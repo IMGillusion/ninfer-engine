@@ -1,0 +1,4992 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Licensed under the Apache License v2.0 with LLVM Exceptions.
+ * See https://nvidia.github.io/NVTX/LICENSE.txt for license information.
+ */
+
+#if defined(NVTX_AS_SYSTEM_HEADER)
+#if defined(__clang__)
+#pragma clang system_header
+#elif defined(__GNUC__) || defined(__NVCOMPILER)
+#pragma GCC system_header
+#elif defined(_MSC_VER)
+#pragma system_header
+#endif
+#endif
+
+/* Temporary helper #defines, #undef'ed at end of header */
+#define NVTX3_CPP_VERSION_MAJOR 1
+#define NVTX3_CPP_VERSION_MINOR 2
+
+/*
+ * NVTX C++ header versioning
+ *
+ * Goals
+ * 1) Allow limited coexistence of different versions of NVTX headers in a
+ * single translation unit (TU)
+ * 2) Support linking objects built with different header versions of NVTX
+ *
+ * Namespaces
+ *
+ * Symbols live in nested major/minor namespaces, e.g.,
+ * `nvtx3::v1::mv1::domain`. The minor namespace is always inlined into the
+ * major namespace. This prevents ODR issues when linking code built against
+ * different minor versions. Do not use minor-version names directly; headers
+ * ship only the latest minor.
+ *
+ * Unversioned vs versioned names
+ *
+ * By default the major namespace is also inlined into `nvtx3`, so both
+ * `nvtx3::v1::domain` and `nvtx3::domain` exist. Defining
+ * `NVTX3_CPP_REQUIRE_EXPLICIT_VERSION` disables this inlining; unversioned
+ * names are omitted. When set, you must use explicit major-version names
+ * (e.g., `nvtx3::v1::scoped_range`).
+ * With default inlining, including two different major headers in one TU is an
+ * error. With `NVTX3_CPP_REQUIRE_EXPLICIT_VERSION` defined, it is technically
+ * possible to mix major versions. However, this typically means all NVTX usage
+ * in the TU must be versioned, unless exactly one major version is included
+ * without the macro (providing unversioned symbols).
+ *
+ * Minor-version policy
+ *
+ * Minor versions are API-backward compatible. Include the highest minor
+ * version first, or just don't mix them at all. Bump the minor version for any
+ * implementation change to avoid ODR conflicts (`NVTX3_CPP_VERSION_MINOR` and
+ * `NVTX3_CPP_INLINED_VERSION_MINOR`). Do not bump
+ * `NVTX3_CPP_DEFINITIONS_V1_0`, this mechanism is no longer applied.
+ *
+ * Macros follow the same scheme, e.g., `NVTX3_V1_FUNC_RANGE`. Unversioned
+ * aliases (e.g., `NVTX3_FUNC_RANGE`) exist unless
+ * `NVTX3_CPP_REQUIRE_EXPLICIT_VERSION` is defined.
+ *
+ * The C++ version numbering described here is strictly about API compatibility
+ * and is unrelated to NVTX release version numbers.
+ *
+ * Recommendations
+ * - Prefer a single specific version of the NVTX headers per TU.
+ * - Use the latest minor version.
+ * - For maximal compatibility in complex builds or header-only code, use
+ *   versioned symbols, e.g., `nvtx3::v1::domain`.
+ * - Only define `NVTX3_CPP_REQUIRE_EXPLICIT_VERSION` when you need to mix
+ *   multiple major versions in the same TU and thus suppress unversioned
+ *   names.
+ */
+/* clang-format off */
+#if !defined(NVTX3_CPP_REQUIRE_EXPLICIT_VERSION)
+  /* Define macro used by all definitions in this header to indicate the
+   * unversioned symbols should be defined in addition to the versioned ones.
+   */
+  #define NVTX3_INLINE_THIS_VERSION
+
+  #if !defined(NVTX3_CPP_INLINED_VERSION_MAJOR)
+    /* First occurrence of this header in the translation unit.  Define macros
+     * indicating which version shall be used for unversioned symbols.
+     */
+
+    /**
+     * @brief Semantic major version number for NVTX C++ wrappers of unversioned symbols
+     *
+     * Breaking changes may occur between major versions, and different major versions
+     * cannot provide unversioned symbols in the same translation unit (.cpp file).
+     *
+     * Note: If NVTX3_CPP_REQUIRE_EXPLICIT_VERSION is defined, this macro is not defined.
+     *
+     * Not to be confused with the version number of the NVTX core library.
+     */
+    #define NVTX3_CPP_INLINED_VERSION_MAJOR 1  // NVTX3_CPP_VERSION_MAJOR
+
+    /**
+     * @brief Semantic minor version number for NVTX C++ wrappers of unversioned symbols
+     *
+     * No breaking changes occur between minor versions -- minor version changes within
+     * a major version are purely additive.
+     *
+     * Note: If NVTX3_CPP_REQUIRE_EXPLICIT_VERSION is defined, this macro is not defined.
+     *
+     * Not to be confused with the version number of the NVTX core library.
+     */
+    #define NVTX3_CPP_INLINED_VERSION_MINOR 2  // NVTX3_CPP_VERSION_MINOR
+  #elif NVTX3_CPP_INLINED_VERSION_MAJOR != NVTX3_CPP_VERSION_MAJOR
+    /* Unsupported case -- cannot define unversioned symbols for different major versions
+     * in the same translation unit.
+     */
+    #error \
+      "Two different major versions of the NVTX C++ Wrappers are being included in a single .cpp file, with unversioned symbols enabled in both.  Only one major version can enable unversioned symbols in a .cpp file.  To disable unversioned symbols, #define NVTX3_CPP_REQUIRE_EXPLICIT_VERSION before #including nvtx3.hpp, and use the versioned symbols instead."
+  #elif (NVTX3_CPP_INLINED_VERSION_MAJOR == NVTX3_CPP_VERSION_MAJOR) && \
+    (NVTX3_CPP_INLINED_VERSION_MINOR < NVTX3_CPP_VERSION_MINOR)
+    /* An older minor version of the same major version already defined unversioned
+     * symbols.  The new features provided in this header will be inlined
+     * redefine the minor version macro to this header's version.
+     */
+    #undef NVTX3_CPP_INLINED_VERSION_MINOR
+    #define NVTX3_CPP_INLINED_VERSION_MINOR 2  // NVTX3_CPP_VERSION_MINOR
+    // else, already have this version or newer, nothing to do
+  #endif
+#endif
+/* clang-format on */
+
+/**
+ * @file nvtx3.hpp
+ *
+ * @brief Provides C++ constructs making the NVTX library safer and easier to
+ * use with zero overhead.
+ */
+
+/**
+ * \mainpage
+ * \tableofcontents
+ *
+ * \section QUICK_START Quick Start
+ *
+ * To add NVTX ranges to your code, use the `nvtx3::scoped_range` RAII object. A
+ * range begins when the object is created, and ends when the object is
+ * destroyed.
+ *
+ * \code{.cpp}
+ * #include "nvtx3/nvtx3.hpp"
+ * void some_function() {
+ *    // Begins a NVTX range with the message "some_function"
+ *    // The range ends when some_function() returns and `r` is destroyed
+ *    nvtx3::scoped_range r{"some_function"};
+ *
+ *    for(int i = 0; i < 5; ++i) {
+ *       nvtx3::scoped_range loop{"loop range"};
+ *       std::this_thread::sleep_for(std::chrono::seconds{1});
+ *    }
+ * } // Range ends when `r` is destroyed
+ * \endcode
+ *
+ * The example code above generates the following timeline view in Nsight
+ * Systems:
+ *
+ * \image html
+ * https://raw.githubusercontent.com/NVIDIA/NVTX/release-v3/docs/images/example_range.png
+ *
+ * Alternatively, use the \ref MACROS like `NVTX3_FUNC_RANGE()` to add
+ * ranges to your code that automatically use the name of the enclosing function
+ * as the range's message.
+ *
+ * \code{.cpp}
+ * #include "nvtx3/nvtx3.hpp"
+ * void some_function() {
+ *    // Creates a range with a message "some_function" that ends when the
+ *    // enclosing function returns
+ *    NVTX3_FUNC_RANGE();
+ *    ...
+ * }
+ * \endcode
+ *
+ *
+ * \section Overview
+ *
+ * The NVTX library provides a set of functions for users to annotate their code
+ * to aid in performance profiling and optimization. These annotations provide
+ * information to tools like Nsight Systems to improve visualization of
+ * application timelines.
+ *
+ * \ref RANGES are one of the most commonly used NVTX constructs for annotating
+ * a span of time. For example, imagine a user wanted to see every time a
+ * function, `my_function`, is called and how long it takes to execute. This can
+ * be accomplished with an NVTX range created on the entry to the function and
+ * terminated on return from `my_function` using the push/pop C APIs:
+ *
+ * \code{.cpp}
+ * void my_function(...) {
+ *    nvtxRangePushA("my_function"); // Begins NVTX range
+ *    // do work
+ *    nvtxRangePop(); // Ends NVTX range
+ * }
+ * \endcode
+ *
+ * One of the challenges with using the NVTX C API is that it requires manually
+ * terminating the end of the range with `nvtxRangePop`. This can be challenging
+ * if `my_function()` has multiple returns or can throw exceptions as it
+ * requires calling `nvtxRangePop()` before all possible return points.
+ *
+ * NVTX C++ solves this inconvenience through the "RAII" technique by providing
+ * a `nvtx3::scoped_range` class that begins a range at construction and ends
+ * the range on destruction. The above example then becomes:
+ *
+ * \code{.cpp}
+ * void my_function(...) {
+ *    nvtx3::scoped_range r{"my_function"}; // Begins NVTX range
+ *    // do work
+ * } // Range ends on exit from `my_function` when `r` is destroyed
+ * \endcode
+ *
+ * The range object `r` is deterministically destroyed whenever `my_function`
+ * returns---ending the NVTX range without manual intervention. For more
+ * information, see \ref RANGES and `nvtx3::scoped_range_in`.
+ *
+ * Another inconvenience of the NVTX C APIs are the several constructs where the
+ * user is expected to initialize an object at the beginning of an application
+ * and reuse that object throughout the lifetime of the application. For example
+ * see domains, categories, and registered messages.
+ *
+ * Example:
+ * \code{.cpp}
+ * nvtxDomainHandle_t D = nvtxDomainCreateA("my domain");
+ * // Reuse `D` throughout the rest of the application
+ * \endcode
+ *
+ * This can be problematic if the user application or library does not have an
+ * explicit initialization function called before all other functions to
+ * ensure that these long-lived objects are initialized before being used.
+ *
+ * NVTX C++ makes use of the "construct on first use" technique to alleviate
+ * this inconvenience. In short, a function local static object is constructed
+ * upon the first invocation of a function and returns a reference to that
+ * object on all future invocations. See the documentation for `nvtx3::domain`,
+ * `nvtx3::named_category`, `nvtx3::registered_string`, and
+ * https://isocpp.org/wiki/faq/ctors#static-init-order-on-first-use for more
+ * information.
+ *
+ * Using construct on first use, the above example becomes:
+ * \code{.cpp}
+ * struct my_domain{ static constexpr char const* name{"my domain"}; };
+ *
+ * // The first invocation of `domain::get` for the type `my_domain` will
+ * // construct a `nvtx3::domain` object and return a reference to it. Future
+ * // invocations simply return a reference.
+ * nvtx3::domain const& D = nvtx3::domain::get<my_domain>();
+ * \endcode
+ * For more information about NVTX and how it can be used, see
+ * https://docs.nvidia.com/cuda/profiler-users-guide/index.html#nvtx and
+ * https://devblogs.nvidia.com/cuda-pro-tip-generate-custom-application-profile-timelines-nvtx/
+ * for more information.
+ *
+ * \section RANGES Ranges
+ *
+ * Ranges are used to describe a span of time during the execution of an
+ * application. Common examples are using ranges to annotate the time it takes
+ * to execute a function or an iteration of a loop.
+ *
+ * NVTX C++ uses RAII to automate the generation of ranges that are tied to the
+ * lifetime of objects. Similar to `std::lock_guard` in the C++ Standard
+ * Template Library.
+ *
+ * \subsection scoped_range Scoped Range
+ *
+ * `nvtx3::scoped_range_in` is a class that begins a range upon construction
+ * and ends the range at destruction. This is one of the most commonly used
+ * constructs in NVTX C++ and is useful for annotating spans of time on a
+ * particular thread. These ranges can be nested to arbitrary depths.
+ *
+ * `nvtx3::scoped_range` is an alias for a `nvtx3::scoped_range_in` in the
+ * global NVTX domain. For more information about Domains, see \ref DOMAINS.
+ *
+ * Various attributes of a range can be configured constructing a
+ * `nvtx3::scoped_range_in` with a `nvtx3::event_attributes` object. For
+ * more information, see \ref ATTRIBUTES.
+ *
+ * Example:
+ *
+ * \code{.cpp}
+ * void some_function() {
+ *    // Creates a range for the duration of `some_function`
+ *    nvtx3::scoped_range r{};
+ *
+ *    while(true) {
+ *       // Creates a range for every loop iteration
+ *       // `loop_range` is nested inside `r`
+ *       nvtx3::scoped_range loop_range{};
+ *    }
+ * }
+ * \endcode
+ *
+ * \subsection unique_range Unique Range
+ *
+ * `nvtx3::unique_range` is similar to `nvtx3::scoped_range`, with a few key differences:
+ * - `unique_range` objects can be destroyed in any order whereas `scoped_range` objects must be
+ *    destroyed in exact reverse creation order
+ * - `unique_range` can start and end on different threads
+ * - `unique_range` is movable
+ * - `unique_range` objects can be constructed as heap objects
+ *
+ * There is extra overhead associated with `unique_range` constructs and therefore use of
+ * `nvtx3::scoped_range_in` should be preferred.
+ *
+ * \subsection push_pop_range Push/Pop Range
+ *
+ * `nvtx3::push_range_in` and `nvtx3::pop_range_in` manually begin and end a
+ * nested thread range. They wrap `nvtxDomainRangePushEx` and
+ * `nvtxDomainRangePop` for cases where the push and pop cannot share one C++
+ * object lifetime.
+ *
+ * Prefer `nvtx3::scoped_range_in` for normal scoped C++ code. Manual push/pop
+ * ranges are intended for callback-driven code or other control flows where
+ * range begin and end happen in separate scopes on the same thread.
+ *
+ * Example:
+ *
+ * \code{.cpp}
+ * void begin_callback() {
+ *    nvtx3::push_range_in<my_domain>("request");
+ * }
+ *
+ * void end_callback() {
+ *    nvtx3::pop_range_in<my_domain>();
+ * }
+ * \endcode
+ *
+ * \section MARKS Marks
+ *
+ * `nvtx3::mark` annotates an instantaneous point in time with a "marker".
+ *
+ * Unlike a "range" which has a beginning and an end, a marker is a single event
+ * in an application, such as detecting a problem:
+ *
+ * \code{.cpp}
+ * bool success = do_operation(...);
+ * if (!success) {
+ *    nvtx3::mark("operation failed!");
+ * }
+ * \endcode
+ *
+ * \section DOMAINS Domains
+ *
+ * Similar to C++ namespaces, domains allow for scoping NVTX events. By default,
+ * all NVTX events belong to the "global" domain. Libraries and applications
+ * should scope their events to use a custom domain to differentiate where the
+ * events originate from.
+ *
+ * It is common for a library or application to have only a single domain and
+ * for the name of that domain to be known at compile time. Therefore, Domains
+ * in NVTX C++ are represented by _tag types_.
+ *
+ * For example, to define a custom domain, simply define a new concrete type
+ * (a `class` or `struct`) with a `static` member called `name` that contains
+ * the desired name of the domain.
+ *
+ * \code{.cpp}
+ * struct my_domain{ static constexpr char const* name{"my domain"}; };
+ * \endcode
+ *
+ * For any NVTX C++ construct that can be scoped to a domain, the type
+ * `my_domain` can be passed as an explicit template argument to scope it to
+ * the custom domain.
+ *
+ * The tag type `nvtx3::domain::global` represents the global NVTX domain.
+ *
+ * \code{.cpp}
+ * // By default, `scoped_range_in` belongs to the global domain
+ * nvtx3::scoped_range_in<> r0{};
+ *
+ * // Alias for a `scoped_range_in` in the global domain
+ * nvtx3::scoped_range r1{};
+ *
+ * // `r` belongs to the custom domain
+ * nvtx3::scoped_range_in<my_domain> r{};
+ * \endcode
+ *
+ * When using a custom domain, it is recommended to define type aliases for NVTX
+ * constructs in the custom domain.
+ * \code{.cpp}
+ * using my_scoped_range = nvtx3::scoped_range_in<my_domain>;
+ * using my_registered_string = nvtx3::registered_string_in<my_domain>;
+ * using my_named_category = nvtx3::named_category_in<my_domain>;
+ * \endcode
+ *
+ * See `nvtx3::domain` for more information.
+ *
+ * \section ATTRIBUTES Event Attributes
+ *
+ * NVTX events can be customized with various attributes to provide additional
+ * information (such as a custom message) or to control visualization of the
+ * event (such as the color used). These attributes can be specified per-event
+ * via arguments to a `nvtx3::event_attributes` object.
+ *
+ * NVTX events can be customized via five "attributes":
+ * - \ref COLOR : color used to visualize the event in tools.
+ * - \ref MESSAGES :  Custom message string.
+ * - \ref PAYLOAD :  User-defined numerical value.
+ * - \ref PAYLOAD_DATA : User-defined structured data (exclusive of payload).
+ * - \ref CATEGORY : Intra-domain grouping.
+ *
+ * It is possible to construct a `nvtx3::event_attributes` from any number of
+ * attribute objects (nvtx3::color, nvtx3::message, nvtx3::payload,
+ * nvtx3::category, nvtx3::payload_data, or a container of nvtx3::payload_data)
+ * in any order. If an attribute is not specified, a tool specific default value
+ * is used. See `nvtx3::event_attributes` for more information.
+ *
+ * \code{.cpp}
+ * // Set message, same as passing nvtx3::message{"message"}
+ * nvtx3::event_attributes attr{"message"};
+ *
+ * // Set message and color
+ * nvtx3::event_attributes attr{"message", nvtx3::rgb{127, 255, 0}};
+ *
+ * // Set message, color, payload, category
+ * nvtx3::event_attributes attr{"message",
+ *                              nvtx3::rgb{127, 255, 0},
+ *                              nvtx3::payload{42},
+ *                              nvtx3::category{1}};
+ *
+ * // Same as above -- can use any order of arguments
+ * nvtx3::event_attributes attr{nvtx3::payload{42},
+ *                              nvtx3::category{1},
+ *                              "message",
+ *                              nvtx3::rgb{127, 255, 0}};
+ *
+ * // Multiple arguments of the same type are allowed, but only the first is
+ * // used -- in this example, payload is set to 42:
+ * nvtx3::event_attributes attr{ nvtx3::payload{42}, nvtx3::payload{7} };
+ * // payload and payload_data should not be used together.
+ *
+ * // Using the nvtx3 namespace in a local scope makes the syntax more succinct:
+ * using namespace nvtx3;
+ * event_attributes attr{"message", rgb{127, 255, 0}, payload{42}, category{1}};
+ * \endcode
+ *
+ * \subsection MESSAGES message
+ *
+ * `nvtx3::message` sets the message string for an NVTX event.
+ *
+ * Example:
+ * \code{.cpp}
+ * // Create an `event_attributes` with the message "my message"
+ * nvtx3::event_attributes attr{nvtx3::message{"my message"}};
+ *
+ * // strings and string literals implicitly assumed to be a `nvtx3::message`
+ * nvtx3::event_attributes attr{"my message"};
+ * \endcode
+ *
+ * \subsubsection REGISTERED_MESSAGE Registered Messages
+ *
+ * Associating a `nvtx3::message` with an event requires copying the contents of
+ * the message every time the message is used, i.e., copying the entire message
+ * string. This may cause non-trivial overhead in performance sensitive code.
+ *
+ * To eliminate this overhead, NVTX allows registering a message string,
+ * yielding a "handle" that is inexpensive to copy that may be used in place of
+ * a message string. When visualizing the events, tools such as Nsight Systems
+ * will take care of mapping the message handle to its string.
+ *
+ * A message should be registered once and the handle reused throughout the rest
+ * of the application. This can be done by either explicitly creating static
+ * `nvtx3::registered_string` objects, or using the
+ * `nvtx3::registered_string::get` construct on first use helper (recommended).
+ *
+ * Similar to \ref DOMAINS, `nvtx3::registered_string::get` requires defining a
+ * custom tag type with a static `message` member whose value will be the
+ * contents of the registered string.
+ *
+ * Example:
+ * \code{.cpp}
+ * // Explicitly constructed, static `registered_string` in my_domain:
+ * static registered_string_in<my_domain> static_message{"my message"};
+ *
+ * // Or use construct on first use:
+ * // Define a tag type with a `message` member string to register
+ * struct my_message{ static constexpr char const* message{ "my message" }; };
+ *
+ * // Uses construct on first use to register the contents of
+ * // `my_message::message`
+ * auto& msg = nvtx3::registered_string_in<my_domain>::get<my_message>();
+ * \endcode
+ *
+ * A `nvtx3::registered_string_in` can also be used inside of a struct for
+ * `nvtx3::payload_data` using `TYPE_NVTX_REGISTERED_STRING_HANDLE`.
+ *
+ * \code{.cpp}
+ *
+ * \endcode
+ *
+ * \subsection COLOR color
+ *
+ * Associating a `nvtx3::color` with an event allows controlling how the event
+ * is visualized in a tool such as Nsight Systems. This is a convenient way to
+ * visually differentiate among different events.
+ *
+ * \code{.cpp}
+ * // Define a color via rgb color values
+ * nvtx3::color c{nvtx3::rgb{127, 255, 0}};
+ * nvtx3::event_attributes attr{c};
+ *
+ * // rgb color values can be passed directly to an `event_attributes`
+ * nvtx3::event_attributes attr1{nvtx3::rgb{127,255,0}};
+ * \endcode
+ *
+ * \subsection CATEGORY category
+ *
+ * A `nvtx3::category` is simply an integer id that allows for fine-grain
+ * grouping of NVTX events. For example, one might use separate categories for
+ * IO, memory allocation, compute, etc.
+ *
+ * \code{.cpp}
+ * nvtx3::event_attributes{nvtx3::category{1}};
+ * \endcode
+ *
+ * \subsubsection NAMED_CATEGORIES Named Categories
+ *
+ * Associates a `name` string with a category `id` to help differentiate among
+ * categories.
+ *
+ * For any given category id `Id`, a `named_category{Id, "name"}` should only
+ * be constructed once and reused throughout an application. This can be done by
+ * either explicitly creating static `nvtx3::named_category` objects, or using
+ * the `nvtx3::named_category::get` construct on first use helper (recommended).
+ *
+ * Similar to \ref DOMAINS, `nvtx3::named_category::get` requires defining a
+ * custom tag type with static `name` and `id` members.
+ *
+ * \code{.cpp}
+ * // Explicitly constructed, static `named_category` in my_domain:
+ * static nvtx3::named_category_in<my_domain> static_category{42, "my category"};
+ *
+ * // Or use construct on first use:
+ * // Define a tag type with `name` and `id` members
+ * struct my_category {
+ *    static constexpr char const* name{"my category"}; // category name
+ *    static constexpr uint32_t id{42}; // category id
+ * };
+ *
+ * // Use construct on first use to name the category id `42`
+ * // with name "my category":
+ * auto& cat = named_category_in<my_domain>::get<my_category>();
+ *
+ * // Range `r` associated with category id `42`
+ * nvtx3::event_attributes attr{cat};
+ * \endcode
+ *
+ * \subsection PAYLOAD payload
+ *
+ * Allows associating a user-defined numerical value with an event.
+ *
+ * \code{.cpp}
+ * // Constructs a payload from the `int32_t` value 42
+ * nvtx3:: event_attributes attr{nvtx3::payload{42}};
+ * \endcode
+ *
+ * \subsection PAYLOAD_DATA payload_data
+ *
+ * `nvtx3::payload_data` allows associating arbitrary structured data with an NVTX event.
+ *
+ * First, define a `struct` that is *standard-layout* and *trivially copyable*.
+ * Then use `NVTX3_DEFINE_SCHEMA_GET` (`NVTX3_V1_DEFINE_SCHEMA_GET()`) to define the schema layout.
+ * Finally you can use any such instance wrapped in `nvtx3::payload_data` in an
+ * `nvtx3::event_attributes` object.
+ * You can also pass containers (e.g., `std::vector`, `std::array`) of `payload_data` objects.
+ * \note Constructing `nvtx3::payload_data` from temporaries or using tempoarary
+ * `nvtx3::payload_data` objects is disabled to prevent dangling pointers.
+ *
+ * \section EXAMPLE Example
+ *
+ * Putting it all together:
+ * \code{.cpp}
+ * // Define a custom domain tag type
+ * struct my_domain{ static constexpr char const* name{"my domain"}; };
+ *
+ * // Define a named category tag type
+ * struct my_category{
+ *    static constexpr char const* name{"my category"};
+ *    static constexpr uint32_t id{42};
+ * };
+ *
+ * // Define a registered string tag type
+ * struct my_message{ static constexpr char const* message{"my message"}; };
+ *
+ * // For convenience, use aliases for domain scoped objects
+ * using my_scoped_range = nvtx3::scoped_range_in<my_domain>;
+ * using my_registered_string = nvtx3::registered_string_in<my_domain>;
+ * using my_named_category = nvtx3::named_category_in<my_domain>;
+ *
+ * // Custom payload data
+ * struct my_payload_data {
+ *     uint32_t iteration;
+ *     float    temperature;
+ * };
+ * NVTX3_DEFINE_SCHEMA_GET(
+ *     my_domain,
+ *     my_payload_data,
+ *     "MyPayloadData",
+ *     NVTX_PAYLOAD_ENTRIES((iteration, TYPE_UINT32, "Iteration Count"),
+ *                          (temperature, TYPE_FLOAT, "Temperature"))
+ * )
+ *
+ * // Default values for all attributes
+ * nvtx3::event_attributes attr{};
+ * my_scoped_range r0{attr};
+ *
+ * // Custom (unregistered) message, and unnamed category
+ * nvtx3::event_attributes attr1{"message", nvtx3::category{2}};
+ * my_scoped_range r1{attr1};
+ *
+ * // Alternatively, pass arguments of `event_attributes` constructor directly
+ * // to `my_scoped_range`
+ * my_scoped_range r2{"message", nvtx3::category{2}};
+ *
+ * // construct on first use a registered string
+ * auto& msg = my_registered_string::get<my_message>();
+ *
+ * // construct on first use a named category
+ * auto& cat = my_named_category::get<my_category>();
+ *
+ * // Use registered string and named category with a custom payload
+ * my_scoped_range r3{msg, cat, nvtx3::payload{42}};
+ *
+ * // Use custom payload data
+ * my_payload_data extras{42, 0.7f};
+ * nvtx3::payload_data pd{extras};
+ * my_scoped_range r4{pd};
+ *
+ * // Use a container of payload_data, can use different struct types
+ * auto multiple = std::to_array({pd, pd2});
+ * my_scoped_range r5{multiple};
+ *
+ * // Any number of arguments in any order
+ * my_scoped_range r{nvtx3::rgb{127, 255, 0}, msg};
+ *
+ * \endcode
+ * \section MACROS Convenience Macros
+ *
+ * Oftentimes users want to quickly and easily add NVTX ranges to their library
+ * or application to aid in profiling and optimization.
+ *
+ * A convenient way to do this is to use the
+ * \ref NVTX3_V1_FUNC_RANGE "NVTX3_FUNC_RANGE" and
+ * \ref NVTX3_V1_FUNC_RANGE_IN "NVTX3_FUNC_RANGE_IN" macros. These macros take
+ * care of constructing an
+ * `nvtx3::scoped_range_in` with the name of the enclosing function as the
+ * range's message.
+ *
+ * \code{.cpp}
+ * void some_function() {
+ *    // Automatically generates an NVTX range for the duration of the function
+ *    // using "some_function" as the event's message.
+ *    NVTX3_FUNC_RANGE();
+ * }
+ * \endcode
+ *
+ */
+
+/* Temporary helper #defines, removed with #undef at end of header */
+
+/* Some compilers do not correctly support SFINAE, which is used in this API
+ * to detect common usage errors and provide clearer error messages (by using
+ * static_assert) than the compiler would produce otherwise.  These compilers
+ * will generate errors while compiling this file such as:
+ *
+ *  error: 'name' is not a member of 'nvtx3::v1::domain::global'
+ *
+ * The following compiler versions are known to have this problem, and so are
+ * set by default to disable the SFINAE-based checks:
+ *
+ * - All MSVC versions prior to VS2017 Update 7 (15.7)
+ * - GCC 8.1-8.3 (the problem was fixed in GCC 8.4)
+ *
+ * If you find your compiler hits this problem, you can work around it by
+ * defining NVTX3_USE_CHECKED_OVERLOADS_FOR_GET to 0 before including this
+ * header, or you can add a check for your compiler version to this #if.
+ * Also, please report the issue on the NVTX GitHub page.
+ */
+#if !defined(NVTX3_USE_CHECKED_OVERLOADS_FOR_GET)
+#if defined(_MSC_VER) && _MSC_VER < 1914 \
+  || defined(__GNUC__) && __GNUC__ == 8 && __GNUC_MINOR__ < 4
+#define NVTX3_USE_CHECKED_OVERLOADS_FOR_GET 0
+#else
+#define NVTX3_USE_CHECKED_OVERLOADS_FOR_GET 1
+#endif
+#define NVTX3_USE_CHECKED_OVERLOADS_FOR_GET_DEFINED_HERE
+#endif
+
+/* Within this header, nvtx3::NVTX3_VERSION_NAMESPACE resolves to nvtx3::vX,
+ * where "X" is the major version number. */
+#define NVTX3_CONCAT(A, B) A##B
+#define NVTX3_NAMESPACE_FOR(VERSION) NVTX3_CONCAT(v, VERSION)
+#define NVTX3_VERSION_NAMESPACE NVTX3_NAMESPACE_FOR(NVTX3_CPP_VERSION_MAJOR)
+/* We use a different prefix to avoid ambiguity with the version namespace */
+#define NVTX3_MINOR_NAMESPACE_FOR(VERSION) NVTX3_CONCAT(mv, VERSION)
+#define NVTX3_MINOR_VERSION_NAMESPACE NVTX3_MINOR_NAMESPACE_FOR(NVTX3_CPP_VERSION_MINOR)
+
+/* Avoid duplicating #if defined(NVTX3_INLINE_THIS_VERSION) for namespaces
+ * in each minor version by making a macro to use unconditionally, which
+ * resolves to "inline" or nothing as appropriate. */
+#if defined(NVTX3_INLINE_THIS_VERSION)
+#define NVTX3_INLINE_IF_REQUESTED inline
+#else
+#define NVTX3_INLINE_IF_REQUESTED
+#endif
+
+/* Enables the use of constexpr when support for C++14 constexpr is present.
+ *
+ * Initialization of a class member that is a union to a specific union member
+ * can only be done in the body of a constructor, not in a member initializer
+ * list.  A constexpr constructor must have an empty body until C++14, so there
+ * is no way to make an initializer of a member union constexpr in C++11.  This
+ * macro allows making functions constexpr in C++14 or newer, but non-constexpr
+ * in C++11 compilation.  It is used here on constructors that initialize their
+ * member unions.
+ */
+#if __cpp_constexpr >= 201304L
+#define NVTX3_CONSTEXPR_IF_CPP14 constexpr
+#else
+#define NVTX3_CONSTEXPR_IF_CPP14
+#endif
+
+/* Enables the use of constexpr when support for C++20 constexpr is present.
+ */
+#if __cplusplus >= 202002L
+#define NVTX3_CONSTEXPR_IF_CPP20 constexpr
+#else
+#define NVTX3_CONSTEXPR_IF_CPP20
+#endif
+
+// Macro wrappers for C++ attributes
+#if !defined(__has_cpp_attribute)
+#define __has_cpp_attribute(x) 0
+#endif
+#if __has_cpp_attribute(maybe_unused)
+#define NVTX3_MAYBE_UNUSED [[maybe_unused]]
+#else
+#define NVTX3_MAYBE_UNUSED
+#endif
+#if __has_cpp_attribute(nodiscard)
+#define NVTX3_NO_DISCARD [[nodiscard]]
+#else
+#define NVTX3_NO_DISCARD
+#endif
+
+ /* Use a macro for static asserts, which defaults to static_assert, but that
+  * testing tools can replace with a logging function.  For example:
+  * #define NVTX3_STATIC_ASSERT(c, m) \
+  *   do { if (!(c)) printf("static_assert would fail: %s\n", m); } while (0)
+  */
+#if !defined(NVTX3_STATIC_ASSERT)
+#define NVTX3_STATIC_ASSERT(condition, message) static_assert(condition, message)
+#define NVTX3_STATIC_ASSERT_DEFINED_HERE
+#endif
+
+/* The original idea here was to have separate implementation sections, enclosed
+ * in guard macros for each minor version. However, this approach was very
+ * limited in practice. Specifically, it is not possible to add constructors to
+ * `event_attributes`, which was needed for version 1.1 and is API compatible.
+ * So we stick with `NVTX3_CPP_DEFINITIONS_V1_0` as guard macro for now, even
+ * with bumped minor versions.
+ */
+#ifndef NVTX3_CPP_DEFINITIONS_V1_0
+#define NVTX3_CPP_DEFINITIONS_V1_0
+
+#include "nvToolsExt.h"
+#include "nvToolsExtCounters.h"
+#include "nvToolsExtPayload.h"
+#include "nvToolsExtPayloadHelper.h"
+#include "nvToolsExtSemanticsCorrelation.h"
+#include "nvToolsExtSemanticsCounters.h"
+#include "nvToolsExtSemanticsScope.h"
+#include "nvToolsExtSemanticsTime.h"
+
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <cstddef>
+#include <cstdint>
+
+namespace nvtx3 {
+
+NVTX3_INLINE_IF_REQUESTED namespace NVTX3_VERSION_NAMESPACE
+{
+inline namespace NVTX3_MINOR_VERSION_NAMESPACE
+{
+
+namespace detail {
+
+template <typename Unused>
+struct always_false : std::false_type {};
+
+template <typename T, typename = void>
+struct has_name : std::false_type {};
+template <typename T>
+struct has_name<T, decltype((void)T::name, void())> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_id : std::false_type {};
+template <typename T>
+struct has_id<T, decltype((void)T::id, void())> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_message : std::false_type {};
+template <typename T>
+struct has_message<T, decltype((void)T::message, void())> : std::true_type {};
+
+template <typename T, typename = void>
+struct is_c_string : std::false_type {};
+template <typename T>
+struct is_c_string<T, typename std::enable_if<
+  std::is_convertible<T, char const*   >::value ||
+  std::is_convertible<T, wchar_t const*>::value
+>::type> : std::true_type {};
+
+template <typename T>
+using is_uint32 = std::is_same<typename std::decay<T>::type, uint32_t>;
+
+template <typename... Args>
+static inline void silence_unused(Args const&...) noexcept {}
+
+// Type trait to check for a .data() member returning T* or const T*
+// Some day, we can just use std::span
+template <typename T, typename TD>
+struct has_data_member
+{
+private:
+    template <typename U>
+    static auto test_data(int) -> decltype(std::declval<const U>().data());
+    template <typename>
+    static auto test_data(...) -> void;
+    using return_type = decltype(test_data<T>(0));
+
+public:
+    static constexpr bool value =
+        std::is_same<return_type, TD*>::value || std::is_same<return_type, TD const*>::value;
+};
+
+// Type trait to check for a .size() member returning something convertible to size_t
+template <typename T>
+struct has_size_member
+{
+private:
+    template <typename U>
+    static auto test_size(int) -> decltype(std::declval<const U>().size());
+    template <typename>
+    static auto test_size(...) -> void;
+    using return_type = decltype(test_size<T>(0));
+
+public:
+    static constexpr bool value = !std::is_same<return_type, void>::value &&
+                                    std::is_convertible<return_type, size_t>::value;
+};
+
+/**
+    * To ensure that we can "safely" use one type as another, for pointers, in
+    * arrays or in structs. This is used for our wrappers around C-types so that
+    * we can pass them back to C.
+    *
+    * This is by no means perfect and foolproof.
+    *
+    * @tparam W The wrapper type.
+    * @tparam U The type it is wrapping.
+    */
+template <typename W, typename U, typename = void>
+struct is_safe_wrapper_of : std::false_type
+{
+};
+
+template <typename W, typename U>
+struct is_safe_wrapper_of<
+    W,
+    U,
+    typename std::enable_if<
+        std::is_standard_layout<W>::value && std::is_standard_layout<U>::value &&
+        std::is_trivially_copyable<W>::value && std::is_trivially_copyable<U>::value &&
+        sizeof(W) == sizeof(U)>::type> : std::true_type
+{
+};
+/**
+ * @brief Base class for semantic types, providing header access.
+ *
+ * The pointer returned by get() aliases internal storage of the builder and is
+ * invalidated when the builder is destroyed. Semantic chains constructed from
+ * another C++ semantic builder own a snapshot of the referenced chain, so
+ * inline temporary chains are safe to use.
+ *
+ * @tparam DataType The underlying C struct type (e.g., nvtxSemanticsCounter_t).
+ */
+template <typename DataType>
+class semantic_base {
+public:
+  /**
+   * @brief Get pointer to the underlying C semantics header.
+   *
+   * The returned pointer aliases internal storage of this object. It is valid
+   * only for the lifetime of *this and must not be used after this object is
+   * destroyed.
+   *
+   * @return Pointer to the semantics header.
+   */
+  nvtxSemanticsHeader_t const* get() const & noexcept
+  {
+    return reinterpret_cast<nvtxSemanticsHeader_t const*>(&data_);
+  }
+
+protected:
+  explicit semantic_base(DataType const& data) noexcept : data_{data} {}
+
+  void set_next(nvtxSemanticsHeader_t const* next) noexcept
+  {
+    // Raw C-header chaining is non-owning; callers must keep next alive.
+    next_owner_.reset();
+    data_.header.next = next;
+  }
+
+  template <typename OtherDataType>
+  void own_next(semantic_base<OtherDataType> const& next)
+  {
+    // C++ wrapper chaining snapshots next and points the C header at the owned copy.
+    auto owned_next = std::make_shared<semantic_base<OtherDataType>>(next);
+    data_.header.next = owned_next->get();
+    next_owner_ = owned_next;
+  }
+
+  DataType data_;
+
+private:
+  // Type-erased owner for the semantic object addressed by data_.header.next.
+  // Stored here to keep the pointer alive
+  std::shared_ptr<void const> next_owner_;
+};
+
+/**
+ * @brief Maps a C++ limit type to the matching nvtxSemanticsCounter_t storage.
+ *
+ * The primary template is intentionally undefined so that an unsupported T
+ * produces a clear "no type named 'limit_type_value' in
+ * counter_limit_traits<T>" diagnostic at the call site.
+ */
+template <typename T>
+struct counter_limit_traits;
+
+template <>
+struct counter_limit_traits<int64_t>
+{
+  static constexpr int64_t limit_type_value = NVTX_COUNTER_LIMIT_I64;
+  static NVTX3_CONSTEXPR_IF_CPP20 void store(nvtxCounterLimit_t& slot, int64_t v) noexcept
+  {
+    slot.i64 = v;
+  }
+};
+
+template <>
+struct counter_limit_traits<uint64_t>
+{
+  static constexpr int64_t limit_type_value = NVTX_COUNTER_LIMIT_U64;
+  static NVTX3_CONSTEXPR_IF_CPP20 void store(nvtxCounterLimit_t& slot, uint64_t v) noexcept
+  {
+    slot.u64 = v;
+  }
+};
+
+template <>
+struct counter_limit_traits<double>
+{
+  static constexpr int64_t limit_type_value = NVTX_COUNTER_LIMIT_F64;
+  static NVTX3_CONSTEXPR_IF_CPP20 void store(nvtxCounterLimit_t& slot, double v) noexcept
+  {
+    slot.f64 = v;
+  }
+};
+
+} // namespace detail
+
+/**
+ * @brief `domain`s allow for grouping NVTX events into a single scope to
+ * differentiate them from events in other `domain`s.
+ *
+ * By default, all NVTX constructs are placed in the "global" NVTX domain.
+ *
+ * A custom `domain` may be used in order to differentiate a library's or
+ * application's NVTX events from other events.
+ *
+ * `domain`s are expected to be long-lived and unique to a library or
+ * application. As such, it is assumed a domain's name is known at compile
+ * time. Therefore, all NVTX constructs that can be associated with a domain
+ * require the domain to be specified via a *type* `D` passed as an
+ * explicit template parameter.
+ *
+ * The type `domain::global` may be used to indicate that the global NVTX
+ * domain should be used.
+ *
+ * None of the C++ NVTX constructs require the user to manually construct a
+ * `domain` object. Instead, if a custom domain is desired, the user is
+ * expected to define a type `D` that contains a member
+ * `D::name` which resolves to either a `char const*` or `wchar_t
+ * const*`. The value of `D::name` is used to name and uniquely
+ * identify the custom domain.
+ *
+ * Upon the first use of an NVTX construct associated with the type
+ * `D`, the "construct on first use" pattern is used to construct a
+ * function local static `domain` object. All future NVTX constructs
+ * associated with `D` will use a reference to the previously
+ * constructed `domain` object. See `domain::get`.
+ *
+ * Example:
+ * \code{.cpp}
+ * // The type `my_domain` defines a `name` member used to name and identify
+ * // the `domain` object identified by `my_domain`.
+ * struct my_domain{ static constexpr char const* name{"my_domain"}; };
+ *
+ * // The NVTX range `r` will be grouped with all other NVTX constructs
+ * // associated with  `my_domain`.
+ * nvtx3::scoped_range_in<my_domain> r{};
+ *
+ * // An alias can be created for a `scoped_range_in` in the custom domain
+ * using my_scoped_range = nvtx3::scoped_range_in<my_domain>;
+ * my_scoped_range my_range{};
+ *
+ * // `domain::global` indicates that the global NVTX domain is used
+ * nvtx3::scoped_range_in<domain::global> r2{};
+ *
+ * // For convenience, `nvtx3::scoped_range` is an alias for a range in the
+ * // global domain
+ * nvtx3::scoped_range r3{};
+ * \endcode
+ */
+class domain {
+ public:
+  domain(domain const&) = delete;
+  domain& operator=(domain const&) = delete;
+  domain(domain&&) = delete;
+  domain& operator=(domain&&) = delete;
+
+  /**
+   * @brief Tag type for the "global" NVTX domain.
+   *
+   * This type may be passed as a template argument to any function/class
+   * expecting a type to identify a domain to indicate that the global domain
+   * should be used.
+   *
+   * All NVTX events in the global domain across all libraries and
+   * applications will be grouped together.
+   *
+   */
+  struct global {
+  };
+
+#if NVTX3_USE_CHECKED_OVERLOADS_FOR_GET
+  /**
+   * @brief Returns reference to an instance of a function local static
+   * `domain` object.
+   *
+   * Uses the "construct on first use" idiom to safely ensure the `domain`
+   * object is initialized exactly once upon first invocation of
+   * `domain::get<D>()`. All following invocations will return a
+   * reference to the previously constructed `domain` object. See
+   * https://isocpp.org/wiki/faq/ctors#static-init-order-on-first-use
+   *
+   * None of the constructs in this header require the user to directly invoke
+   * `domain::get`. It is automatically invoked when constructing objects like
+   * a `scoped_range_in` or `category`. Advanced users may wish to use
+   * `domain::get` for the convenience of the "construct on first use" idiom
+   * when using domains with their own use of the NVTX C API.
+   *
+   * This function is thread-safe as of C++11. If two or more threads call
+   * `domain::get<D>` concurrently, exactly one of them is guaranteed
+   * to construct the `domain` object and the other(s) will receive a
+   * reference to the object after it is fully constructed.
+   *
+   * The domain's name is specified via the type `D` pass as an
+   * explicit template parameter. `D` is required to contain a
+   * member `D::name` that resolves to either a `char const*` or
+   * `wchar_t const*`. The value of `D::name` is used to name and
+   * uniquely identify the `domain`.
+   *
+   * Example:
+   * \code{.cpp}
+   * // The type `my_domain` defines a `name` member used to name and identify
+   * // the `domain` object identified by `my_domain`.
+   * struct my_domain{ static constexpr char const* name{"my domain"}; };
+   *
+   * auto& D1 = domain::get<my_domain>(); // First invocation constructs a
+   *                                      // `domain` with the name "my domain"
+   *
+   * auto& D2 = domain::get<my_domain>(); // Quickly returns reference to
+   *                                      // previously constructed `domain`.
+   * \endcode
+   *
+   * @tparam D Type that contains a `D::name` member used to
+   * name the `domain` object.
+   * @return Reference to the `domain` corresponding to the type `D`.
+   */
+  template <typename D = global,
+    typename std::enable_if<
+      detail::is_c_string<decltype(D::name)>::value
+    , int>::type = 0>
+  NVTX3_NO_DISCARD static domain const& get() noexcept
+  {
+    static domain const d(D::name);
+    return d;
+  }
+
+  /**
+   * @brief Overload of `domain::get` to provide a clear compile error when
+   * `D` has a `name` member that is not directly convertible to either
+   * `char const*` or `wchar_t const*`.
+   */
+  template <typename D = global,
+    typename std::enable_if<
+      !detail::is_c_string<decltype(D::name)>::value
+    , int>::type = 0>
+  NVTX3_NO_DISCARD static domain const& get() noexcept
+  {
+    NVTX3_STATIC_ASSERT(detail::always_false<D>::value,
+      "Type used to identify an NVTX domain must contain a static constexpr member "
+      "called 'name' of type const char* or const wchar_t* -- 'name' member is not "
+      "convertible to either of those types");
+    static domain const unused;
+    return unused;  // Function must compile for static_assert to be triggered
+  }
+
+  /**
+   * @brief Overload of `domain::get` to provide a clear compile error when
+   * `D` does not have a `name` member.
+   */
+  template <typename D = global,
+    typename std::enable_if<
+      !detail::has_name<D>::value
+    , int>::type = 0>
+  NVTX3_NO_DISCARD static domain const& get() noexcept
+  {
+    NVTX3_STATIC_ASSERT(detail::always_false<D>::value,
+      "Type used to identify an NVTX domain must contain a static constexpr member "
+      "called 'name' of type const char* or const wchar_t* -- 'name' member is missing");
+    static domain const unused;
+    return unused;  // Function must compile for static_assert to be triggered
+  }
+#else
+  template <typename D = global>
+  NVTX3_NO_DISCARD static domain const& get() noexcept
+  {
+    static domain const d(D::name);
+    return d;
+  }
+#endif
+
+  /**
+   * @brief Conversion operator to `nvtxDomainHandle_t`.
+   *
+   * Allows transparently passing a domain object into an API expecting a
+   * native `nvtxDomainHandle_t` object.
+   */
+  operator nvtxDomainHandle_t() const noexcept { return _domain; }
+
+ private:
+  /**
+   * @brief Construct a new domain with the specified `name`.
+   *
+   * This constructor is private as it is intended that `domain` objects only
+   * be created through the `domain::get` function.
+   *
+   * @param name A unique name identifying the domain
+   */
+  explicit domain(char const* name) noexcept : _domain{nvtxDomainCreateA(name)} {}
+
+  /**
+   * @brief Construct a new domain with the specified `name`.
+   *
+   * This constructor is private as it is intended that `domain` objects only
+   * be created through the `domain::get` function.
+   *
+   * @param name A unique name identifying the domain
+   */
+  explicit domain(wchar_t const* name) noexcept : _domain{nvtxDomainCreateW(name)} {}
+
+  /**
+   * @brief Construct a new domain with the specified `name`.
+   *
+   * This constructor is private as it is intended that `domain` objects only
+   * be created through the `domain::get` function.
+   *
+   * @param name A unique name identifying the domain
+   */
+  explicit domain(std::string const& name) noexcept : domain{name.c_str()} {}
+
+  /**
+   * @brief Construct a new domain with the specified `name`.
+   *
+   * This constructor is private as it is intended that `domain` objects only
+   * be created through the `domain::get` function.
+   *
+   * @param name A unique name identifying the domain
+   */
+  explicit domain(std::wstring const& name) noexcept : domain{name.c_str()} {}
+
+  /**
+   * @brief Default constructor creates a `domain` representing the
+   * "global" NVTX domain.
+   *
+   * All events not associated with a custom `domain` are grouped in the
+   * "global" NVTX domain.
+   *
+   */
+  constexpr domain() noexcept {}
+
+  /**
+   * @brief Intentionally avoid calling nvtxDomainDestroy on the `domain` object.
+   *
+   * No currently-available tools attempt to free domain resources when the
+   * nvtxDomainDestroy function is called, due to the thread-safety and
+   * efficiency challenges of freeing thread-local storage for other threads.
+   * Since libraries may be disallowed from introducing static destructors,
+   * and destroying the domain is likely to have no effect, the destructor
+   * for `domain` intentionally chooses to not destroy the domain.
+   *
+   * In a situation where domain destruction is necessary, either manually
+   * call nvtxDomainDestroy on the domain's handle, or make a class that
+   * derives from `domain` and calls nvtxDomainDestroy in its destructor.
+   */
+  ~domain() = default;
+
+ private:
+  nvtxDomainHandle_t const _domain{};  ///< The `domain`s NVTX handle
+};
+
+/**
+ * @brief Returns reference to the `domain` object that represents the global
+ * NVTX domain.
+ *
+ * This specialization for `domain::global` returns a default constructed,
+ * `domain` object for use when the "global" domain is desired.
+ *
+ * All NVTX events in the global domain across all libraries and applications
+ * will be grouped together.
+ *
+ * @return Reference to the `domain` corresponding to the global NVTX domain.
+ *
+ */
+template <>
+NVTX3_NO_DISCARD inline domain const& domain::get<domain::global>() noexcept
+{
+  static domain const d{};
+  return d;
+}
+
+/**
+ * @brief Indicates the values of the red, green, and blue color channels for
+ * an RGB color to use as an event attribute (assumes no transparency).
+ *
+ */
+struct rgb {
+  /// Type used for component values
+  using component_type = uint8_t;
+
+  /**
+   * @brief Construct a rgb with red, green, and blue channels
+   * specified by `red_`, `green_`, and `blue_`, respectively.
+   *
+   * Valid values are in the range `[0,255]`.
+   *
+   * @param red_ Value of the red channel
+   * @param green_ Value of the green channel
+   * @param blue_ Value of the blue channel
+   */
+  constexpr rgb(
+    component_type red_,
+    component_type green_,
+    component_type blue_) noexcept
+    : red{red_}, green{green_}, blue{blue_}
+  {
+  }
+
+  component_type red{};    ///< Red channel value
+  component_type green{};  ///< Green channel value
+  component_type blue{};   ///< Blue channel value
+};
+
+/**
+ * @brief Indicates the value of the alpha, red, green, and blue color
+ * channels for an ARGB color to use as an event attribute.
+ *
+ */
+struct argb final : rgb {
+  /**
+   * @brief Construct an argb with alpha, red, green, and blue channels
+   * specified by `alpha_`, `red_`, `green_`, and `blue_`, respectively.
+   *
+   * Valid values are in the range `[0,255]`.
+   *
+   * @param alpha_  Value of the alpha channel (opacity)
+   * @param red_  Value of the red channel
+   * @param green_  Value of the green channel
+   * @param blue_  Value of the blue channel
+   *
+   */
+  constexpr argb(
+    component_type alpha_,
+    component_type red_,
+    component_type green_,
+    component_type blue_) noexcept
+    : rgb{red_, green_, blue_}, alpha{alpha_}
+  {
+  }
+
+  component_type alpha{};  ///< Alpha channel value
+};
+
+/**
+ * @brief Represents a custom color that can be associated with an NVTX event
+ * via its `event_attributes`.
+ *
+ * Specifying colors for NVTX events is a convenient way to visually
+ * differentiate among different events in a visualization tool such as Nsight
+ * Systems.
+ *
+ */
+class color {
+ public:
+  /// Type used for the color's value
+  using value_type = uint32_t;
+
+  /**
+   * @brief Constructs a `color` using the value provided by `hex_code`.
+   *
+   * `hex_code` is expected to be a 4 byte argb hex code.
+   *
+   * The most significant byte indicates the value of the alpha channel
+   * (opacity) (0-255)
+   *
+   * The next byte indicates the value of the red channel (0-255)
+   *
+   * The next byte indicates the value of the green channel (0-255)
+   *
+   * The least significant byte indicates the value of the blue channel
+   * (0-255)
+   *
+   * @param hex_code The hex code used to construct the `color`
+   */
+  constexpr explicit color(value_type hex_code) noexcept : _value{hex_code} {}
+
+  /**
+   * @brief Construct a `color` using the alpha, red, green, blue components
+   * in `argb`.
+   *
+   * @param argb_ The alpha, red, green, blue components of the desired `color`
+   */
+  constexpr color(argb argb_) noexcept
+    : color{from_bytes_msb_to_lsb(argb_.alpha, argb_.red, argb_.green, argb_.blue)}
+  {
+  }
+
+  /**
+   * @brief Construct a `color` using the red, green, blue components in
+   * `rgb`.
+   *
+   * Uses maximum value for the alpha channel (opacity) of the `color`.
+   *
+   * @param rgb_ The red, green, blue components of the desired `color`
+   */
+  constexpr color(rgb rgb_) noexcept
+    : color{from_bytes_msb_to_lsb(0xFF, rgb_.red, rgb_.green, rgb_.blue)}
+  {
+  }
+
+  /**
+   * @brief Returns the `color`s argb hex code
+   *
+   */
+  constexpr value_type get_value() const noexcept { return _value; }
+
+  /**
+   * @brief Return the NVTX color type of the color.
+   *
+   */
+  constexpr nvtxColorType_t get_type() const noexcept { return _type; }
+
+  color() = delete;
+  ~color() = default;
+  color(color const&) = default;
+  color& operator=(color const&) = default;
+  color(color&&) = default;
+  color& operator=(color&&) = default;
+
+ private:
+  /**
+   * @brief Constructs an unsigned, 4B integer from the component bytes in
+   * most to least significant byte order.
+   *
+   */
+  constexpr static value_type from_bytes_msb_to_lsb(
+    uint8_t byte3,
+    uint8_t byte2,
+    uint8_t byte1,
+    uint8_t byte0) noexcept
+  {
+    return uint32_t{byte3} << 24 | uint32_t{byte2} << 16 | uint32_t{byte1} << 8 | uint32_t{byte0};
+  }
+
+  value_type _value{};                     ///< color's argb color code
+  nvtxColorType_t _type{NVTX_COLOR_ARGB};  ///< NVTX color type code
+};
+
+/**
+ * @brief Object for intra-domain grouping of NVTX events.
+ *
+ * A `category` is simply an integer id that allows for fine-grain grouping of
+ * NVTX events. For example, one might use separate categories for IO, memory
+ * allocation, compute, etc.
+ *
+ * Example:
+ * \code{.cpp}
+ * nvtx3::category cat1{1};
+ *
+ * // Range `r1` belongs to the category identified by the value `1`.
+ * nvtx3::scoped_range r1{cat1};
+ *
+ * // Range `r2` belongs to the same category as `r1`
+ * nvtx3::scoped_range r2{nvtx3::category{1}};
+ * \endcode
+ *
+ * To associate a name string with a category id, see `named_category`.
+ *
+ */
+class category {
+ public:
+  /// Type used for `category`s integer id.
+  using id_type = uint32_t;
+
+  /**
+   * @brief Construct a `category` with the specified `id`.
+   *
+   * The `category` will be unnamed and identified only by its `id` value.
+   *
+   * All `category`s in a domain sharing the same `id` are equivalent.
+   *
+   * @param[in] id The `category`'s identifying value
+   */
+  constexpr explicit category(id_type id) noexcept : id_{id} {}
+
+  /**
+   * @brief Returns the id of the category.
+   *
+   */
+  constexpr id_type get_id() const noexcept { return id_; }
+
+  category() = delete;
+  ~category() = default;
+  category(category const&) = default;
+  category& operator=(category const&) = default;
+  category(category&&) = default;
+  category& operator=(category&&) = default;
+
+ private:
+  id_type id_{};  ///< category's unique identifier
+};
+
+/**
+ * @brief A `category` with an associated name string.
+ *
+ * Associates a `name` string with a category `id` to help differentiate among
+ * categories.
+ *
+ * For any given category id `Id`, a `named_category(Id, "name")` should only
+ * be constructed once and reused throughout an application. This can be done
+ * by either explicitly creating static `named_category` objects, or using the
+ * `named_category::get` construct on first use helper (recommended).
+ *
+ * Creating two or more `named_category` objects with the same value for `id`
+ * in the same domain results in undefined behavior.
+ *
+ * Similarly, behavior is undefined when a `named_category` and `category`
+ * share the same value of `id`.
+ *
+ * Example:
+ * \code{.cpp}
+ * // Explicitly constructed, static `named_category` in global domain:
+ * static nvtx3::named_category static_category{42, "my category"};
+ *
+ * // Range `r` associated with category id `42`
+ * nvtx3::scoped_range r{static_category};
+ *
+ * // OR use construct on first use:
+ *
+ * // Define a type with `name` and `id` members
+ * struct my_category {
+ *    static constexpr char const* name{"my category"}; // category name
+ *    static constexpr uint32_t id{42}; // category id
+ * };
+ *
+ * // Use construct on first use to name the category id `42`
+ * // with name "my category"
+ * auto& cat = named_category_in<my_domain>::get<my_category>();
+ *
+ * // Range `r` associated with category id `42`
+ * nvtx3::scoped_range r{cat};
+ * \endcode
+ *
+ * `named_category_in<D>`'s association of a name to a category id is local to
+ * the domain specified by the type `D`. An id may have a different name in
+ * another domain.
+ *
+ * @tparam D Type containing `name` member used to identify the `domain` to
+ * which the `named_category_in` belongs. Else, `domain::global` to indicate
+ * that the global NVTX domain should be used.
+ */
+template <typename D = domain::global>
+class named_category_in final : public category {
+ public:
+#if NVTX3_USE_CHECKED_OVERLOADS_FOR_GET
+  /**
+   * @brief Returns a global instance of a `named_category_in` as a
+   * function-local static.
+   *
+   * Creates a `named_category_in<D>` with name and id specified by the contents
+   * of a type `C`. `C::name` determines the name and `C::id` determines the
+   * category id.
+   *
+   * This function is useful for constructing a named `category` exactly once
+   * and reusing the same instance throughout an application.
+   *
+   * Example:
+   * \code{.cpp}
+   * // Define a type with `name` and `id` members
+   * struct my_category {
+   *    static constexpr char const* name{"my category"}; // category name
+   *    static constexpr uint32_t id{42}; // category id
+   * };
+   *
+   * // Use construct on first use to name the category id `42`
+   * // with name "my category"
+   * auto& cat = named_category_in<my_domain>::get<my_category>();
+   *
+   * // Range `r` associated with category id `42`
+   * nvtx3::scoped_range r{cat};
+   * \endcode
+   *
+   * Uses the "construct on first use" idiom to safely ensure the `category`
+   * object is initialized exactly once. See
+   * https://isocpp.org/wiki/faq/ctors#static-init-order-on-first-use
+   *
+   * @tparam C Type containing a member `C::name` that resolves to either a
+   * `char const*` or `wchar_t const*` and `C::id`.
+   */
+  template <typename C,
+    typename std::enable_if<
+      detail::is_c_string<decltype(C::name)>::value &&
+      detail::is_uint32<decltype(C::id)>::value
+    , int>::type = 0>
+  static named_category_in const& get() noexcept
+  {
+    static named_category_in const cat(C::id, C::name);
+    return cat;
+  }
+
+  /**
+   * @brief Overload of `named_category_in::get` to provide a clear compile error
+   * when `C` has the required `name` and `id` members, but they are not the
+   * required types.  `name` must be directly convertible to `char const*` or
+   * `wchar_t const*`, and `id` must be `uint32_t`.
+   */
+  template <typename C,
+    typename std::enable_if<
+      !detail::is_c_string<decltype(C::name)>::value ||
+      !detail::is_uint32<decltype(C::id)>::value
+    , int>::type = 0>
+  NVTX3_NO_DISCARD static named_category_in const& get() noexcept
+  {
+    NVTX3_STATIC_ASSERT(detail::is_c_string<decltype(C::name)>::value,
+      "Type used to name an NVTX category must contain a static constexpr member "
+      "called 'name' of type const char* or const wchar_t* -- 'name' member is not "
+      "convertible to either of those types");
+    NVTX3_STATIC_ASSERT(detail::is_uint32<decltype(C::id)>::value,
+      "Type used to name an NVTX category must contain a static constexpr member "
+      "called 'id' of type uint32_t -- 'id' member is the wrong type");
+    static named_category_in const unused;
+    return unused;  // Function must compile for static_assert to be triggered
+  }
+
+  /**
+   * @brief Overload of `named_category_in::get` to provide a clear compile error
+   * when `C` does not have the required `name` and `id` members.
+   */
+  template <typename C,
+    typename std::enable_if<
+      !detail::has_name<C>::value ||
+      !detail::has_id<C>::value
+    , int>::type = 0>
+  NVTX3_NO_DISCARD static named_category_in const& get() noexcept
+  {
+    NVTX3_STATIC_ASSERT(detail::has_name<C>::value,
+      "Type used to name an NVTX category must contain a static constexpr member "
+      "called 'name' of type const char* or const wchar_t* -- 'name' member is missing");
+    NVTX3_STATIC_ASSERT(detail::has_id<C>::value,
+      "Type used to name an NVTX category must contain a static constexpr member "
+      "called 'id' of type uint32_t -- 'id' member is missing");
+    static named_category_in const unused;
+    return unused;  // Function must compile for static_assert to be triggered
+  }
+#else
+  template <typename C>
+  NVTX3_NO_DISCARD static named_category_in const& get() noexcept
+  {
+    static named_category_in const cat(C::id, C::name);
+    return cat;
+  }
+#endif
+
+ private:
+  // Default constructor is only used internally for static_assert(false) cases.
+  named_category_in() noexcept : category{0} {}
+
+ public:
+  /**
+   * @brief Construct a `named_category_in` with the specified `id` and `name`.
+   *
+   * The name `name` will be registered with `id`.
+   *
+   * Every unique value of `id` should only be named once.
+   *
+   * @param[in] id The category id to name
+   * @param[in] name The name to associated with `id`
+   */
+  named_category_in(id_type id, char const* name) noexcept : category{id}
+  {
+#ifndef NVTX_DISABLE
+    nvtxDomainNameCategoryA(domain::get<D>(), get_id(), name);
+#else
+    (void)id;
+    (void)name;
+#endif
+  }
+
+  /**
+   * @brief Construct a `named_category_in` with the specified `id` and `name`.
+   *
+   * The name `name` will be registered with `id`.
+   *
+   * Every unique value of `id` should only be named once.
+   *
+   * @param[in] id The category id to name
+   * @param[in] name The name to associated with `id`
+   */
+  named_category_in(id_type id, std::string const& name) noexcept
+    : named_category_in{id, name.c_str()} {}
+
+  /**
+   * @brief Construct a `named_category_in` with the specified `id` and `name`.
+   *
+   * The name `name` will be registered with `id`.
+   *
+   * Every unique value of `id` should only be named once.
+   *
+   * @param[in] id The category id to name
+   * @param[in] name The name to associated with `id`
+   */
+  named_category_in(id_type id, wchar_t const* name) noexcept : category{id}
+  {
+#ifndef NVTX_DISABLE
+    nvtxDomainNameCategoryW(domain::get<D>(), get_id(), name);
+#else
+    (void)id;
+    (void)name;
+#endif
+  }
+
+  /**
+   * @brief Construct a `named_category_in` with the specified `id` and `name`.
+   *
+   * The name `name` will be registered with `id`.
+   *
+   * Every unique value of `id` should only be named once.
+   *
+   * @param[in] id The category id to name
+   * @param[in] name The name to associated with `id`
+   */
+  named_category_in(id_type id, std::wstring const& name) noexcept
+    : named_category_in{id, name.c_str()} {}
+};
+
+/**
+ * @brief Alias for a `named_category_in` in the global NVTX domain.
+ *
+ */
+using named_category = named_category_in<domain::global>;
+
+/**
+ * @brief A message registered with NVTX.
+ *
+ * Normally, associating a `message` with an NVTX event requires copying the
+ * contents of the message string. This may cause non-trivial overhead in
+ * highly performance sensitive regions of code.
+ *
+ * message registration is an optimization to lower the overhead of
+ * associating a message with an NVTX event. Registering a message yields a
+ * handle that is inexpensive to copy that may be used in place of a message
+ * string.
+ *
+ * A particular message should only be registered once and the handle
+ * reused throughout the rest of the application. This can be done by either
+ * explicitly creating static `registered_string_in` objects, or using the
+ * `registered_string_in::get` construct on first use helper (recommended).
+ *
+ * Example:
+ * \code{.cpp}
+ * // Explicitly constructed, static `registered_string` in my_domain:
+ * static registered_string_in<my_domain> static_message{"message"};
+ *
+ * // "message" is associated with the range `r`
+ * nvtx3::scoped_range r{static_message};
+ *
+ * // Or use construct on first use:
+ *
+ * // Define a type with a `message` member that defines the contents of the
+ * // registered string
+ * struct my_message{ static constexpr char const* message{ "my message" }; };
+ *
+ * // Uses construct on first use to register the contents of
+ * // `my_message::message`
+ * auto& msg = registered_string_in<my_domain>::get<my_message>();
+ *
+ * // "my message" is associated with the range `r`
+ * nvtx3::scoped_range r{msg};
+ * \endcode
+ *
+ * `registered_string_in`s are local to a particular domain specified via
+ * the type `D`.
+ *
+ * @tparam D Type containing `name` member used to identify the `domain` to
+ * which the `registered_string_in` belongs. Else, `domain::global` to indicate
+ * that the global NVTX domain should be used.
+ */
+template <typename D = domain::global>
+class registered_string_in {
+ public:
+#if NVTX3_USE_CHECKED_OVERLOADS_FOR_GET
+  /**
+   * @brief Returns a global instance of a `registered_string_in` as a function
+   * local static.
+   *
+   * Provides a convenient way to register a message with NVTX without having
+   * to explicitly register the message.
+   *
+   * Upon first invocation, constructs a `registered_string_in` whose contents
+   * are specified by `message::message`.
+   *
+   * All future invocations will return a reference to the object constructed
+   * in the first invocation.
+   *
+   * Example:
+   * \code{.cpp}
+   * // Define a type with a `message` member that defines the contents of the
+   * // registered string
+   * struct my_message{ static constexpr char const* message{ "my message" };
+   * };
+   *
+   * // Uses construct on first use to register the contents of
+   * // `my_message::message`
+   * auto& msg = registered_string_in<my_domain>::get<my_message>();
+   *
+   * // "my message" is associated with the range `r`
+   * nvtx3::scoped_range r{msg};
+   * \endcode
+   *
+   * @tparam M Type required to contain a member `M::message` that
+   * resolves to either a `char const*` or `wchar_t const*` used as the
+   * registered string's contents.
+   * @return Reference to a `registered_string_in` associated with the type `M`.
+   */
+  template <typename M,
+    typename std::enable_if<
+      detail::is_c_string<decltype(M::message)>::value
+    , int>::type = 0>
+  NVTX3_NO_DISCARD static registered_string_in const& get() noexcept
+  {
+    static registered_string_in const regstr(M::message);
+    return regstr;
+  }
+
+  /**
+   * @brief Overload of `registered_string_in::get` to provide a clear compile error
+   * when `M` has a `message` member that is not directly convertible to either
+   * `char const*` or `wchar_t const*`.
+   */
+  template <typename M,
+    typename std::enable_if<
+      !detail::is_c_string<decltype(M::message)>::value
+    , int>::type = 0>
+  NVTX3_NO_DISCARD static registered_string_in const& get() noexcept
+  {
+    NVTX3_STATIC_ASSERT(detail::always_false<M>::value,
+      "Type used to register an NVTX string must contain a static constexpr member "
+      "called 'message' of type const char* or const wchar_t* -- 'message' member is "
+      "not convertible to either of those types");
+    static registered_string_in const unused;
+    return unused;  // Function must compile for static_assert to be triggered
+  }
+
+  /**
+   * @brief Overload of `registered_string_in::get` to provide a clear compile error when
+   * `M` does not have a `message` member.
+   */
+  template <typename M,
+    typename std::enable_if<
+      !detail::has_message<M>::value
+    , int>::type = 0>
+  NVTX3_NO_DISCARD static registered_string_in const& get() noexcept
+  {
+    NVTX3_STATIC_ASSERT(detail::always_false<M>::value,
+      "Type used to register an NVTX string must contain a static constexpr member "
+      "called 'message' of type const char* or const wchar_t* -- 'message' member "
+      "is missing");
+    static registered_string_in const unused;
+    return unused;  // Function must compile for static_assert to be triggered
+  }
+#else
+  template <typename M>
+  NVTX3_NO_DISCARD static registered_string_in const& get() noexcept
+  {
+    static registered_string_in const regstr(M::message);
+    return regstr;
+  }
+#endif
+
+  /**
+   * @brief Constructs a `registered_string_in` from the specified `msg` string.
+   *
+   * Registers `msg` with NVTX and associates a handle with the registered
+   * message.
+   *
+   * A particular message should should only be registered once and the handle
+   * reused throughout the rest of the application.
+   *
+   * @param msg The contents of the message
+   */
+  explicit registered_string_in(char const* msg) noexcept
+    : handle_{nvtxDomainRegisterStringA(domain::get<D>(), msg)}
+  {
+  }
+
+  /**
+   * @brief Constructs a `registered_string_in` from the specified `msg` string.
+   *
+   * Registers `msg` with NVTX and associates a handle with the registered
+   * message.
+   *
+   * A particular message should should only be registered once and the handle
+   * reused throughout the rest of the application.
+   *
+   * @param msg The contents of the message
+   */
+  explicit registered_string_in(std::string const& msg) noexcept
+    : registered_string_in{msg.c_str()} {}
+
+  /**
+   * @brief Constructs a `registered_string_in` from the specified `msg` string.
+   *
+   * Registers `msg` with NVTX and associates a handle with the registered
+   * message.
+   *
+   * A particular message should should only be registered once and the handle
+   * reused throughout the rest of the application.
+   *
+   * @param msg The contents of the message
+   */
+  explicit registered_string_in(wchar_t const* msg) noexcept
+    : handle_{nvtxDomainRegisterStringW(domain::get<D>(), msg)}
+  {
+  }
+
+  /**
+   * @brief Constructs a `registered_string_in` from the specified `msg` string.
+   *
+   * Registers `msg` with NVTX and associates a handle with the registered
+   * message.
+   *
+   * A particular message should only be registered once and the handle
+   * reused throughout the rest of the application.
+   *
+   * @param msg The contents of the message
+   */
+  explicit registered_string_in(std::wstring const& msg) noexcept
+    : registered_string_in{msg.c_str()} {}
+
+  /**
+   * @brief Returns the registered string's handle
+   *
+   */
+  nvtxStringHandle_t get_handle() const noexcept
+  {
+    // We want to ensure that we can use the registered_string in place of a handle
+    // in a payload data struct.
+    NVTX3_STATIC_ASSERT(
+      (detail::is_safe_wrapper_of<registered_string_in<D>, nvtxStringHandle_t>::value),
+      "Internal error! registered_string_in is potentially unsafe.");
+    return handle_;
+  }
+
+private:
+  // Default constructor is only used internally for static_assert(false) cases.
+  registered_string_in() noexcept {}
+public:
+  ~registered_string_in() = default;
+  registered_string_in(registered_string_in const&) = default;
+  registered_string_in& operator=(registered_string_in const&) = default;
+  registered_string_in(registered_string_in&&) = default;
+  registered_string_in& operator=(registered_string_in&&) = default;
+
+ private:
+  nvtxStringHandle_t handle_{};  ///< The handle returned from
+                                 ///< registering the message with NVTX
+};
+
+/**
+ * @brief Alias for a `registered_string_in` in the global NVTX domain.
+ *
+ */
+using registered_string = registered_string_in<domain::global>;
+
+/**
+ * @brief Allows associating a message string with an NVTX event via
+ * its `EventAttribute`s.
+ *
+ * Associating a `message` with an NVTX event through its `event_attributes`
+ * allows for naming events to easily differentiate them from other events.
+ *
+ * Every time an NVTX event is created with an associated `message`, the
+ * contents of the message string must be copied.  This may cause non-trivial
+ * overhead in highly performance sensitive sections of code. Use of a
+ * `nvtx3::registered_string` is recommended in these situations.
+ *
+ * Example:
+ * \code{.cpp}
+ * // Creates an `event_attributes` with message "message 0"
+ * nvtx3::event_attributes attr0{nvtx3::message{"message 0"}};
+ *
+ * // `range0` contains message "message 0"
+ * nvtx3::scoped_range range0{attr0};
+ *
+ * // `std::string` and string literals are implicitly assumed to be
+ * // the contents of an `nvtx3::message`
+ * // Creates an `event_attributes` with message "message 1"
+ * nvtx3::event_attributes attr1{"message 1"};
+ *
+ * // `range1` contains message "message 1"
+ * nvtx3::scoped_range range1{attr1};
+ *
+ * // `range2` contains message "message 2"
+ * nvtx3::scoped_range range2{nvtx3::message{"message 2"}};
+ *
+ * // `std::string` and string literals are implicitly assumed to be
+ * // the contents of an `nvtx3::message`
+ * // `range3` contains message "message 3"
+ * nvtx3::scoped_range range3{"message 3"};
+ * \endcode
+ */
+class message {
+ public:
+  using value_type = nvtxMessageValue_t;
+
+  /**
+   * @brief Construct a `message` whose contents are specified by `msg`.
+   *
+   * @param msg The contents of the message
+   */
+  NVTX3_CONSTEXPR_IF_CPP14 message(char const* msg) noexcept : type_{NVTX_MESSAGE_TYPE_ASCII}
+  {
+    value_.ascii = msg;
+  }
+
+  /**
+   * @brief Construct a `message` whose contents are specified by `msg`.
+   *
+   * @param msg The contents of the message
+   */
+  message(std::string const& msg) noexcept : message{msg.c_str()} {}
+
+  /**
+   * @brief Disallow construction for `std::string` r-value
+   *
+   * `message` is a non-owning type and therefore cannot take ownership of an
+   * r-value. Therefore, constructing from an r-value is disallowed to prevent
+   * a dangling pointer.
+   *
+   */
+#ifndef NVTX3_ALLOW_RVALUE_CONSTRUCTORS
+  message(std::string&&) = delete;
+#endif
+
+  /**
+   * @brief Construct a `message` whose contents are specified by `msg`.
+   *
+   * @param msg The contents of the message
+   */
+  NVTX3_CONSTEXPR_IF_CPP14 message(wchar_t const* msg) noexcept : type_{NVTX_MESSAGE_TYPE_UNICODE}
+  {
+    value_.unicode = msg;
+  }
+
+  /**
+   * @brief Construct a `message` whose contents are specified by `msg`.
+   *
+   * @param msg The contents of the message
+   */
+  message(std::wstring const& msg) noexcept : message{msg.c_str()} {}
+
+  /**
+   * @brief Disallow construction for `std::wstring` r-value
+   *
+   * `message` is a non-owning type and therefore cannot take ownership of an
+   * r-value. Therefore, constructing from an r-value is disallowed to prevent
+   * a dangling pointer.
+   *
+   */
+#ifndef NVTX3_ALLOW_RVALUE_CONSTRUCTORS
+  message(std::wstring&&) = delete;
+#endif
+
+  /**
+   * @brief Construct a `message` from a `registered_string_in`.
+   *
+   * @tparam D Type containing `name` member used to identify the `domain`
+   * to which the `registered_string_in` belongs. Else, `domain::global` to
+   * indicate that the global NVTX domain should be used.
+   * @param msg The message that has already been registered with NVTX.
+   */
+  template <typename D>
+  NVTX3_CONSTEXPR_IF_CPP14 message(registered_string_in<D> const& msg) noexcept
+    : type_{NVTX_MESSAGE_TYPE_REGISTERED}
+  {
+    value_.registered = msg.get_handle();
+  }
+
+  /**
+   * @brief Construct a `message` from NVTX C API type and value.
+   *
+   * @param type nvtxMessageType_t enum value indicating type of the payload
+   * @param value nvtxMessageValue_t union containing message
+   */
+  constexpr message(
+    nvtxMessageType_t const& type,
+    nvtxMessageValue_t const& value) noexcept
+    : type_{type}, value_(value)
+  {
+  }
+
+  /**
+   * @brief Construct a `message` from NVTX C API registered string handle.
+   *
+   * @param handle nvtxStringHandle_t value of registered string handle
+   */
+  NVTX3_CONSTEXPR_IF_CPP14 message(nvtxStringHandle_t handle) noexcept
+    : type_{NVTX_MESSAGE_TYPE_REGISTERED}
+  {
+    value_.registered = handle;
+  }
+
+  /**
+   * @brief Return the union holding the value of the message.
+   *
+   */
+  constexpr value_type get_value() const noexcept { return value_; }
+
+  /**
+   * @brief Return the type information about the value the union holds.
+   *
+   */
+  constexpr nvtxMessageType_t get_type() const noexcept { return type_; }
+
+ private:
+  nvtxMessageType_t type_{};    ///< message type
+  nvtxMessageValue_t value_{};  ///< message contents
+};
+
+/**
+ * @brief A numerical value that can be associated with an NVTX event via
+ * its `event_attributes`.
+ *
+ * Example:
+ * \code{.cpp}
+ * // Constructs a payload from the int32_t value 42
+ * nvtx3:: event_attributes attr{nvtx3::payload{42}};
+ *
+ * // `range0` will have an int32_t payload of 42
+ * nvtx3::scoped_range range0{attr};
+ *
+ * // range1 has double payload of 3.14
+ * nvtx3::scoped_range range1{nvtx3::payload{3.14}};
+ * \endcode
+ */
+class payload {
+ public:
+  using value_type = typename nvtxEventAttributes_v2::payload_t;
+
+  /**
+   * @brief Construct a `payload` from a signed, 8 byte integer.
+   *
+   * @param value Value to use as contents of the payload
+   */
+  NVTX3_CONSTEXPR_IF_CPP14 explicit payload(int64_t value) noexcept
+    : type_{NVTX_PAYLOAD_TYPE_INT64}, value_{}
+  {
+    value_.llValue = value;
+  }
+
+  /**
+   * @brief Construct a `payload` from a signed, 4 byte integer.
+   *
+   * @param value Value to use as contents of the payload
+   */
+  NVTX3_CONSTEXPR_IF_CPP14 explicit payload(int32_t value) noexcept
+    : type_{NVTX_PAYLOAD_TYPE_INT32}, value_{}
+  {
+    value_.iValue = value;
+  }
+
+  /**
+   * @brief Construct a `payload` from an unsigned, 8 byte integer.
+   *
+   * @param value Value to use as contents of the payload
+   */
+  NVTX3_CONSTEXPR_IF_CPP14 explicit payload(uint64_t value) noexcept
+    : type_{NVTX_PAYLOAD_TYPE_UNSIGNED_INT64}, value_{}
+  {
+    value_.ullValue = value;
+  }
+
+  /**
+   * @brief Construct a `payload` from an unsigned, 4 byte integer.
+   *
+   * @param value Value to use as contents of the payload
+   */
+  NVTX3_CONSTEXPR_IF_CPP14 explicit payload(uint32_t value) noexcept
+    : type_{NVTX_PAYLOAD_TYPE_UNSIGNED_INT32}, value_{}
+  {
+    value_.uiValue = value;
+  }
+
+  /**
+   * @brief Construct a `payload` from a single-precision floating point
+   * value.
+   *
+   * @param value Value to use as contents of the payload
+   */
+  NVTX3_CONSTEXPR_IF_CPP14 explicit payload(float value) noexcept
+    : type_{NVTX_PAYLOAD_TYPE_FLOAT}, value_{}
+  {
+    value_.fValue = value;
+  }
+
+  /**
+   * @brief Construct a `payload` from a double-precision floating point
+   * value.
+   *
+   * @param value Value to use as contents of the payload
+   */
+  NVTX3_CONSTEXPR_IF_CPP14 explicit payload(double value) noexcept
+    : type_{NVTX_PAYLOAD_TYPE_DOUBLE}, value_{}
+  {
+    value_.dValue = value;
+  }
+
+  /**
+   * @brief Construct a `payload` from NVTX C API type and value.
+   *
+   * @param type nvtxPayloadType_t enum value indicating type of the payload
+   * @param value nvtxEventAttributes_t::payload_t union containing payload
+   */
+  constexpr payload(
+    nvtxPayloadType_t const& type,
+    value_type const& value) noexcept
+    : type_{type}, value_(value)
+  {
+  }
+
+  /**
+   * @brief Return the union holding the value of the payload
+   *
+   */
+  constexpr value_type get_value() const noexcept { return value_; }
+
+  /**
+   * @brief Return the information about the type the union holds.
+   *
+   */
+  constexpr nvtxPayloadType_t get_type() const noexcept { return type_; }
+
+ private:
+  nvtxPayloadType_t type_;  ///< Type of the payload value
+  value_type value_;        ///< Union holding the payload value
+};
+
+/**
+ * @brief Represents the registered schema for a payload struct.
+ *
+ * This class encapsulates the schema ID obtained by registering a payload struct
+ * using `nvtxPayloadSchemaRegister`. The primary mechanism for obtaining an
+ * instance is via the static template function `get<T>()`, which must be
+ * specialized for each payload struct type `T` using the
+ * `NVTX3_DEFINE_SCHEMA_GET` (`NVTX3_V1_DEFINE_SCHEMA_GET()`) macro.
+ *
+ * The schema ID is used internally when constructing `payload_data` objects.
+ */
+class schema
+{
+private:
+  /**
+   * @brief Private default constructor.
+   *
+   * Used only internally for static_assert(false) cases.
+   */
+  schema()
+      : _schema_id{0}
+  {}
+
+  public:
+  schema(schema const&) = delete;
+  schema& operator=(schema const&) = delete;
+  schema(schema&&) = delete;
+  schema& operator=(schema&&) = delete;
+
+  /**
+   * @brief Constructs a schema object directly from a schema ID.
+   *
+   * This constructor is primarily for internal use or advanced scenarios where
+   * the schema ID is obtained manually.
+   *
+   * @param id The NVTX schema ID.
+   */
+  explicit schema(uint64_t id)
+      : _schema_id{id}
+  {}
+
+  /**
+   * @brief Gets the schema instance for a specific payload struct type.
+   *
+   * This function relies on template specialization. Users must provide a
+   * specialization for each payload struct type `T` using the
+   * `NVTX3_DEFINE_SCHEMA_GET` (`NVTX3_V1_DEFINE_SCHEMA_GET()`) macro.
+   *
+   * @tparam T The payload struct type for which to get the schema.
+   * @return A constant reference to the schema object for type `T`.
+   */
+  template <typename T>
+  NVTX3_NO_DISCARD static schema const& get() noexcept
+  {
+    NVTX3_STATIC_ASSERT(
+        detail::always_false<T>::value,
+        "payload_data schema deduction requires a template specialization. Use the macro "
+        "NVTX3_DEFINE_SCHEMA_GET to generate this specialization.");
+    static schema unused;
+    return unused;
+  }
+
+  /**
+   * @brief Return the underlying C handle of the schema.
+   */
+  uint64_t get_handle() const noexcept
+  {
+    return _schema_id;
+  }
+
+private:
+  uint64_t const _schema_id;
+};
+
+/**
+ * @brief Wrapper around the NVTX C API `nvtxPayloadData_t` struct.
+ *
+ * This class facilitates associating a structured payload with an NVTX event.
+ * It combines a pointer to the payload data instance with its registered schema
+ * ID and size.
+ */
+class payload_data
+{
+public:
+  /**
+   * @brief Constructs `payload_data` from an existing NVTX C API struct.
+   *
+   * Provides interoperability with code using the NVTX C API directly.
+   *
+   * @param pd An existing `nvtxPayloadData_t` struct.
+   */
+  explicit payload_data(nvtxPayloadData_t const& pd)
+      : data_(pd)
+  {}
+
+  /**
+   * @brief Constructs `payload_data` for a specific payload struct instance.
+   *
+   * This template constructor automatically retrieves the necessary information
+   * from the given struct type `T` and the reference to the instance.
+   * The type `T` must be standard layout and trivially copyable as well as
+   * have a `schema::get<T>()` specialization via `NVTX3_DEFINE_SCHEMA_GET` (`NVTX3_V1_DEFINE_SCHEMA_GET()`).
+   *
+   * Make sure the provided referenace is valid for the lifetime of the created
+   * `payload_data` object.
+   *
+   * @param t A constant reference to the payload struct instance.
+   */
+  // We cannot simply delete the rvalue constructor here because with a template
+  // parameter that would be a forwarding reference. Thus, we have this one
+  // ctor with a forwarding reference and use a static assert for the rvalue check.
+  // Disable this for the C-style nvtxPayloadData_t to prefer above ctor for non-const.
+  template <
+      typename R,
+      typename T = typename std::remove_cv<typename std::remove_reference<R>::type>::type,
+      typename = typename std::enable_if<!std::is_same<T, nvtxPayloadData_t>::value>::type>
+  explicit payload_data(R&& t)
+      : data_{schema::get<T>().get_handle(), sizeof(T), &t}
+  {
+#ifndef NVTX3_ALLOW_RVALUE_CONSTRUCTORS
+    NVTX3_STATIC_ASSERT(
+        std::is_lvalue_reference<R>::value,
+        "payload_data requires an lvalue reference to the underlying data. Constructing "
+        "from an rvalue is potentially unsafe and therefore forbidden.");
+#endif
+    NVTX3_STATIC_ASSERT(
+        std::is_standard_layout<T>::value && std::is_trivially_copyable<T>::value,
+        "structs used for NVTX3 payload schema must be standard layout and trivially copyable");
+  }
+
+  /**
+   * @brief Constructs `payload_data` for a payload instance with a given schema.
+   *
+   * Use this constructor if you have a dynamic schema for your struct rather than
+   * a static one defined by `NVTX3_DEFINE_SCHEMA_GET` (`NVTX3_V1_DEFINE_SCHEMA_GET()`).
+   *
+   * Make sure the provided referenace is valid for the lifetime of the created
+   * `payload_data` object.
+   *
+   * @param t A constant reference to the payload struct instance.
+   * @param s The schema to use for the payload data.
+   */
+  template <typename T>
+  explicit payload_data(T const& t, schema s)
+      : data_{s.get_handle(), sizeof(T), &t}
+  {
+    NVTX3_STATIC_ASSERT(
+        std::is_standard_layout<T>::value && std::is_trivially_copyable<T>::value,
+        "structs used for NVTX3 payload schema must be standard layout and trivially copyable");
+  }
+
+  /**
+   * @return A pointer to the `nvtxPayloadData_t` struct as ullValue to use
+   * with NVTX C API functions.
+   */
+  uint64_t as_ull_value() const noexcept
+  {
+    NVTX3_STATIC_ASSERT(
+        (detail::is_safe_wrapper_of<payload_data, nvtxPayloadData_t>::value),
+        "Internal error! payload_data is potentially unsafe.");
+    return NVTX_POINTER_AS_PAYLOAD_ULLVALUE(&data_);
+  }
+
+private:
+  nvtxPayloadData_t data_;
+};
+
+/**
+ * @brief Describes the attributes of a NVTX event.
+ *
+ * NVTX events can be customized via four "attributes":
+ *
+ * - color:    color used to visualize the event in tools such as Nsight
+ *             Systems. See `color`.
+ * - message:  Custom message string. See `message`.
+ * - payload:  User-defined numerical value. See `payload`.
+ * - category: Intra-domain grouping. See `category`.
+ *
+ * These component attributes are specified via an `event_attributes` object.
+ * See `nvtx3::color`, `nvtx3::message`, `nvtx3::payload`, and
+ * `nvtx3::category` for how these individual attributes are constructed.
+ *
+ * While it is possible to specify all four attributes, it is common to want
+ * to only specify a subset of attributes and use default values for the
+ * others. For convenience, `event_attributes` can be constructed from any
+ * number of attribute components in any order.
+ *
+ * Example:
+ * \code{.cpp}
+ * // Set message, same as using nvtx3::message{"message"}
+ * event_attributes attr{"message"};
+ *
+ * // Set message and color
+ * event_attributes attr{"message", nvtx3::rgb{127, 255, 0}};
+ *
+ * // Set message, color, payload, category
+ * event_attributes attr{"message",
+ *                       nvtx3::rgb{127, 255, 0},
+ *                       nvtx3::payload{42},
+ *                       nvtx3::category{1}};
+ *
+ * // Same as above -- can use any order of arguments
+ * event_attributes attr{nvtx3::payload{42},
+ *                       nvtx3::category{1},
+ *                       "message",
+ *                       nvtx3::rgb{127, 255, 0}};
+ *
+ * // Multiple arguments of the same type are allowed, but only the first is
+ * // used -- in this example, payload is set to 42:
+ * event_attributes attr{ nvtx3::payload{42}, nvtx3::payload{7} };
+ *
+ * // Range `r` will be customized according the attributes in `attr`
+ * nvtx3::scoped_range r{attr};
+ *
+ * // For convenience, `event_attributes` constructor arguments may be passed
+ * // to the `scoped_range_in` constructor -- they are forwarded to the
+ * // `event_attributes` constructor
+ * nvtx3::scoped_range r{nvtx3::payload{42}, nvtx3::category{1}, "message"};
+ *
+ * // Using the nvtx3 namespace in a local scope makes the syntax more succinct:
+ * using namespace nvtx3;
+ * scoped_range r{payload{42}, category{1}, "message"};
+ * \endcode
+ *
+ */
+class event_attributes {
+ public:
+  using value_type = nvtxEventAttributes_t;
+
+  /**
+   * @brief Default constructor creates an `event_attributes` with no
+   * category, color, payload, nor message.
+   */
+  constexpr event_attributes() noexcept
+    : attributes_{
+        NVTX_VERSION,                   // version
+        sizeof(nvtxEventAttributes_t),  // size
+        0,                              // category
+        NVTX_COLOR_UNKNOWN,             // color type
+        0,                              // color value
+        NVTX_PAYLOAD_UNKNOWN,           // payload type
+        0,                              // reserved 4B
+        {0},                            // payload value (union)
+        NVTX_MESSAGE_UNKNOWN,           // message type
+        {nullptr}                       // message value (union)
+      }
+  {
+  }
+
+  /**
+   * @brief Variadic constructor where the first argument is a `category`.
+   *
+   * Sets the value of the `EventAttribute`s category based on `c` and
+   * forwards the remaining variadic parameter pack to the next constructor.
+   *
+   */
+  template <typename... Args>
+  NVTX3_CONSTEXPR_IF_CPP14 explicit event_attributes(category const& c, Args const&... args) noexcept
+    : event_attributes(args...)
+  {
+    attributes_.category = c.get_id();
+  }
+
+  /**
+   * @brief Variadic constructor where the first argument is a `color`.
+   *
+   * Sets the value of the `EventAttribute`s color based on `c` and forwards
+   * the remaining variadic parameter pack to the next constructor.
+   *
+   */
+  template <typename... Args>
+  NVTX3_CONSTEXPR_IF_CPP14 explicit event_attributes(color const& c, Args const&... args) noexcept
+    : event_attributes(args...)
+  {
+    attributes_.color     = c.get_value();
+    attributes_.colorType = c.get_type();
+  }
+
+  /**
+   * @brief Variadic constructor where the first argument is a `payload`.
+   *
+   * Sets the value of the `EventAttribute`s payload based on `p` and forwards
+   * the remaining variadic parameter pack to the next constructor.
+   *
+   */
+  template <typename... Args>
+  NVTX3_CONSTEXPR_IF_CPP14 explicit event_attributes(payload const& p, Args const&... args) noexcept
+    : event_attributes(args...)
+  {
+    attributes_.payload     = p.get_value();
+    attributes_.payloadType = p.get_type();
+  }
+
+  /**
+   * @brief Variadic constructor where the first argument is a single `payload_data`.
+   *
+   * Sets the value of the `EventAttribute`s payload data based on `pd` and forwards
+   * the remaining variadic parameter pack to the next constructor.
+   *
+   */
+  template <typename... Args>
+  NVTX3_CONSTEXPR_IF_CPP14 explicit event_attributes(payload_data const& pd, Args const&... args) noexcept
+      : event_attributes(args...)
+  {
+    attributes_.payloadType = NVTX_PAYLOAD_TYPE_EXT;
+    attributes_.reserved0 = 1;
+    attributes_.payload.ullValue = pd.as_ull_value();
+  }
+
+  /**
+   * @brief Deleted constructor for `payload_data` rvalue references.
+   *
+   * `event_attributes` is non-owning and therefore cannot take ownership of an r-value
+   * `payload_data`. Therefore this constructor is deleted by default to prevent dangling
+   * pointers.
+   */
+#ifndef NVTX3_ALLOW_RVALUE_CONSTRUCTORS
+  template <typename... Args>
+  NVTX3_CONSTEXPR_IF_CPP14 explicit event_attributes(payload_data&& pd, Args const&... args) = delete;
+#endif
+
+  /**
+   * @brief Variadic constructor template for containers of `payload_data`.
+   *
+   * Associates multiple structured payloads contained in `pdc` with the event attributes.
+   * This constructor is enabled for types that have both a `data()` member function
+   * returning `payload_data*` or `const payload_data*` and a `size()` member function.
+   * E.g., `std::vector` or `std::array` can be used.
+   * Forwards the remaining variadic parameter pack to the next constructor.
+   */
+  template <
+      typename T,
+      typename... Args,
+      typename = typename std::enable_if<
+          detail::has_data_member<T, payload_data>::value && detail::has_size_member<T>::value>::type>
+  NVTX3_CONSTEXPR_IF_CPP20 explicit event_attributes(T&& pdc, Args const&... args) noexcept
+      : event_attributes(args...)
+  {
+    NVTX3_STATIC_ASSERT(
+        std::is_lvalue_reference<T>::value,
+        "event_attributes requires an lvalue reference to the underlying data. "
+        "Constructing from an rvalue is potentially unsafe and therefore forbidden.");
+    attributes_.payloadType = NVTX_PAYLOAD_TYPE_EXT;
+    attributes_.reserved0 = static_cast<int32_t>(pdc.size()); // Cast size to int32_t
+    attributes_.payload.ullValue = pdc.data()->as_ull_value();
+  }
+
+  /**
+   * @brief Variadic constructor where the first argument is a `message`.
+   *
+   * Sets the value of the `EventAttribute`s message based on `m` and forwards
+   * the remaining variadic parameter pack to the next constructor.
+   *
+   */
+  template <typename... Args>
+  NVTX3_CONSTEXPR_IF_CPP14 explicit event_attributes(message const& m, Args const&... args) noexcept
+    : event_attributes(args...)
+  {
+    attributes_.message     = m.get_value();
+    attributes_.messageType = m.get_type();
+  }
+
+  ~event_attributes() = default;
+  event_attributes(event_attributes const&) = default;
+  event_attributes& operator=(event_attributes const&) = default;
+  event_attributes(event_attributes&&) = default;
+  event_attributes& operator=(event_attributes&&) = default;
+
+  /**
+   * @brief Get raw pointer to underlying NVTX attributes object.
+   *
+   */
+  constexpr value_type const* get() const noexcept { return &attributes_; }
+
+ private:
+  value_type attributes_{};  ///< The NVTX attributes structure
+};
+
+/**
+ * @brief A RAII object for creating a NVTX range local to a thread within a
+ * domain.
+ *
+ * When constructed, begins a nested NVTX range on the calling thread in the
+ * specified domain. Upon destruction, ends the NVTX range.
+ *
+ * Behavior is undefined if a `scoped_range_in` object is
+ * created/destroyed on different threads.
+ *
+ * `scoped_range_in` is neither movable nor copyable.
+ *
+ * `scoped_range_in`s may be nested within other ranges.
+ *
+ * The domain of the range is specified by the template type parameter `D`.
+ * By default, the `domain::global` is used, which scopes the range to the
+ * global NVTX domain. The convenience alias `scoped_range` is provided for
+ * ranges scoped to the global domain.
+ *
+ * A custom domain can be defined by creating a type, `D`, with a static
+ * member `D::name` whose value is used to name the domain associated with
+ * `D`. `D::name` must resolve to either `char const*` or `wchar_t const*`
+ *
+ * Example:
+ * \code{.cpp}
+ * // Define a type `my_domain` with a member `name` used to name the domain
+ * // associated with the type `my_domain`.
+ * struct my_domain{
+ *    static constexpr char const* name{"my domain"};
+ * };
+ * \endcode
+ *
+ * Usage:
+ * \code{.cpp}
+ * nvtx3::scoped_range_in<my_domain> r1{"range 1"}; // Range in my domain
+ *
+ * // Three equivalent ways to make a range in the global domain:
+ * nvtx3::scoped_range_in<nvtx3::domain::global> r2{"range 2"};
+ * nvtx3::scoped_range_in<> r3{"range 3"};
+ * nvtx3::scoped_range r4{"range 4"};
+ *
+ * // Create an alias to succinctly make ranges in my domain:
+ * using my_scoped_range = nvtx3::scoped_range_in<my_domain>;
+ *
+ * my_scoped_range r3{"range 3"};
+ * \endcode
+ */
+template <class D = domain::global>
+class NVTX3_MAYBE_UNUSED scoped_range_in {
+ public:
+  /**
+   * @brief Construct a `scoped_range_in` with the specified
+   * `event_attributes`
+   *
+   * Example:
+   * \code{cpp}
+   * nvtx3::event_attributes attr{"msg", nvtx3::rgb{127,255,0}};
+   * nvtx3::scoped_range range{attr}; // Creates a range with message contents
+   *                                  // "msg" and green color
+   * \endcode
+   *
+   * @param[in] attr `event_attributes` that describes the desired attributes
+   * of the range.
+   */
+  explicit scoped_range_in(event_attributes const& attr) noexcept
+  {
+#ifndef NVTX_DISABLE
+    nvtxDomainRangePushEx(domain::get<D>(), attr.get());
+#else
+    (void)attr;
+#endif
+  }
+
+  /**
+   * @brief Constructs a `scoped_range_in` from the constructor arguments
+   * of an `event_attributes`.
+   *
+   * Forwards the arguments `args...` to construct an
+   * `event_attributes` object. The `event_attributes` object is then
+   * associated with the `scoped_range_in`.
+   *
+   * For more detail, see `event_attributes` documentation.
+   *
+   * Example:
+   * \code{cpp}
+   * // Creates a range with message "message" and green color
+   * nvtx3::scoped_range r{"message", nvtx3::rgb{127,255,0}};
+   * \endcode
+   *
+   * @param[in] args Arguments to used to construct an `event_attributes` associated with this
+   * range.
+   *
+   */
+  template <typename... Args>
+  explicit scoped_range_in(Args const&... args) noexcept
+    : scoped_range_in{event_attributes{args...}}
+  {
+  }
+
+  /**
+   * @brief Default constructor creates a `scoped_range_in` with no
+   * message, color, payload, nor category.
+   *
+   */
+  scoped_range_in() noexcept : scoped_range_in{event_attributes{}} {}
+
+  /**
+   * @brief Delete `operator new` to disallow heap allocated objects.
+   *
+   * `scoped_range_in` must follow RAII semantics to guarantee proper push/pop semantics.
+   *
+   */
+  void* operator new(std::size_t) = delete;
+
+  scoped_range_in(scoped_range_in const&) = delete;
+  scoped_range_in& operator=(scoped_range_in const&) = delete;
+  scoped_range_in(scoped_range_in&&) = delete;
+  scoped_range_in& operator=(scoped_range_in&&) = delete;
+
+  /**
+   * @brief Destroy the scoped_range_in, ending the NVTX range event.
+   */
+  ~scoped_range_in() noexcept
+  {
+#ifndef NVTX_DISABLE
+    nvtxDomainRangePop(domain::get<D>());
+#endif
+  }
+};
+
+/**
+ * @brief Alias for a `scoped_range_in` in the global NVTX domain.
+ *
+ */
+using scoped_range = scoped_range_in<domain::global>;
+
+/**
+ * @brief Manually begin a nested thread range in a domain.
+ *
+ * This function begins a nested range on the calling thread in the specified
+ * domain. End the range with a matching call to `pop_range_in<D>()` on the same
+ * thread.
+ *
+ * Prefer `nvtx3::scoped_range_in` when a range can be tied to a C++ object
+ * lifetime. Use this manual push/pop API for callback-driven code or other
+ * control flows where the range begin and end happen in separate C++ scopes.
+ *
+ * @warning Manual push/pop ranges are not RAII protected. The caller is
+ * responsible for ensuring each pushed range has exactly one matching pop,
+ * ranges are properly nested, and the matching pop is called on the same
+ * thread.
+ *
+ * Example:
+ * \code{.cpp}
+ * nvtx3::event_attributes attr{"msg", nvtx3::rgb{127,255,0}};
+ * nvtx3::push_range_in<my_domain>(attr);
+ * ...
+ * nvtx3::pop_range_in<my_domain>();
+ * \endcode
+ *
+ * @tparam D Type containing `name` member used to identify the `domain`
+ * to which the range belongs. Else, `domain::global` to indicate that the
+ * global NVTX domain should be used.
+ * @param[in] attr `event_attributes` that describes the desired attributes
+ * of the range.
+ * @return The 0-based level of the range being started, or a negative value
+ * if an error occurs.
+ */
+template <typename D = domain::global>
+inline int push_range_in(event_attributes const& attr) noexcept
+{
+#ifndef NVTX_DISABLE
+  return nvtxDomainRangePushEx(domain::get<D>(), attr.get());
+#else
+  (void)attr;
+  return 0;
+#endif
+}
+
+/**
+ * @brief Manually begin a nested thread range in a domain.
+ *
+ * This overload uses `args...` to construct an `event_attributes` object to
+ * associate with the range. For more detail, see `event_attributes`.
+ *
+ * Prefer `nvtx3::scoped_range_in` when a range can be tied to a C++ object
+ * lifetime. Use this manual push/pop API for callback-driven code or other
+ * control flows where the range begin and end happen in separate C++ scopes.
+ *
+ * @warning Manual push/pop ranges are not RAII protected. The caller is
+ * responsible for ensuring each pushed range has exactly one matching pop,
+ * ranges are properly nested, and the matching pop is called on the same
+ * thread.
+ *
+ * Example:
+ * \code{.cpp}
+ * nvtx3::push_range_in<my_domain>("msg", nvtx3::rgb{127,255,0});
+ * ...
+ * nvtx3::pop_range_in<my_domain>();
+ * \endcode
+ *
+ * @tparam D Type containing `name` member used to identify the `domain`
+ * to which the range belongs. Else, `domain::global` to indicate that the
+ * global NVTX domain should be used.
+ * @param[in] args Variadic parameter pack of the arguments for an `event_attributes`.
+ * @return The 0-based level of the range being started, or a negative value
+ * if an error occurs.
+ */
+template <typename D = domain::global, typename... Args>
+inline int push_range_in(Args const&... args) noexcept
+{
+#ifndef NVTX_DISABLE
+  return push_range_in<D>(event_attributes{args...});
+#else
+  detail::silence_unused(args...);
+  return 0;
+#endif
+}
+
+/**
+ * @brief Manually begin a nested thread range in the global domain.
+ *
+ * This function is equivalent to `nvtx3::push_range_in<>()` and
+ * `nvtx3::push_range_in<nvtx3::domain::global>()`.
+ *
+ * Prefer `nvtx3::scoped_range` when a range can be tied to a C++ object
+ * lifetime. Use this manual push/pop API for callback-driven code or other
+ * control flows where the range begin and end happen in separate C++ scopes.
+ *
+ * @warning Manual push/pop ranges are not RAII protected. The caller is
+ * responsible for ensuring each pushed range has exactly one matching pop,
+ * ranges are properly nested, and the matching pop is called on the same
+ * thread.
+ *
+ * @param[in] attr `event_attributes` that describes the desired attributes
+ * of the range.
+ * @return The 0-based level of the range being started, or a negative value
+ * if an error occurs.
+ */
+inline int push_range(event_attributes const& attr) noexcept
+{
+#ifndef NVTX_DISABLE
+  return push_range_in<domain::global>(attr);
+#else
+  (void)attr;
+  return 0;
+#endif
+}
+
+/**
+ * @brief Manually begin a nested thread range in the global domain.
+ *
+ * This function is equivalent to `nvtx3::push_range_in<>()` and
+ * `nvtx3::push_range_in<nvtx3::domain::global>()`.
+ *
+ * This overload uses `args...` to construct an `event_attributes` object to
+ * associate with the range. For more detail, see `event_attributes`.
+ *
+ * Prefer `nvtx3::scoped_range` when a range can be tied to a C++ object
+ * lifetime. Use this manual push/pop API for callback-driven code or other
+ * control flows where the range begin and end happen in separate C++ scopes.
+ *
+ * @warning Manual push/pop ranges are not RAII protected. The caller is
+ * responsible for ensuring each pushed range has exactly one matching pop,
+ * ranges are properly nested, and the matching pop is called on the same
+ * thread.
+ *
+ * @param[in] args Variadic parameter pack of the arguments for an `event_attributes`.
+ * @return The 0-based level of the range being started, or a negative value
+ * if an error occurs.
+ */
+template <typename... Args>
+inline int push_range(Args const&... args) noexcept
+{
+#ifndef NVTX_DISABLE
+  return push_range_in<domain::global>(args...);
+#else
+  detail::silence_unused(args...);
+  return 0;
+#endif
+}
+
+/**
+ * @brief Manually end the current nested thread range in a domain.
+ *
+ * Ends the innermost range previously started by `push_range_in<D>()` on the
+ * same thread.
+ *
+ * Prefer `nvtx3::scoped_range_in` when a range can be tied to a C++ object
+ * lifetime. Use this manual push/pop API for callback-driven code or other
+ * control flows where the range begin and end happen in separate C++ scopes.
+ *
+ * @warning Manual push/pop ranges are not RAII protected. The caller is
+ * responsible for ensuring each pushed range has exactly one matching pop,
+ * ranges are properly nested, and the matching pop is called on the same
+ * thread.
+ *
+ * @tparam D Type containing `name` member used to identify the `domain`
+ * to which the range belongs. Else, `domain::global` to indicate that the
+ * global NVTX domain should be used.
+ * @return The level of the range being ended, or a negative value if an error
+ * occurs.
+ */
+template <typename D = domain::global>
+inline int pop_range_in() noexcept
+{
+#ifndef NVTX_DISABLE
+  return nvtxDomainRangePop(domain::get<D>());
+#else
+  return 0;
+#endif
+}
+
+/**
+ * @brief Manually end the current nested thread range in the global domain.
+ *
+ * This function is equivalent to `nvtx3::pop_range_in<>()` and
+ * `nvtx3::pop_range_in<nvtx3::domain::global>()`.
+ *
+ * Prefer `nvtx3::scoped_range` when a range can be tied to a C++ object
+ * lifetime. Use this manual push/pop API for callback-driven code or other
+ * control flows where the range begin and end happen in separate C++ scopes.
+ *
+ * @warning Manual push/pop ranges are not RAII protected. The caller is
+ * responsible for ensuring each pushed range has exactly one matching pop,
+ * ranges are properly nested, and the matching pop is called on the same
+ * thread.
+ *
+ * @return The level of the range being ended, or a negative value if an error
+ * occurs.
+ */
+inline int pop_range() noexcept
+{
+#ifndef NVTX_DISABLE
+  return pop_range_in<domain::global>();
+#else
+  return 0;
+#endif
+}
+
+namespace detail {
+
+/// @cond internal
+template <typename D = domain::global>
+class NVTX3_MAYBE_UNUSED optional_scoped_range_in
+{
+public:
+  optional_scoped_range_in() = default;
+
+  void begin(event_attributes const& attr) noexcept
+  {
+#ifndef NVTX_DISABLE
+    // This class is not meant to be part of the public NVTX C++ API and should
+    // only be used in the `NVTX3_FUNC_RANGE_IF` and `NVTX3_FUNC_RANGE_IF_IN`
+    // macros. However, to prevent developers from misusing this class, make
+    // sure to not start multiple ranges.
+    if (initialized) { return; }
+
+    nvtxDomainRangePushEx(domain::get<D>(), attr.get());
+    initialized = true;
+#else
+    (void)attr;
+#endif
+  }
+
+  ~optional_scoped_range_in() noexcept
+  {
+#ifndef NVTX_DISABLE
+    if (initialized) { nvtxDomainRangePop(domain::get<D>()); }
+#endif
+  }
+
+  void* operator new(std::size_t) = delete;
+  optional_scoped_range_in(optional_scoped_range_in const&) = delete;
+  optional_scoped_range_in& operator=(optional_scoped_range_in const&) = delete;
+  optional_scoped_range_in(optional_scoped_range_in&&) = delete;
+  optional_scoped_range_in& operator=(optional_scoped_range_in&&) = delete;
+
+private:
+#ifndef NVTX_DISABLE
+  bool initialized = false;
+#endif
+};
+/// @endcond
+
+} // namespace detail
+
+/**
+ * @brief Handle used for correlating explicit range start and end events.
+ *
+ * A handle is "null" if it does not correspond to any range.
+ *
+ */
+struct range_handle {
+  /// Type used for the handle's value
+  using value_type = nvtxRangeId_t;
+
+
+  /**
+   * @brief Construct a `range_handle` from the given id.
+   *
+   */
+  constexpr explicit range_handle(value_type id) noexcept : _range_id{id} {}
+
+  /**
+   * @brief Constructs a null range handle.
+   *
+   * A null range_handle corresponds to no range. Calling `end_range` on a
+   * null handle is undefined behavior when a tool is active.
+   *
+   */
+  constexpr range_handle() noexcept = default;
+
+  /**
+   * @brief Checks whether this handle is null
+   *
+   * Provides contextual conversion to `bool`.
+   *
+   * \code{cpp}
+   * range_handle handle{};
+   * if (handle) {...}
+   * \endcode
+   *
+   */
+  constexpr explicit operator bool() const noexcept { return get_value() != null_range_id; }
+
+  /**
+   * @brief Implicit conversion from `nullptr` constructs a null handle.
+   *
+   * Satisfies the "NullablePointer" requirement to make `range_handle` comparable with `nullptr`.
+   *
+   */
+  constexpr range_handle(std::nullptr_t) noexcept {}
+
+  /**
+   * @brief Returns the `range_handle`'s value
+   *
+   * @return value_type The handle's value
+   */
+  constexpr value_type get_value() const noexcept { return _range_id; }
+
+ private:
+  /// Sentinel value for a null handle that corresponds to no range
+  static constexpr value_type null_range_id = nvtxRangeId_t{0};
+
+  value_type _range_id{null_range_id};  ///< The underlying NVTX range id
+};
+
+/**
+ * @brief Compares two range_handles for equality
+ *
+ * @param lhs The first range_handle to compare
+ * @param rhs The second range_handle to compare
+ */
+inline constexpr bool operator==(range_handle lhs, range_handle rhs) noexcept
+{
+  return lhs.get_value() == rhs.get_value();
+}
+
+/**
+ * @brief Compares two range_handles for inequality
+ *
+ * @param lhs The first range_handle to compare
+ * @param rhs The second range_handle to compare
+ */
+inline constexpr bool operator!=(range_handle lhs, range_handle rhs) noexcept { return !(lhs == rhs); }
+
+/**
+ * @brief Manually begin an NVTX range.
+ *
+ * Explicitly begins an NVTX range and returns a unique handle. To end the
+ * range, pass the handle to `end_range_in<D>()`.
+ *
+ * `nvtx3::start_range(...)` is equivalent to `nvtx3::start_range_in<>(...)` and
+ * `nvtx3::start_range_in<nvtx3::domain::global>(...)`.
+ *
+ * `start_range_in/end_range_in` are the most explicit and lowest level APIs
+ * provided for creating ranges.  Use of `nvtx3::unique_range_in` should be
+ * preferred unless one is unable to tie the range to the lifetime of an object.
+ *
+ * Example:
+ * \code{.cpp}
+ * nvtx3::event_attributes attr{"msg", nvtx3::rgb{127,255,0}};
+ * // Manually begin a range
+ * nvtx3::range_handle h = nvtx3::start_range_in<my_domain>(attr);
+ * ...
+ * nvtx3::end_range_in<my_domain>(h); // End the range
+ * \endcode
+ *
+ * @tparam D Type containing `name` member used to identify the `domain`
+ * to which the range belongs. Else, `domain::global` to indicate that the
+ * global NVTX domain should be used.
+ * @param[in] attr `event_attributes` that describes the desired attributes
+ * of the range.
+ * @return Unique handle to be passed to `end_range_in` to end the range.
+ */
+template <typename D = domain::global>
+NVTX3_NO_DISCARD inline range_handle start_range_in(event_attributes const& attr) noexcept
+{
+#ifndef NVTX_DISABLE
+  return range_handle{nvtxDomainRangeStartEx(domain::get<D>(), attr.get())};
+#else
+  (void)attr;
+  return {};
+#endif
+}
+
+/**
+ * @brief Manually begin an NVTX range.
+ *
+ * Explicitly begins an NVTX range and returns a unique handle. To end the
+ * range, pass the handle to `end_range_in<D>()`.
+ *
+ * `nvtx3::start_range(...)` is equivalent to `nvtx3::start_range_in<>(...)` and
+ * `nvtx3::start_range_in<nvtx3::domain::global>(...)`.
+ *
+ * `start_range_in/end_range_in` are the most explicit and lowest level APIs
+ * provided for creating ranges.  Use of `nvtx3::unique_range_in` should be
+ * preferred unless one is unable to tie the range to the lifetime of an object.
+ *
+ * This overload uses `args...` to construct an  `event_attributes` to
+ * associate with the range.  For more detail, see `event_attributes`.
+ *
+ * Example:
+ * \code{cpp}
+ * // Manually begin a range
+ * nvtx3::range_handle h = nvtx3::start_range_in<D>("msg", nvtx3::rgb{127,255,0});
+ * ...
+ * nvtx3::end_range_in<D>(h); // Ends the range
+ * \endcode
+ *
+ * @tparam D Type containing `name` member used to identify the `domain`
+ * to which the range belongs. Else, `domain::global` to indicate that the
+ * global NVTX domain should be used.
+ * @param[in] args Variadic parameter pack of the arguments for an `event_attributes`.
+ * @return Unique handle to be passed to `end_range` to end the range.
+ */
+template <typename D = domain::global, typename... Args>
+NVTX3_NO_DISCARD inline range_handle start_range_in(Args const&... args) noexcept
+{
+#ifndef NVTX_DISABLE
+  return start_range_in<D>(event_attributes{args...});
+#else
+  detail::silence_unused(args...);
+  return {};
+#endif
+}
+
+/**
+ * @brief Manually begin an NVTX range in the global domain.
+ *
+ * Explicitly begins an NVTX range and returns a unique handle. To end the
+ * range, pass the handle to `end_range()`.
+ *
+ * `nvtx3::start_range(...)` is equivalent to `nvtx3::start_range_in<>(...)` and
+ * `nvtx3::start_range_in<nvtx3::domain::global>(...)`.
+ *
+ * `start_range/end_range` are the most explicit and lowest level APIs
+ * provided for creating ranges.  Use of `nvtx3::unique_range` should be
+ * preferred unless one is unable to tie the range to the lifetime of an object.
+ *
+ * Example:
+ * \code{.cpp}
+ * nvtx3::event_attributes attr{"msg", nvtx3::rgb{127,255,0}};
+ * // Manually begin a range
+ * nvtx3::range_handle h = nvtx3::start_range(attr);
+ * ...
+ * nvtx3::end_range(h); // End the range
+ * \endcode
+ *
+ * @param[in] attr `event_attributes` that describes the desired attributes
+ * of the range.
+ * @return Unique handle to be passed to `end_range_in` to end the range.
+ */
+NVTX3_NO_DISCARD inline range_handle start_range(event_attributes const& attr) noexcept
+{
+#ifndef NVTX_DISABLE
+  return start_range_in<domain::global>(attr);
+#else
+  (void)attr;
+  return {};
+#endif
+}
+
+/**
+ * @brief Manually begin an NVTX range in the global domain.
+ *
+ * Explicitly begins an NVTX range and returns a unique handle. To end the
+ * range, pass the handle to `end_range_in<D>()`.
+ *
+ * `nvtx3::start_range(...)` is equivalent to `nvtx3::start_range_in<>(...)` and
+ * `nvtx3::start_range_in<nvtx3::domain::global>(...)`.
+ *
+ * `start_range_in/end_range_in` are the most explicit and lowest level APIs
+ * provided for creating ranges.  Use of `nvtx3::unique_range_in` should be
+ * preferred unless one is unable to tie the range to the lifetime of an object.
+ *
+ * This overload uses `args...` to construct an  `event_attributes` to
+ * associate with the range.  For more detail, see `event_attributes`.
+ *
+ * Example:
+ * \code{cpp}
+ * // Manually begin a range
+ * nvtx3::range_handle h = nvtx3::start_range("msg", nvtx3::rgb{127,255,0});
+ * ...
+ * nvtx3::end_range(h); // Ends the range
+ * \endcode
+ *
+ * @param[in] args Variadic parameter pack of the arguments for an `event_attributes`.
+ * @return Unique handle to be passed to `end_range` to end the range.
+ */
+template <typename... Args>
+NVTX3_NO_DISCARD inline range_handle start_range(Args const&... args) noexcept
+{
+#ifndef NVTX_DISABLE
+  return start_range_in<domain::global>(args...);
+#else
+  detail::silence_unused(args...);
+  return {};
+#endif
+}
+
+/**
+ * @brief Manually end the range associated with the handle `r` in domain `D`.
+ *
+ * Explicitly ends the NVTX range indicated by the handle `r` returned from a
+ * prior call to `start_range_in<D>`. The range may end on a different thread
+ * from where it began.
+ *
+ * @tparam D Type containing `name` member used to identify the `domain` to
+ * which the range belongs. Else, `domain::global` to indicate that the global
+ * NVTX domain should be used.
+ * @param r Handle to a range started by a prior call to `start_range_in`.
+ *
+ * @warning The domain type specified as template parameter to this function
+ * must be the same that was specified on the associated `start_range_in` call.
+ */
+template <typename D = domain::global>
+inline void end_range_in(range_handle r) noexcept
+{
+#ifndef NVTX_DISABLE
+  nvtxDomainRangeEnd(domain::get<D>(), r.get_value());
+#else
+  (void)r;
+#endif
+}
+
+/**
+ * @brief Manually end the range associated with the handle `r` in the global
+ * domain.
+ *
+ * Explicitly ends the NVTX range indicated by the handle `r` returned from a
+ * prior call to `start_range`. The range may end on a different thread from
+ * where it began.
+ *
+ * @param r Handle to a range started by a prior call to `start_range`.
+ *
+ * @warning The domain type specified as template parameter to this function
+ * must be the same that was specified on the associated `start_range` call.
+ */
+inline void end_range(range_handle r) noexcept
+{
+#ifndef NVTX_DISABLE
+  end_range_in<domain::global>(r);
+#else
+  (void)r;
+#endif
+}
+
+/**
+ * @brief A RAII object for creating a NVTX range within a domain that can
+ * be created and destroyed on different threads.
+ *
+ * When constructed, begins a NVTX range in the specified domain. Upon
+ * destruction, ends the NVTX range.
+ *
+ * Similar to `nvtx3::scoped_range_in`, with a few key differences:
+ * - `unique_range` objects can be destroyed in an order whereas `scoped_range` objects must be
+ *    destroyed in exact reverse creation order
+ * - `unique_range` can start and end on different threads
+ * - `unique_range` is movable
+ * - `unique_range` objects can be constructed as heap objects
+ *
+ * There is extra overhead associated with `unique_range` constructs and therefore use of
+ * `nvtx3::scoped_range_in` should be preferred.
+ *
+ * @tparam D Type containing `name` member used to identify the `domain`
+ * to which the `unique_range_in` belongs. Else, `domain::global` to
+ * indicate that the global NVTX domain should be used.
+ */
+template <typename D = domain::global>
+class NVTX3_MAYBE_UNUSED unique_range_in {
+ public:
+  /**
+   * @brief Construct a new unique_range_in object with the specified event attributes
+   *
+   * Example:
+   * \code{cpp}
+   * nvtx3::event_attributes attr{"msg", nvtx3::rgb{127,255,0}};
+   * nvtx3::unique_range_in<my_domain> range{attr}; // Creates a range with message contents
+   *                                            // "msg" and green color
+   * \endcode
+   *
+   * @param[in] attr `event_attributes` that describes the desired attributes
+   * of the range.
+   */
+  explicit unique_range_in(event_attributes const& attr) noexcept
+    : handle_{start_range_in<D>(attr)}
+  {
+  }
+
+  /**
+   * @brief Constructs a `unique_range_in` from the constructor arguments
+   * of an `event_attributes`.
+   *
+   * Forwards the arguments `args...` to construct an
+   * `event_attributes` object. The `event_attributes` object is then
+   * associated with the `unique_range_in`.
+   *
+   * For more detail, see `event_attributes` documentation.
+   *
+   * Example:
+   * \code{.cpp}
+   * // Creates a range with message "message" and green color
+   * nvtx3::unique_range_in<> r{"message", nvtx3::rgb{127,255,0}};
+   * \endcode
+   *
+   * @param[in] args Variadic parameter pack of arguments to construct an `event_attributes`
+   * associated with this range.
+   */
+  template <typename... Args>
+  explicit unique_range_in(Args const&... args) noexcept
+    : unique_range_in{event_attributes{args...}}
+  {
+  }
+
+  /**
+   * @brief Default constructor creates a `unique_range_in` with no
+   * message, color, payload, nor category.
+   *
+   */
+  constexpr unique_range_in() noexcept : unique_range_in{event_attributes{}} {}
+
+  /**
+   * @brief Destroy the `unique_range_in` ending the range.
+   *
+   */
+  ~unique_range_in() noexcept = default;
+
+  /**
+   * @brief Move constructor allows taking ownership of the NVTX range from
+   * another `unique_range_in`.
+   *
+   * @param other The range to take ownership of
+   */
+  unique_range_in(unique_range_in&& other) noexcept = default;
+
+  /**
+   * @brief Move assignment operator allows taking ownership of an NVTX range
+   * from another `unique_range_in`.
+   *
+   * @param other The range to take ownership of
+   */
+  unique_range_in& operator=(unique_range_in&& other) noexcept = default;
+
+  /// Copy construction is not allowed to prevent multiple objects from owning
+  /// the same range handle
+  unique_range_in(unique_range_in const&) = delete;
+
+  /// Copy assignment is not allowed to prevent multiple objects from owning the
+  /// same range handle
+  unique_range_in& operator=(unique_range_in const&) = delete;
+
+ private:
+
+  struct end_range_handle {
+    using pointer = range_handle;  /// Override the pointer type of the unique_ptr
+    void operator()(range_handle h) const noexcept { end_range_in<D>(h); }
+  };
+
+  /// Range handle used to correlate the start/end of the range
+  std::unique_ptr<range_handle, end_range_handle> handle_;
+};
+
+/**
+ * @brief Alias for a `unique_range_in` in the global NVTX domain.
+ *
+ */
+using unique_range = unique_range_in<domain::global>;
+
+/**
+ * @brief Annotates an instantaneous point in time with a "marker", using the
+ * attributes specified by `attr`.
+ *
+ * Unlike a "range" which has a beginning and an end, a marker is a single event
+ * in an application, such as detecting a problem:
+ *
+ * \code{.cpp}
+ * bool success = do_operation(...);
+ * if (!success) {
+ *    nvtx3::event_attributes attr{"operation failed!", nvtx3::rgb{255,0,0}};
+ *    nvtx3::mark_in<my_domain>(attr);
+ * }
+ * \endcode
+ *
+ * Note that nvtx3::mark_in<D> is a function, not a class like scoped_range_in<D>.
+ *
+ * @tparam D Type containing `name` member used to identify the `domain`
+ * to which the `unique_range_in` belongs. Else, `domain::global` to
+ * indicate that the global NVTX domain should be used.
+ * @param[in] attr `event_attributes` that describes the desired attributes
+ * of the mark.
+ */
+template <typename D = domain::global>
+inline void mark_in(event_attributes const& attr) noexcept
+{
+#ifndef NVTX_DISABLE
+  nvtxDomainMarkEx(domain::get<D>(), attr.get());
+#else
+  (void)(attr);
+#endif
+}
+
+/**
+ * @brief Annotates an instantaneous point in time with a "marker", using the
+ * arguments to construct an `event_attributes`.
+ *
+ * Unlike a "range" which has a beginning and an end, a marker is a single event
+ * in an application, such as detecting a problem:
+ *
+ * \code{.cpp}
+ * bool success = do_operation(...);
+ * if (!success) {
+ *    nvtx3::mark_in<my_domain>("operation failed!", nvtx3::rgb{255,0,0});
+ * }
+ * \endcode
+ *
+ * Note that nvtx3::mark_in<D> is a function, not a class like scoped_range_in<D>.
+ *
+ * Forwards the arguments `args...` to construct an `event_attributes` object.
+ * The attributes are then associated with the marker. For more detail, see
+ * the `event_attributes` documentation.
+ *
+ * @tparam D Type containing `name` member used to identify the `domain`
+ * to which the `unique_range_in` belongs. Else `domain::global` to
+ * indicate that the global NVTX domain should be used.
+ * @param[in] args Variadic parameter pack of arguments to construct an `event_attributes`
+ * associated with this range.
+ *
+ */
+template <typename D = domain::global, typename... Args>
+inline void mark_in(Args const&... args) noexcept
+{
+#ifndef NVTX_DISABLE
+  mark_in<D>(event_attributes{args...});
+#else
+  detail::silence_unused(args...);
+#endif
+}
+
+/**
+ * @brief Annotates an instantaneous point in time with a "marker", using the
+ * attributes specified by `attr`, in the global domain.
+ *
+ * Unlike a "range" which has a beginning and an end, a marker is a single event
+ * in an application, such as detecting a problem:
+ *
+ * \code{.cpp}
+ * bool success = do_operation(...);
+ * if (!success) {
+ *    nvtx3::event_attributes attr{"operation failed!", nvtx3::rgb{255,0,0}};
+ *    nvtx3::mark(attr);
+ * }
+ * \endcode
+ *
+ * Note that nvtx3::mark is a function, not a class like scoped_range.
+ *
+ * @param[in] attr `event_attributes` that describes the desired attributes
+ * of the mark.
+ */
+inline void mark(event_attributes const& attr) noexcept
+{
+#ifndef NVTX_DISABLE
+  mark_in<domain::global>(attr);
+#else
+  (void)attr;
+#endif
+}
+
+/**
+ * @brief Annotates an instantaneous point in time with a "marker", using the
+ * arguments to construct an `event_attributes`, in the global domain.
+ *
+ * Unlike a "range" which has a beginning and an end, a marker is a single event
+ * in an application, such as detecting a problem:
+ *
+ * \code{.cpp}
+ * bool success = do_operation(...);
+ * if (!success) {
+ *    nvtx3::mark("operation failed!", nvtx3::rgb{255,0,0});
+ * }
+ * \endcode
+ *
+ * Note that nvtx3::mark is a function, not a class like scoped_range.
+ *
+ * Forwards the arguments `args...` to construct an `event_attributes` object.
+ * The attributes are then associated with the marker. For more detail, see
+ * the `event_attributes` documentation.
+ *
+ * @param[in] args Variadic parameter pack of arguments to construct an
+ * `event_attributes` associated with this range.
+ *
+ */
+template <typename... Args>
+inline void mark(Args const&... args) noexcept
+{
+#ifndef NVTX_DISABLE
+  mark_in<domain::global>(args...);
+#else
+  detail::silence_unused(args...);
+#endif
+}
+
+/* ===== Counter Semantics API ============================================== */
+
+/**
+ * @brief Type-safe wrapper for NVTX scope identifiers.
+ *
+ * Scopes define the context in which a counter is meaningful, such as
+ * process-wide or thread-local.
+ *
+ * Predefined scopes are available as static member functions. Custom scopes
+ * can be created using explicit construction from a raw scope ID (C interop)
+ * or in future versions via `nvtxScopeRegister`.
+ *
+ * Example:
+ * \code{.cpp}
+ * // Use predefined scopes
+ * nvtx3::counter<int64_t> c1{"counter", nvtx3::scope::current_sw_process()};
+ *
+ * // C interop: wrap a raw scope ID
+ * uint64_t raw_id = some_c_api_returning_scope();
+ * nvtx3::scope custom{raw_id};
+ * nvtx3::counter<int64_t> c2{"counter", custom};
+ * \endcode
+ */
+class scope {
+public:
+  using value_type = uint64_t;
+
+  /**
+   * @brief Explicit constructor from a raw scope ID.
+   *
+   * Use this for C API interoperability when you have a scope ID
+   * from `nvtxScopeRegister` or similar.
+   *
+   * @param id The raw scope ID.
+   */
+  constexpr explicit scope(value_type id) noexcept : id_{id} {}
+
+  /**
+   * @brief Get the underlying scope ID.
+   * @return The raw scope ID for C API interop.
+   */
+  constexpr value_type get() const noexcept { return id_; }
+
+  /** @brief No scope specified. */
+  static constexpr scope none() noexcept { return scope{NVTX_SCOPE_NONE}; }
+  /** @brief The root in a hierarchy. */
+  static constexpr scope root() noexcept { return scope{NVTX_SCOPE_ROOT}; }
+
+  /* Hardware events */
+  /** @brief Node/machine name */
+  static constexpr scope current_hw_machine() noexcept { return scope{NVTX_SCOPE_CURRENT_HW_MACHINE}; }
+  static constexpr scope current_hw_socket() noexcept { return scope{NVTX_SCOPE_CURRENT_HW_SOCKET}; }
+  /** @brief Physical CPU core */
+  static constexpr scope current_hw_cpu_physical() noexcept { return scope{NVTX_SCOPE_CURRENT_HW_CPU_PHYSICAL}; }
+  /** @brief Logical CPU core */
+  static constexpr scope current_hw_cpu_logical() noexcept { return scope{NVTX_SCOPE_CURRENT_HW_CPU_LOGICAL}; }
+  /** @brief Innermost HW execution context */
+  static constexpr scope current_hw_innermost() noexcept { return scope{NVTX_SCOPE_CURRENT_HW_INNERMOST}; }
+
+  /* Virtualized hardware, virtual machines */
+  static constexpr scope current_hypervisor() noexcept { return scope{NVTX_SCOPE_CURRENT_HYPERVISOR}; }
+  static constexpr scope current_vm() noexcept { return scope{NVTX_SCOPE_CURRENT_VM}; }
+  static constexpr scope current_kernel() noexcept { return scope{NVTX_SCOPE_CURRENT_KERNEL}; }
+  static constexpr scope current_container() noexcept { return scope{NVTX_SCOPE_CURRENT_CONTAINER}; }
+  static constexpr scope current_os() noexcept { return scope{NVTX_SCOPE_CURRENT_OS}; }
+
+  /* Software scopes */
+  /** @brief Process scope */
+  static constexpr scope current_sw_process() noexcept { return scope{NVTX_SCOPE_CURRENT_SW_PROCESS}; }
+  /** @brief Thread scope */
+  static constexpr scope current_sw_thread() noexcept { return scope{NVTX_SCOPE_CURRENT_SW_THREAD}; }
+  /** @brief Innermost SW execution context */
+  static constexpr scope current_sw_innermost() noexcept { return scope{NVTX_SCOPE_CURRENT_SW_INNERMOST}; }
+
+private:
+  value_type id_;
+};
+
+namespace detail {
+
+// scope_semantic::scope is a builder method whose name hides the scope type
+// during member lookup. This version-local alias avoids spelling the fully
+// qualified type name, ::nvtx3::NVTX3_VERSION_NAMESPACE::scope, and depending
+// on the optional nvtx3::scope name, which is absent when
+// NVTX3_CPP_REQUIRE_EXPLICIT_VERSION is defined.
+using scope_type = scope;
+
+} // namespace detail
+
+/**
+ * @brief Reasons for sampling a counter without a value.
+ *
+ * Used with `counter_in::sample_no_value()` to indicate why a sample
+ * has no associated value.
+ */
+enum class no_value_reason : uint8_t {
+  zero        = NVTX_COUNTER_SAMPLE_ZERO,
+  unchanged   = NVTX_COUNTER_SAMPLE_UNCHANGED,
+  unavailable = NVTX_COUNTER_SAMPLE_UNAVAILABLE
+};
+
+/**
+ * @brief Builder class for configuring counter semantics.
+ *
+ * Counter semantics provide additional metadata about counter values,
+ * such as units, limits, interpolation behavior, and value types. This
+ * information helps tools to properly display and interpret counter data.
+ *
+ * Settings are always accumulated as flags, never reset.
+ * Do not mix overlapping settings.
+ *
+ * Setters return `*this` to allow method chaining.
+ *
+ * Example:
+ * \code{.cpp}
+ * nvtx3::counter_semantic sem;
+ * sem.unit("bytes")
+ *    .limits<int64_t>(0, 1024LL * 1024 * 1024)
+ *    .interpolation_since_last();
+ *
+ * nvtx3::counter<int64_t> memory{"heap_size",
+ *                                "Process heap size",
+ *                                nvtx3::scope::current_sw_process(),
+ *                                sem};
+ * \endcode
+ */
+class counter_semantic : public detail::semantic_base<nvtxSemanticsCounter_t> {
+public:
+  /**
+   * @brief Construct an unchained counter semantic.
+   */
+  counter_semantic() noexcept
+    : detail::semantic_base<nvtxSemanticsCounter_t>{
+        {{sizeof(nvtxSemanticsCounter_t), NVTX_SEMANTIC_ID_COUNTERS_V1,
+          NVTX_COUNTER_SEMANTIC_VERSION, nullptr},
+         NVTX_COUNTER_FLAGS_NONE,
+         nullptr,
+         1,
+         1,
+         NVTX_COUNTER_LIMIT_UNDEFINED,
+         {0},
+         {0}}}
+  {
+  }
+
+  // Raw C-header chaining is non-owning. Prefer the semantic-wrapper overload.
+  /**
+   * @brief Construct a counter semantic chained to another semantic header.
+   *
+   * @param next Non-owning pointer to the next semantic in the chain (nullptr if none).
+   */
+  explicit counter_semantic(nvtxSemanticsHeader_t const* next)
+    : counter_semantic{}
+  {
+    set_next(next);
+  }
+
+  /**
+   * @brief Construct a counter semantic that chains to another semantic builder.
+   *
+   * Convenience overload of the header-pointer constructor that accepts a
+   * sibling semantic builder object directly. The referenced builder is copied
+   * into this object.
+   *
+   * @tparam OtherDataType Underlying C struct type of the other semantic.
+   * @param next The semantic builder to chain after this one.
+   */
+  template <typename OtherDataType>
+  explicit counter_semantic(detail::semantic_base<OtherDataType> const& next)
+    : counter_semantic{}
+  {
+    own_next(next);
+  }
+
+  /**
+   * @brief Set the unit string for the counter (e.g., "bytes", "ms", "%").
+   * @param unit_name Unit string (must remain valid for the lifetime of this object).
+   * @return Reference to this object for chaining.
+   */
+  counter_semantic& unit(const char* unit_name) noexcept
+  {
+    data_.unit = unit_name;
+    return *this;
+  }
+
+  /**
+   * @brief Set the unit string for the counter (e.g., "bytes", "ms", "%").
+   * @param unit_name Unit string (must remain valid for the lifetime of this object).
+   * @return Reference to this object for chaining.
+   */
+  counter_semantic& unit(std::string const& unit_name) noexcept
+  {
+    return unit(unit_name.c_str());
+  }
+
+  /**
+   * @brief Disallow setting the borrowed unit string from a temporary string.
+   */
+  counter_semantic& unit(std::string&& unit_name) = delete;
+
+  /**
+   * @brief Set the unit scale as a fraction (numerator/denominator).
+   *
+   * @param numerator Scale numerator (should be 1 if not used).
+   * @param denominator Scale denominator (should be 1 if not used).
+   * @return Reference to this object for chaining.
+   */
+  counter_semantic& unit_scale(uint64_t numerator, uint64_t denominator = 1) noexcept
+  {
+    data_.unitScaleNumerator = numerator;
+    data_.unitScaleDenominator = denominator;
+    return *this;
+  }
+
+  /**
+   * @brief Enable normalization of counter values.
+   *
+   * Convert the fixed point value to a normalized floating point.
+   * Use the sign/unsign from the underlying type this flag is applied to.
+   * Unsigned [0f : 1f] or signed [-1f : 1f]
+   *
+   * @return Reference to this object for chaining.
+   */
+  counter_semantic& normalize() noexcept
+  {
+    data_.flags |= NVTX_COUNTER_FLAG_NORMALIZE;
+    return *this;
+  }
+
+  /**
+   * @brief Set value type to absolute.
+   *
+   * @throws std::logic_error if any valuetype_* setter has already been
+   *         called on this object.
+   * @return Reference to this object for chaining.
+   */
+  counter_semantic& valuetype_absolute()
+  {
+    set_enum_group_flag(NVTX_COUNTER_FLAG_VALUETYPES,
+                        NVTX_COUNTER_FLAG_VALUETYPE_ABSOLUTE, "valuetype");
+    return *this;
+  }
+
+  /**
+   * @brief Set value type to delta from previous sample.
+   *
+   * @throws std::logic_error if any valuetype_* setter has already been
+   *         called on this object.
+   * @return Reference to this object for chaining.
+   */
+  counter_semantic& valuetype_delta()
+  {
+    set_enum_group_flag(NVTX_COUNTER_FLAG_VALUETYPES,
+                        NVTX_COUNTER_FLAG_VALUETYPE_DELTA, "valuetype");
+    return *this;
+  }
+
+  /**
+   * @brief Set value type to delta since start.
+   *
+   * @throws std::logic_error if any valuetype_* setter has already been
+   *         called on this object.
+   * @return Reference to this object for chaining.
+   */
+  counter_semantic& valuetype_delta_since_start()
+  {
+    set_enum_group_flag(NVTX_COUNTER_FLAG_VALUETYPES,
+                        NVTX_COUNTER_FLAG_VALUETYPE_DELTA_SINCE_START, "valuetype");
+    return *this;
+  }
+
+  /**
+   * @brief Set interpolation to point (no interpolation between samples).
+   *
+   * @throws std::logic_error if any interpolation_* setter has already
+   *         been called on this object.
+   * @return Reference to this object for chaining.
+   */
+  counter_semantic& interpolation_point()
+  {
+    set_enum_group_flag(NVTX_COUNTER_FLAG_INTERPOLATIONS,
+                        NVTX_COUNTER_FLAG_INTERPOLATION_POINT, "interpolation");
+    return *this;
+  }
+
+  /**
+   * @brief Set interpolation to piecewise constant from last sample.
+   *
+   * @throws std::logic_error if any interpolation_* setter has already
+   *         been called on this object.
+   * @return Reference to this object for chaining.
+   */
+  counter_semantic& interpolation_since_last()
+  {
+    set_enum_group_flag(NVTX_COUNTER_FLAG_INTERPOLATIONS,
+                        NVTX_COUNTER_FLAG_INTERPOLATION_SINCE_LAST, "interpolation");
+    return *this;
+  }
+
+  /**
+   * @brief Set interpolation to piecewise constant until next sample.
+   *
+   * @throws std::logic_error if any interpolation_* setter has already
+   *         been called on this object.
+   * @return Reference to this object for chaining.
+   */
+  counter_semantic& interpolation_until_next()
+  {
+    set_enum_group_flag(NVTX_COUNTER_FLAG_INTERPOLATIONS,
+                        NVTX_COUNTER_FLAG_INTERPOLATION_UNTIL_NEXT, "interpolation");
+    return *this;
+  }
+
+  /**
+   * @brief Set interpolation to linear between samples.
+   *
+   * @throws std::logic_error if any interpolation_* setter has already
+   *         been called on this object.
+   * @return Reference to this object for chaining.
+   */
+  counter_semantic& interpolation_linear()
+  {
+    set_enum_group_flag(NVTX_COUNTER_FLAG_INTERPOLATIONS,
+                        NVTX_COUNTER_FLAG_INTERPOLATION_LINEAR, "interpolation");
+    return *this;
+  }
+
+  /**
+   * @brief Set minimum and maximum limits, typed.
+   *
+   * @tparam T One of `int64_t`, `uint64_t`, or `double`; selects the union
+   *           member in the underlying nvtxSemanticsCounter_v1 struct and
+   *           the corresponding NVTX_COUNTER_LIMIT_* tag stored in
+   *           `limitType`.
+   * @param min_val Minimum limit.
+   * @param max_val Maximum limit.
+   * @return Reference to this object for chaining.
+   *
+   * @note If limit_min<T1>() and limit_max<T2>() are called with different
+   *       T the last call wins on `limitType`, and the earlier write lives
+   *       in the wrong union member. Prefer this overload of limits() over
+   *       paired limit_min/limit_max when you want both bounds.
+   */
+  template <typename T>
+  counter_semantic& limits(T min_val, T max_val) noexcept
+  {
+    using traits = detail::counter_limit_traits<T>;
+    data_.limitType = traits::limit_type_value;
+    data_.flags |= NVTX_COUNTER_FLAG_LIMITS;
+    traits::store(data_.min, min_val);
+    traits::store(data_.max, max_val);
+    return *this;
+  }
+
+  /**
+   * @brief Set only the minimum limit, typed.
+   * @tparam T One of `int64_t`, `uint64_t`, or `double`.
+   * @param min_val Minimum limit.
+   * @return Reference to this object for chaining.
+   */
+  template <typename T>
+  counter_semantic& limit_min(T min_val) noexcept
+  {
+    using traits = detail::counter_limit_traits<T>;
+    data_.limitType = traits::limit_type_value;
+    data_.flags |= NVTX_COUNTER_FLAG_LIMIT_MIN;
+    traits::store(data_.min, min_val);
+    return *this;
+  }
+
+  /**
+   * @brief Set only the maximum limit, typed.
+   * @tparam T One of `int64_t`, `uint64_t`, or `double`.
+   * @param max_val Maximum limit.
+   * @return Reference to this object for chaining.
+   */
+  template <typename T>
+  counter_semantic& limit_max(T max_val) noexcept
+  {
+    using traits = detail::counter_limit_traits<T>;
+    data_.limitType = traits::limit_type_value;
+    data_.flags |= NVTX_COUNTER_FLAG_LIMIT_MAX;
+    traits::store(data_.max, max_val);
+    return *this;
+  }
+
+private:
+  void set_enum_group_flag(uint64_t group_mask, uint64_t value, char const* group_name)
+  {
+    if ((data_.flags & group_mask) != 0) {
+      throw std::logic_error(std::string("counter_semantic: conflicting ") + group_name
+                             + " setter; the " + group_name + " can be set only once");
+    }
+    data_.flags |= value;
+  }
+};
+
+/**
+ * @brief Builder for the scope semantic applied to a payload entry.
+ *
+ * Specifies the NVTX scope that applies to a particular value within a
+ * payload (for example, the scope of a counter or a timestamp). The
+ * scope must be known at schema registration time.
+ */
+class scope_semantic : public detail::semantic_base<nvtxSemanticsScope_t> {
+public:
+  /**
+   * @brief Construct an unchained scope semantic.
+   */
+  scope_semantic() noexcept
+    : detail::semantic_base<nvtxSemanticsScope_t>{
+        {{sizeof(nvtxSemanticsScope_t), NVTX_SEMANTIC_ID_SCOPE_V1,
+          NVTX_SCOPE_SEMANTIC_VERSION, nullptr},
+         NVTX_SCOPE_NONE}}
+  {
+  }
+
+  // Raw C-header chaining is non-owning. Prefer the semantic-wrapper overload.
+  /**
+   * @brief Construct a scope semantic chained to another semantic header.
+   *
+   * @param next Non-owning pointer to the next semantic in the chain, or nullptr.
+   */
+  explicit scope_semantic(nvtxSemanticsHeader_t const* next)
+    : scope_semantic{}
+  {
+    set_next(next);
+  }
+
+  /**
+   * @brief Construct a scope semantic that chains to another semantic builder.
+   *
+   * Convenience overload of the header-pointer constructor that accepts a
+   * sibling semantic builder object directly. The referenced builder is copied
+   * into this object.
+   *
+   * @tparam OtherDataType Underlying C struct type of the other semantic.
+   * @param next The semantic builder to chain after this one.
+   */
+  template <typename OtherDataType>
+  explicit scope_semantic(detail::semantic_base<OtherDataType> const& next)
+    : scope_semantic{}
+  {
+    own_next(next);
+  }
+
+  /**
+   * @brief Set the scope by raw NVTX scope identifier.
+   * @param scope_id One of the NVTX_SCOPE_* values or a tool-defined scope.
+   * @return Reference to this object for chaining.
+   */
+  scope_semantic& scope(uint64_t scope_id) noexcept
+  {
+    data_.scopeId = scope_id;
+    return *this;
+  }
+
+  /**
+   * @brief Set the scope by \c nvtx3::scope identifier.
+   * @param s Scope identifier (wraps an NVTX_SCOPE_* value).
+   * @return Reference to this object for chaining.
+   */
+  scope_semantic& scope(detail::scope_type s) noexcept
+  {
+    data_.scopeId = s.get();
+    return *this;
+  }
+};
+
+/**
+ * @brief A domain-scoped handle to a user-registered NVTX scope.
+ *
+ * Calls \c nvtxScopeRegister at construction to create a scope identified
+ * by a path, relative to an optional parent scope. The resulting scope
+ * ID can be used anywhere an NVTX scope is expected and, in particular,
+ * can be handed to \c scope_semantic::scope() through the implicit
+ * conversion to \c nvtx3::scope.
+ *
+ * @tparam D NVTX domain (defaults to \c domain::global).
+ */
+template <typename D = domain::global>
+class scope_in {
+public:
+  /**
+   * @brief Register a scope in the given domain.
+   *
+   * @param path Path delimited by '/' characters, relative to \p parent.
+   *             See \c nvtxScopeAttr_t for the full syntax. `nullptr` and
+   *             `""` are treated equivalently.
+   * @param parent Parent scope. Defaults to \c scope::none() (which the
+   *               tool treats as root).
+   * @param static_id Optional static scope ID, which must be in
+   *                  [\c NVTX_SCOPE_ID_STATIC_START, \c NVTX_SCOPE_ID_DYNAMIC_START).
+   *                  Defaults to \c NVTX_SCOPE_NONE, which lets the tool
+   *                  assign a dynamic ID.
+   */
+  explicit scope_in(char const* path,
+                    detail::scope_type parent = detail::scope_type::none(),
+                    uint64_t static_id = NVTX_SCOPE_NONE) noexcept
+  {
+#ifndef NVTX_DISABLE
+    nvtxScopeAttr_t attr{};
+    attr.structSize = sizeof(nvtxScopeAttr_t);
+    attr.path = path;
+    attr.parentScope = parent.get();
+    attr.scopeId = static_id;
+    id_ = nvtxScopeRegister(domain::get<D>(), &attr);
+#else
+    (void)path;
+    (void)parent;
+    (void)static_id;
+    id_ = NVTX_SCOPE_NONE;
+#endif
+  }
+
+  /**
+   * @brief Register a scope in the given domain from the specified path string.
+   *
+   * @param path Path delimited by '/' characters, relative to \p parent.
+   *             See \c nvtxScopeAttr_t for the full syntax. `""` is treated
+   *             equivalently to `nullptr`.
+   * @param parent Parent scope. Defaults to \c scope::none() (which the
+   *               tool treats as root).
+   * @param static_id Optional static scope ID, which must be in
+   *                  [\c NVTX_SCOPE_ID_STATIC_START, \c NVTX_SCOPE_ID_DYNAMIC_START).
+   *                  Defaults to \c NVTX_SCOPE_NONE, which lets the tool
+   *                  assign a dynamic ID.
+   */
+  explicit scope_in(std::string const& path,
+                    detail::scope_type parent = detail::scope_type::none(),
+                    uint64_t static_id = NVTX_SCOPE_NONE) noexcept
+    : scope_in{path.c_str(), parent, static_id} {}
+
+  /** @brief The registered scope ID (\c NVTX_SCOPE_NONE on failure). */
+  uint64_t id() const noexcept { return id_; }
+
+  /** @brief Convert to an \c nvtx3::scope for use with scope_semantic. */
+  operator detail::scope_type() const noexcept { return detail::scope_type{id_}; }
+
+private:
+  uint64_t id_;
+};
+
+/**
+ * @brief Builder for the time semantic applied to a payload entry.
+ *
+ * Specifies the time domain of a timestamp payload entry. The domain
+ * is either a user-registered identifier or one of the predefined
+ * \c NVTX_TIMESTAMP_TYPE_* constants.
+ */
+class time_semantic : public detail::semantic_base<nvtxSemanticsTime_t> {
+public:
+  /**
+   * @brief Construct an unchained time semantic.
+   */
+  time_semantic() noexcept
+    : detail::semantic_base<nvtxSemanticsTime_t>{
+        {{sizeof(nvtxSemanticsTime_t), NVTX_SEMANTIC_ID_TIME_V1,
+          NVTX_TIME_SEMANTIC_VERSION, nullptr},
+         0}}
+  {
+  }
+
+  // Raw C-header chaining is non-owning. Prefer the semantic-wrapper overload.
+  /**
+   * @brief Construct a time semantic chained to another semantic header.
+   *
+   * @param next Non-owning pointer to the next semantic in the chain, or nullptr.
+   */
+  explicit time_semantic(nvtxSemanticsHeader_t const* next)
+    : time_semantic{}
+  {
+    set_next(next);
+  }
+
+  /**
+   * @brief Construct a time semantic that chains to another semantic builder.
+   *
+   * Convenience overload of the header-pointer constructor that accepts a
+   * sibling semantic builder object directly. The referenced builder is copied
+   * into this object.
+   *
+   * @tparam OtherDataType Underlying C struct type of the other semantic.
+   * @param next The semantic builder to chain after this one.
+   */
+  template <typename OtherDataType>
+  explicit time_semantic(detail::semantic_base<OtherDataType> const& next)
+    : time_semantic{}
+  {
+    own_next(next);
+  }
+
+  /**
+   * @brief Set the time domain by identifier.
+   * @param domain_id A tool-registered time domain ID or a predefined
+   *                  \c NVTX_TIMESTAMP_TYPE_* value.
+   * @return Reference to this object for chaining.
+   */
+  time_semantic& time_domain(uint64_t domain_id) noexcept
+  {
+    data_.timeDomainId = domain_id;
+    return *this;
+  }
+};
+
+/**
+ * @brief Read a timestamp from the NVTX handler (wraps \c nvtxTimestampGet).
+ *
+ * If no tool is attached, the returned value is tool-defined (often a
+ * CPU TSC read). The timestamp is only meaningful alongside a registered
+ * timer source or time domain that tells the tool how to interpret it.
+ *
+ * @return The current NVTX timestamp.
+ */
+inline int64_t timestamp() noexcept
+{
+#ifndef NVTX_DISABLE
+  return nvtxTimestampGet();
+#else
+  return 0;
+#endif
+}
+
+/**
+ * @brief A domain-scoped handle to a user-registered NVTX time domain.
+ *
+ * Wraps \c nvtxTimeDomainRegister and the follow-up APIs that describe
+ * timer sources and report time synchronization between domains. Once
+ * constructed, the cached time domain ID can be passed to
+ * \c time_semantic::time_domain() or used directly with the C API.
+ *
+ * @tparam D NVTX domain (defaults to \c domain::global).
+ */
+template <typename D = domain::global>
+class time_domain_in {
+public:
+  /**
+   * @brief Register a time domain in the given NVTX domain.
+   *
+   * @param timestamp_type_id A predefined \c NVTX_TIMESTAMP_TYPE_* value or 0
+   *                          for tool-defined.
+   * @param s Scope in which the timestamps apply.
+   * @param timer_flags \c NVTX_TIMER_FLAG_* bits describing timer properties.
+   * @param timer_resolution Ticks per second (0 means unknown).
+   * @param timer_start One of \c NVTX_TIMER_START_*.
+   * @param static_id Optional static time domain ID, which must be in
+   *                  [\c NVTX_TIME_DOMAIN_ID_STATIC_START,
+   *                  \c NVTX_TIME_DOMAIN_ID_DYNAMIC_START). Defaults to 0,
+   *                  which lets the tool assign the ID.
+   */
+  explicit time_domain_in(uint64_t timestamp_type_id,
+                          detail::scope_type s = detail::scope_type::none(),
+                          uint64_t timer_flags = NVTX_TIMER_FLAG_NONE,
+                          int64_t timer_resolution = 0,
+                          uint64_t timer_start = NVTX_TIMER_START_UNKNOWN,
+                          uint64_t static_id = 0) noexcept
+  {
+#ifndef NVTX_DISABLE
+    nvtxTimeDomainAttr_t attr{};
+    attr.scopeId = s.get();
+    attr.timestampTypeId = timestamp_type_id;
+    attr.timeDomainId = static_id;
+    attr.timerFlags = timer_flags;
+    attr.timerResolution = timer_resolution;
+    attr.timerStart = timer_start;
+    id_ = nvtxTimeDomainRegister(domain::get<D>(), &attr);
+#else
+    (void)timestamp_type_id;
+    (void)s;
+    (void)timer_flags;
+    (void)timer_resolution;
+    (void)timer_start;
+    (void)static_id;
+    id_ = 0;
+#endif
+  }
+
+  /** @brief The registered time domain ID. */
+  uint64_t id() const noexcept { return id_; }
+
+  /**
+   * @brief Describe the timer source for this time domain.
+   *
+   * Wraps \c nvtxTimerSource.
+   *
+   * @param flags Provider flags (e.g. whether the function is safe to call
+   *              after process teardown).
+   * @param provider Pointer to a function that returns a timestamp.
+   */
+  void set_timer_source(uint64_t flags, int64_t (*provider)()) noexcept
+  {
+#ifndef NVTX_DISABLE
+    nvtxTimerSource(domain::get<D>(), id_, flags, provider);
+#else
+    (void)flags;
+    (void)provider;
+#endif
+  }
+
+  /**
+   * @brief Describe the timer source with a user data pointer.
+   *
+   * Wraps \c nvtxTimerSourceWithData.
+   *
+   * @param flags Provider flags.
+   * @param provider Pointer to a function that returns a timestamp given
+   *                 \p data.
+   * @param data Opaque pointer passed through to \p provider.
+   */
+  void set_timer_source(uint64_t flags,
+                        int64_t (*provider)(void*),
+                        void* data) noexcept
+  {
+#ifndef NVTX_DISABLE
+    nvtxTimerSourceWithData(domain::get<D>(), id_, flags, provider, data);
+#else
+    (void)flags;
+    (void)provider;
+    (void)data;
+#endif
+  }
+
+  /**
+   * @brief Report one synchronization point to another time domain.
+   *
+   * Wraps \c nvtxTimeSyncPoint.
+   *
+   * @param other_id Target time domain ID (a registered ID or a predefined
+   *                 \c NVTX_TIMESTAMP_TYPE_* when unambiguous).
+   * @param ts_self Timestamp in this time domain.
+   * @param ts_other Timestamp in the other time domain.
+   */
+  void sync_point(uint64_t other_id, int64_t ts_self, int64_t ts_other) noexcept
+  {
+#ifndef NVTX_DISABLE
+    nvtxTimeSyncPoint(domain::get<D>(), id_, other_id, ts_self, ts_other);
+#else
+    (void)other_id;
+    (void)ts_self;
+    (void)ts_other;
+#endif
+  }
+
+  /**
+   * @brief Report a table of synchronization points to another time domain.
+   *
+   * Wraps \c nvtxTimeSyncPointTable.
+   *
+   * @param other_id Target time domain ID.
+   * @param points Array of \c nvtxSyncPoint_t pairs.
+   * @param count Number of entries in \p points.
+   */
+  void sync_point_table(uint64_t other_id,
+                        nvtxSyncPoint_t const* points,
+                        size_t count) noexcept
+  {
+#ifndef NVTX_DISABLE
+    nvtxTimeSyncPointTable(domain::get<D>(), id_, other_id, points, count);
+#else
+    (void)other_id;
+    (void)points;
+    (void)count;
+#endif
+  }
+
+  /**
+   * @brief Report a conversion factor from this domain to another.
+   *
+   * Wraps \c nvtxTimestampConversionFactor.
+   *
+   * @param other_id Target time domain ID.
+   * @param slope Conversion factor (other-ticks / this-ticks).
+   * @param ts_self Reference timestamp in this time domain.
+   * @param ts_other Reference timestamp in the other time domain.
+   */
+  void conversion_factor(uint64_t other_id,
+                         double slope,
+                         int64_t ts_self,
+                         int64_t ts_other) noexcept
+  {
+#ifndef NVTX_DISABLE
+    nvtxTimestampConversionFactor(domain::get<D>(), id_, other_id, slope, ts_self, ts_other);
+#else
+    (void)other_id;
+    (void)slope;
+    (void)ts_self;
+    (void)ts_other;
+#endif
+  }
+
+private:
+  uint64_t id_;
+};
+
+/**
+ * @brief Builder for the correlation semantic applied to a payload entry.
+ *
+ * Marks an entry as the identifier of a correlation domain and specifies
+ * how the event relates to other events in that domain. The UUID must be
+ * globally unique across NVTX domains; the optional display name is
+ * copied by the tool at schema registration time.
+ */
+class correlation_semantic : public detail::semantic_base<nvtxSemanticsCorrelation_t> {
+public:
+  /**
+   * @brief Construct an unchained correlation semantic.
+   */
+  correlation_semantic() noexcept
+    : detail::semantic_base<nvtxSemanticsCorrelation_t>{
+        {{sizeof(nvtxSemanticsCorrelation_t), NVTX_SEMANTIC_ID_CORRELATION_V1,
+          NVTX_CORRELATION_SEMANTIC_VERSION, nullptr},
+         {0},
+         nullptr,
+         NVTX_CORRELATION_ROLE_NONE}}
+  {
+  }
+
+  // Raw C-header chaining is non-owning. Prefer the semantic-wrapper overload.
+  /**
+   * @brief Construct a correlation semantic chained to another semantic header.
+   *
+   * @param next Non-owning pointer to the next semantic in the chain, or nullptr.
+   */
+  explicit correlation_semantic(nvtxSemanticsHeader_t const* next)
+    : correlation_semantic{}
+  {
+    set_next(next);
+  }
+
+  /**
+   * @brief Construct a correlation semantic that chains to another semantic builder.
+   *
+   * Convenience overload of the header-pointer constructor that accepts a
+   * sibling semantic builder object directly. The referenced builder is copied
+   * into this object.
+   *
+   * @tparam OtherDataType Underlying C struct type of the other semantic.
+   * @param next The semantic builder to chain after this one.
+   */
+  template <typename OtherDataType>
+  explicit correlation_semantic(detail::semantic_base<OtherDataType> const& next)
+    : correlation_semantic{}
+  {
+    own_next(next);
+  }
+
+  /**
+   * @brief Set the correlation domain UUID.
+   * @param uuid A 16-byte array that must be globally unique across NVTX domains.
+   * @return Reference to this object for chaining.
+   */
+  correlation_semantic& domain_uuid(const unsigned char uuid[16]) noexcept
+  {
+    for (int i = 0; i < 16; ++i) {
+      data_.correlationDomainUuid[i] = uuid[i];
+    }
+    return *this;
+  }
+
+  /**
+   * @brief Set the optional display name for the correlation domain.
+   * @param name String copied by the tool at schema registration; must remain
+   *             valid until then.
+   * @return Reference to this object for chaining.
+   */
+  correlation_semantic& display_name(const char* name) noexcept
+  {
+    data_.displayName = name;
+    return *this;
+  }
+
+  /**
+   * @brief Set the optional display name for the correlation domain.
+   * @param name String copied by the tool at schema registration; must remain
+   *             valid until then.
+   * @return Reference to this object for chaining.
+   */
+  correlation_semantic& display_name(std::string const& name) noexcept
+  {
+    return display_name(name.c_str());
+  }
+
+  /**
+   * @brief Disallow setting the borrowed display name from a temporary string.
+   */
+  correlation_semantic& display_name(std::string&& name) = delete;
+
+  /**
+   * @brief Set the role this entry plays in the correlation.
+   * @param role_id One of the \c NVTX_CORRELATION_ROLE_* values.
+   * @return Reference to this object for chaining.
+   */
+  correlation_semantic& role(uint64_t role_id) noexcept
+  {
+    data_.role = role_id;
+    return *this;
+  }
+};
+
+namespace detail {
+
+/**
+ * @brief Type trait to get the NVTX schema ID for a given C++ type.
+ *
+ * Primary template uses schema::get<T>() for user-defined struct types.
+ * Specializations exist for primitive types.
+ */
+template <typename T, typename = void>
+struct counter_schema_id {
+  static uint64_t get() noexcept
+  {
+    return schema::get<T>().get_handle();
+  }
+};
+
+// Specializations for primitive types
+template <>
+struct counter_schema_id<int64_t> {
+  static constexpr uint64_t get() noexcept { return NVTX_PAYLOAD_ENTRY_TYPE_INT64; }
+};
+
+template <>
+struct counter_schema_id<uint64_t> {
+  static constexpr uint64_t get() noexcept { return NVTX_PAYLOAD_ENTRY_TYPE_UINT64; }
+};
+
+template <>
+struct counter_schema_id<int32_t> {
+  static constexpr uint64_t get() noexcept { return NVTX_PAYLOAD_ENTRY_TYPE_INT32; }
+};
+
+template <>
+struct counter_schema_id<uint32_t> {
+  static constexpr uint64_t get() noexcept { return NVTX_PAYLOAD_ENTRY_TYPE_UINT32; }
+};
+
+template <>
+struct counter_schema_id<double> {
+  static constexpr uint64_t get() noexcept { return NVTX_PAYLOAD_ENTRY_TYPE_FLOAT64; }
+};
+
+template <>
+struct counter_schema_id<float> {
+  static constexpr uint64_t get() noexcept { return NVTX_PAYLOAD_ENTRY_TYPE_FLOAT; }
+};
+
+} // namespace detail
+
+/**
+ * @brief A type-safe NVTX counter in a specific domain.
+ *
+ * `counter_in` provides a type-safe interface for NVTX counters. The counter
+ * value type is specified as a template parameter, ensuring that only values
+ * of the correct type can be sampled.
+ *
+ * For primitive types (int64_t, double, etc.), the schema is automatically
+ * determined. For user-defined struct types, a schema must be registered
+ * using `NVTX3_DEFINE_SCHEMA_GET`.
+ *
+ * @tparam T The value type of the counter.
+ * @tparam D The domain type (defaults to global domain).
+ *
+ * Example:
+ * \code{.cpp}
+ * // Simple int64_t counter
+ * nvtx3::counter<int64_t> iterations{"iteration_count"};
+ * iterations.sample(42);
+ *
+ * // Counter with semantics
+ * nvtx3::counter_semantic sem;
+ * sem.unit("bytes").limits(int64_t{0}, int64_t{1024 * 1024});
+ * nvtx3::counter<int64_t> memory{"heap_size",
+ *                                "Process heap size",
+ *                                nvtx3::scope::current_sw_process(),
+ *                                sem};
+ * memory.sample(512 * 1024);
+ *
+ * // Struct counter (requires NVTX3_DEFINE_SCHEMA_GET)
+ * nvtx3::counter<gpu_metrics> gpu{"gpu_0"};
+ * gpu.sample({72.5f, 250, 0.85});
+ * \endcode
+ */
+template <typename T, typename D = domain::global>
+class counter_in {
+public:
+  using value_type = T;
+
+  /**
+   * @brief Construct a counter with a name, description, and scope.
+   *
+   * @param name The counter name.
+   * @param description The counter description.
+   * @param s The scope for this counter.
+   */
+  counter_in(const char* name, const char* description = nullptr, scope s = scope::none() ) noexcept
+    : counter_in{name, description, s, nullptr}
+  {
+  }
+
+  /**
+   * @brief Construct a counter with a name and scope.
+   *
+   * @param name The counter name.
+   * @param s The scope for this counter.
+   */
+  counter_in(std::string const& name, scope s = scope::none()) noexcept
+    : counter_in{name.c_str(), nullptr, s, nullptr}
+  {
+  }
+
+  /**
+   * @brief Construct a counter with a name, description, and scope.
+   *
+   * @param name The counter name.
+   * @param description The counter description.
+   * @param s The scope for this counter.
+   */
+  counter_in(std::string const& name,
+             std::string const& description,
+             scope s = scope::none()) noexcept
+    : counter_in{name.c_str(), description.c_str(), s, nullptr}
+  {
+  }
+
+  /**
+   * @brief Construct a counter with name, description, scope, and semantics.
+   *
+   * @param name The counter name.
+   * @param description The counter description.
+   * @param s The scope for this counter.
+   * @param semantic The counter semantics.
+   */
+  counter_in(const char* name, const char* description, scope s, const counter_semantic& semantic) noexcept
+    : counter_in{name, description, s, &semantic}
+  {
+  }
+
+  /**
+   * @brief Construct a counter with name, description, scope, and semantics.
+   *
+   * @param name The counter name.
+   * @param description The counter description.
+   * @param s The scope for this counter.
+   * @param semantic The counter semantics.
+   */
+  counter_in(std::string const& name,
+             std::string const& description,
+             scope s,
+             const counter_semantic& semantic) noexcept
+    : counter_in{name.c_str(), description.c_str(), s, &semantic}
+  {
+  }
+
+  /**
+   * @brief Sample the counter with a value.
+   *
+   * The value type must match the counter's template parameter T.
+   * For primitive types (int64_t, double), optimized sampling functions
+   * are used. For struct types, the value is passed by reference.
+   *
+   * @param value The counter value to sample.
+   */
+  void sample(T const& value) noexcept
+  {
+#ifndef NVTX_DISABLE
+    sample_impl(value, std::is_same<T, int64_t>{}, std::is_same<T, double>{});
+#else
+    (void)value;
+#endif
+  }
+
+  /**
+   * @brief Sample the counter without a value.
+   *
+   * Used when a sample cannot be taken but should still be recorded.
+   *
+   * @param reason The reason for the missing value.
+   */
+  void sample_no_value(no_value_reason reason) noexcept
+  {
+#ifndef NVTX_DISABLE
+    nvtxCounterSampleNoValue(domain::get<D>(), id_, static_cast<uint8_t>(reason));
+#else
+    (void)reason;
+#endif
+  }
+
+  /**
+   * @brief Submit a batch of counter samples.
+   *
+   * Use this overload when the counter sample layout includes timestamp entries.
+   * Otherwise, provide timestamps with one of the timestamp overloads.
+   *
+   * @param values Pointer to a contiguous array of counter samples.
+   * @param count Number of samples in \p values.
+   * @param flags \c NVTX_BATCH_FLAG_* and \c NVTX_COUNTER_BATCH_FLAG_* bits.
+   */
+  void submit_batch(T const* values,
+                    size_t count,
+                    uint64_t flags = NVTX_BATCH_FLAG_TIME_SORTED) noexcept
+  {
+    submit_batch(values, count, nullptr, 0, flags);
+  }
+
+  /**
+   * @brief Submit a batch of counter samples with external timestamps.
+   *
+   * @param values Pointer to a contiguous array of counter samples.
+   * @param count Number of samples in \p values.
+   * @param timestamps Pointer to timestamps or timestamp/interval pairs.
+   * @param timestamp_count Number of timestamp values in \p timestamps.
+   * @param flags \c NVTX_BATCH_FLAG_* and \c NVTX_COUNTER_BATCH_FLAG_* bits.
+   */
+  void submit_batch(T const* values,
+                    size_t count,
+                    int64_t const* timestamps,
+                    size_t timestamp_count,
+                    uint64_t flags = NVTX_BATCH_FLAG_TIME_SORTED) noexcept
+  {
+#ifndef NVTX_DISABLE
+    nvtxCounterBatch_t batch{};
+    batch.counterId = id_;
+    batch.counters = values;
+    batch.countersSize = count * sizeof(T);
+    batch.flags = flags;
+    batch.timestamps = timestamps;
+    batch.timestampsSize = timestamp_count * sizeof(int64_t);
+
+    nvtxCounterBatchSubmit(domain::get<D>(), &batch);
+#else
+    (void)values;
+    (void)count;
+    (void)timestamps;
+    (void)timestamp_count;
+    (void)flags;
+#endif
+  }
+
+  /**
+   * @brief Submit a batch from a contiguous container.
+   *
+   * The container must expose \c data() returning \c T* or \c T const*, and
+   * \c size() convertible to \c size_t.
+   */
+  template <
+      typename CounterContainer,
+      typename = typename std::enable_if<
+          detail::has_data_member<CounterContainer, T>::value
+          && detail::has_size_member<CounterContainer>::value>::type>
+  void submit_batch(CounterContainer const& values,
+                    uint64_t flags = NVTX_BATCH_FLAG_TIME_SORTED) noexcept
+  {
+    submit_batch(values.data(), values.size(), flags);
+  }
+
+  /**
+   * @brief Submit a batch from contiguous sample and timestamp containers.
+   *
+   * The sample container must expose \c T elements. The timestamp container must
+   * expose \c int64_t elements.
+   */
+  template <
+      typename CounterContainer,
+      typename TimestampContainer,
+      typename = typename std::enable_if<
+          detail::has_data_member<CounterContainer, T>::value
+          && detail::has_size_member<CounterContainer>::value
+          && detail::has_data_member<TimestampContainer, int64_t>::value
+          && detail::has_size_member<TimestampContainer>::value>::type>
+  void submit_batch(CounterContainer const& values,
+                    TimestampContainer const& timestamps,
+                    uint64_t flags = NVTX_BATCH_FLAG_TIME_SORTED) noexcept
+  {
+    submit_batch(values.data(), values.size(), timestamps.data(), timestamps.size(), flags);
+  }
+
+  /**
+   * @brief Get the underlying counter ID.
+   *
+   * Useful for interoperability with the NVTX C API.
+   *
+   * @return The counter ID.
+   */
+  uint64_t id() const noexcept { return id_; }
+
+private:
+  counter_in(const char* name, const char* description, scope s, counter_semantic const* semantic) noexcept
+  {
+#ifndef NVTX_DISABLE
+    nvtxCounterAttr_t attr{};
+    attr.structSize = sizeof(nvtxCounterAttr_t);
+    attr.schemaId = detail::counter_schema_id<T>::get();
+    attr.name = name;
+    attr.description = description;
+    attr.scopeId = s.get();
+    attr.semantics = semantic ? semantic->get() : nullptr;
+
+    id_ = nvtxCounterRegister(domain::get<D>(), &attr);
+#else
+    (void)name;
+    (void)description;
+    (void)s;
+    (void)semantic;
+#endif
+  }
+
+  // Overloads for optimized primitive sampling (int64_t)
+  void sample_impl(int64_t value, std::true_type /*is_int64*/, std::false_type) noexcept
+  {
+    nvtxCounterSampleInt64(domain::get<D>(), id_, value);
+  }
+
+  // Overloads for optimized primitive sampling (double)
+  void sample_impl(double value, std::false_type, std::true_type /*is_double*/) noexcept
+  {
+    nvtxCounterSampleFloat64(domain::get<D>(), id_, value);
+  }
+
+  // Generic fallback for struct types
+  void sample_impl(T const& value, std::false_type, std::false_type) noexcept
+  {
+    nvtxCounterSample(domain::get<D>(), id_, &value, sizeof(T));
+  }
+
+  uint64_t id_{0};
+};
+
+/**
+ * @brief Alias for a counter in the global NVTX domain.
+ *
+ * Example:
+ * \code{.cpp}
+ * nvtx3::counter<int64_t> my_counter{"name"};
+ * \endcode
+ */
+template <typename T>
+using counter = counter_in<T, domain::global>;
+
+}  // namespace NVTX3_MINOR_VERSION_NAMESPACE
+}  // namespace NVTX3_VERSION_NAMESPACE
+} // namespace nvtx3
+
+#ifndef NVTX_DISABLE
+/**
+ * @brief Convenience macro for generating a range in the specified `domain`
+ * from the lifetime of a function
+ *
+ * This macro is useful for generating an NVTX range in `domain` from
+ * the entry point of a function to its exit. It is intended to be the first
+ * line of the function.
+ *
+ * Constructs a static `registered_string_in` using the name of the immediately
+ * enclosing function returned by `__func__` and constructs a
+ * `nvtx3::scoped_range` using the registered function name as the range's
+ * message.
+ *
+ * Example:
+ * \code{.cpp}
+ * struct my_domain{static constexpr char const* name{"my_domain"};};
+ *
+ * void foo(...) {
+ *    NVTX3_FUNC_RANGE_IN(my_domain); // Range begins on entry to foo()
+ *    // do stuff
+ *    ...
+ * } // Range ends on return from foo()
+ * \endcode
+ *
+ * @param[in] D Type containing `name` member used to identify the
+ * `domain` to which the `registered_string_in` belongs. Else,
+ * `domain::global` to  indicate that the global NVTX domain should be used.
+ */
+#define NVTX3_V1_FUNC_RANGE_IN(D)                                                  \
+  static ::nvtx3::v1::registered_string_in<D> const nvtx3_func_name__{__func__};   \
+  static ::nvtx3::v1::event_attributes const nvtx3_func_attr__{nvtx3_func_name__}; \
+  ::nvtx3::v1::scoped_range_in<D> const nvtx3_range__{nvtx3_func_attr__}
+
+/**
+ * @brief Convenience macro for generating a range in the specified `domain`
+ * from the lifetime of a function if the given boolean expression evaluates
+ * to true.
+ *
+ * Similar to `NVTX3_V1_FUNC_RANGE_IN(D)`, the only difference being that
+ * `NVTX3_V1_FUNC_RANGE_IF_IN(D, C)` only generates a range if the given boolean
+ * expression evaluates to true.
+ *
+ * @param[in] D Type containing `name` member used to identify the
+ * `domain` to which the `registered_string_in` belongs. Else,
+ * `domain::global` to indicate that the global NVTX domain should be used.
+ *
+ * @param[in] C Boolean expression used to determine if a range should be
+ * generated.
+ */
+#define NVTX3_V1_FUNC_RANGE_IF_IN(D, C) \
+  ::nvtx3::v1::detail::optional_scoped_range_in<D> optional_nvtx3_range__;           \
+  if (C) {                                                                           \
+    static ::nvtx3::v1::registered_string_in<D> const nvtx3_func_name__{__func__};   \
+    static ::nvtx3::v1::event_attributes const nvtx3_func_attr__{nvtx3_func_name__}; \
+    optional_nvtx3_range__.begin(nvtx3_func_attr__);                                 \
+  } (void)0
+#else /* NVTX_DISABLE */
+#define NVTX3_V1_FUNC_RANGE_IN(D) (void)0
+#define NVTX3_V1_FUNC_RANGE_IF_IN(D, C) (void)(C)
+#endif /* NVTX_DISABLE */
+
+/**
+ * @brief Convenience macro for generating a range in the global domain from the
+ * lifetime of a function.
+ *
+ * This macro is useful for generating an NVTX range in the global domain from
+ * the entry point of a function to its exit. It is intended to be the first
+ * line of the function.
+ *
+ * Constructs a static `registered_string_in` using the name of the immediately
+ * enclosing function returned by `__func__` and constructs a
+ * `nvtx3::scoped_range` using the registered function name as the range's
+ * message.
+ *
+ * Example:
+ * \code{.cpp}
+ * void foo(...) {
+ *    NVTX3_FUNC_RANGE(); // Range begins on entry to foo()
+ *    // do stuff
+ *    ...
+ * } // Range ends on return from foo()
+ * \endcode
+ */
+#define NVTX3_V1_FUNC_RANGE() NVTX3_V1_FUNC_RANGE_IN(::nvtx3::v1::domain::global)
+
+/**
+ * @brief Convenience macro for generating a range in the global domain from the
+ * lifetime of a function if the given boolean expression evaluates to true.
+ *
+ * Similar to `NVTX3_V1_FUNC_RANGE()`, the only difference being that
+ * `NVTX3_V1_FUNC_RANGE_IF(C)` only generates a range if the given boolean
+ * expression evaluates to true.
+ *
+ * @param[in] C Boolean expression used to determine if a range should be
+ * generated.
+ */
+#define NVTX3_V1_FUNC_RANGE_IF(C) NVTX3_V1_FUNC_RANGE_IF_IN(::nvtx3::v1::domain::global, C)
+
+// We need another helper macro because the other one will get undefined
+#if __has_cpp_attribute(nodiscard)
+#define NVTX3_V1_NO_DISCARD [[nodiscard]]
+#else
+#define NVTX3_V1_NO_DISCARD
+#endif
+/**
+ * @brief Convenience macro for generating a sspecialization of nvtx3::schema::get
+ * for an existing `struct`.
+ *
+ * Use this macro after your struct to enable the struct to be used as a payload.
+ *
+ * \note This macro must not be used inside a namespace.
+ *
+ * Example:
+ * \code{.cpp}
+ * struct SensorData
+ * {
+ *     int32_t sensorId;
+ *     uint8_t channelId;
+ * };
+ *
+ * NVTX3_DEFINE_SCHEMA_GET(
+ *     my_domain,
+ *     SensorData,
+ *     "SensorEvent",
+ *     NVTX_PAYLOAD_ENTRIES(
+ *         (sensorId, TYPE_INT32, "SensorID"),
+ *         (channelId, TYPE_UINT8, "ChannelID")
+ *     )
+ * )
+ * \endcode
+ *
+ * @param[in] dom The NVTX domain.
+ * @param[in] struct_id The name of the struct.
+ * @param[in] schema_name Name of the payload schema.
+ * @param[in] entries Payload schema entries using NVTX_PAYLOAD_ENTRIES macro.
+ *
+ * @note On MSVC, this macro requires the conforming preprocessor:
+ *       \c /Zc:preprocessor (VS 2019+) or \c /experimental:preprocessor
+ *       (VS 2017 v15.5+).  Not supported on older MSVC versions.
+ */
+#define NVTX3_V1_DEFINE_SCHEMA_GET(dom, struct_id, schema_name, entries)                               \
+    template <>                                                                                        \
+    NVTX3_V1_NO_DISCARD inline nvtx3::v1::schema const& nvtx3::v1::schema::get<struct_id>() noexcept   \
+    {                                                                                                  \
+        static_assert(                                                                                 \
+            std::is_standard_layout<struct_id>::value,                                                 \
+            "structs used for NVTX3 payload schema must be standard layout");                          \
+        static_assert(                                                                                 \
+            std::is_trivially_copyable<struct_id>::value,                                              \
+            "structs used for NVTX3 payload schema must be trivially copyable");                       \
+        using nvtx_struct_id = struct_id; /* avoids issues with namespaced struct_id */                \
+        _NVTX_DEFINE_SCHEMA_FOR_STRUCT(nvtx_struct_id, schema_name, static const, entries)              \
+        static const schema s{                                                                         \
+            nvtxPayloadSchemaRegister(nvtx3::v1::domain::get<dom>(), &nvtx_struct_id##Attr)};          \
+        return s;                                                                                      \
+    }
+
+/**
+ * @brief Macro for inline semantic definitions in schema entries.
+ *
+ * Use this macro within NVTX_PAYLOAD_ENTRIES to attach per-field semantics
+ * or a chain thereof. The macro creates a static local to give the
+ * semantic object stable storage for the lifetime of the program, and
+ * returns the pointer to its header that the schema entry's \c semantics
+ * field expects.
+ *
+ * The type of the semantic is deduced from the expression, so any builder
+ * in the `nvtx3::v1` semantic family works. If the semantic is chained to
+ * another semantic, the chain is copied into the static semantic object.
+ *
+ * Example:
+ * \code{.cpp}
+ * NVTX3_DEFINE_SCHEMA_GET(
+ *     my_domain,
+ *     sensor_data,
+ *     "SensorData",
+ *     NVTX_PAYLOAD_ENTRIES(
+ *         (temperature, TYPE_FLOAT, "Temperature", nullptr, 0, UNUSED,
+ *             NVTX3_SEMANTIC(nvtx3::counter_semantic{}.unit("C").limits(-40.0, 85.0))),
+ *         (pressure, TYPE_FLOAT, "Pressure", nullptr, 0, UNUSED,
+ *             NVTX3_SEMANTIC(nvtx3::counter_semantic{}.unit("hPa")))))
+ * \endcode
+ *
+ * @param expr Any semantic builder expression exposing a \c get() method
+ *             returning an \c nvtxSemanticsHeader_t const*.
+ */
+#define NVTX3_V1_SEMANTIC(expr)                                    \
+    ([]() -> nvtxSemanticsHeader_t const* {                        \
+        static auto const s_ = (expr);                             \
+        return s_.get();                                           \
+    }())
+
+/* When inlining this version, versioned macros must have unversioned aliases.
+ * For each NVTX3_Vx_ #define, make an NVTX3_ alias of it here.*/
+#if defined(NVTX3_INLINE_THIS_VERSION)
+/* clang format off */
+#define NVTX3_FUNC_RANGE        NVTX3_V1_FUNC_RANGE
+#define NVTX3_FUNC_RANGE_IF     NVTX3_V1_FUNC_RANGE_IF
+#define NVTX3_FUNC_RANGE_IN     NVTX3_V1_FUNC_RANGE_IN
+#define NVTX3_FUNC_RANGE_IF_IN  NVTX3_V1_FUNC_RANGE_IF_IN
+#define NVTX3_DEFINE_SCHEMA_GET NVTX3_V1_DEFINE_SCHEMA_GET
+#define NVTX3_SEMANTIC          NVTX3_V1_SEMANTIC
+/* clang format on */
+#endif
+
+#endif  // NVTX3_CPP_DEFINITIONS_V1_0
+
+/* Undefine all temporarily-defined unversioned macros, which would conflict with
+ * subsequent includes of different versions of this header. */
+#undef NVTX3_CPP_VERSION_MAJOR
+#undef NVTX3_CPP_VERSION_MINOR
+#undef NVTX3_CONCAT
+#undef NVTX3_NAMESPACE_FOR
+#undef NVTX3_VERSION_NAMESPACE
+#undef NVTX3_MINOR_NAMESPACE_FOR
+#undef NVTX3_MINOR_VERSION_NAMESPACE
+#undef NVTX3_INLINE_IF_REQUESTED
+#undef NVTX3_CONSTEXPR_IF_CPP14
+#undef NVTX3_CONSTEXPR_IF_CPP20
+#undef NVTX3_MAYBE_UNUSED
+#undef NVTX3_NO_DISCARD
+
+#if defined(NVTX3_INLINE_THIS_VERSION)
+#undef NVTX3_INLINE_THIS_VERSION
+#endif
+
+#if defined(NVTX3_USE_CHECKED_OVERLOADS_FOR_GET_DEFINED_HERE)
+#undef NVTX3_USE_CHECKED_OVERLOADS_FOR_GET_DEFINED_HERE
+#undef NVTX3_USE_CHECKED_OVERLOADS_FOR_GET
+#endif
+
+#if defined(NVTX3_STATIC_ASSERT_DEFINED_HERE)
+#undef NVTX3_STATIC_ASSERT_DEFINED_HERE
+#undef NVTX3_STATIC_ASSERT
+#endif

@@ -1,0 +1,238 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Licensed under the Apache License v2.0 with LLVM Exceptions.
+ * See https://nvidia.github.io/NVTX/LICENSE.txt for license information.
+ */
+
+#if defined(NVTX_AS_SYSTEM_HEADER)
+#if defined(__clang__)
+#pragma clang system_header
+#elif defined(__GNUC__) || defined(__NVCOMPILER)
+#pragma GCC system_header
+#elif defined(_MSC_VER)
+#pragma system_header
+#endif
+#endif
+
+#include "nvtxDetail/nvtxExtPayloadHelperInternal.h"
+
+/**
+ * @file
+ * \brief Helper macros for defining NVTX binary payload schemas.
+ *
+ * \par MSVC Preprocessor Requirement
+ * Several macros in this header rely on variadic macro argument counting and
+ * dispatch, which requires a standards-conforming preprocessor.  On Microsoft
+ * Visual C++, the traditional preprocessor does not expand \c __VA_ARGS__
+ * correctly for these patterns.  To use the affected macros (listed below) with
+ * MSVC, enable the modern conforming preprocessor:
+ *  - Visual Studio 2019 and newer: \c /Zc:preprocessor
+ *  - Visual Studio 2017 (v15.5+): \c /experimental:preprocessor
+ *
+ * Visual Studio versions older than 2017 do not support the conforming
+ * preprocessor and cannot use these macros.
+ *
+ * Affected macros:
+ *  - \ref NVTX_DEFINE_SCHEMA_FOR_STRUCT
+ *  - \ref NVTX_DEFINE_STRUCT_WITH_SCHEMA
+ *  - \ref NVTX_DEFINE_STRUCT_WITH_SCHEMA_AND_REGISTER
+ *  - \ref NVTX_DEFINE_SCHEMA_FOR_STRUCT_AND_REGISTER
+ *  - \ref NVTX_DEFINE_STRUCT
+ *
+ * GCC, Clang, and other compilers with conforming preprocessors work without
+ * any additional flags.
+ */
+
+/* This is just an empty marker (for readability), which can be omitted. */
+/* TODO: Fix issue with trailing comma at end of entry list. */
+#define NVTX_PAYLOAD_ENTRIES
+
+
+/**
+ * Use this macro for payload entries that are defined by a schema (nested
+ * payload schema).
+ */
+#define NVTX_PAYLOAD_NESTED(schemaId) _NVTX_PAYLOAD_NESTED(schemaId)
+
+
+/**
+ * \brief Define a payload schema for an existing C `struct` definition.
+ *
+ *  This macro does
+ *   1) create schema description (array of schema entries).
+ *   2) set the schema attributes for a static data layout.
+ *
+ * It can be used in static code or within a function context.
+ *
+ * Example:
+ *  NVTX_DEFINE_SCHEMA_FOR_STRUCT(your_struct, "SchemaName",
+ *      NVTX_PAYLOAD_ENTRIES(
+ *          (index, TYPE_INT, "integer value"),
+ *          (dpfloat, TYPE_DOUBLE, "fp64 value"),
+ *          (text, TYPE_CSTRING, "text", NULL, 24)
+ *      )
+ *  )
+ *
+ * It is required to at least provide the struct name and the payload entries.
+ * The first two fields (member name and NVTX entry type) of each payload entry
+ * are required.
+ *
+ * The optional parameters are only allowed to be passed in the predefined order.
+ * Hence, `payload_flags` requires `payload_schema` to be given and
+ * `prefix` requires `payload_flags` and `payload_schema` to be given.
+ * The payload entries are always the last parameter. A maximum of 16 schema
+ * entries is supported.
+ *
+ * It is recommended to use `NVTX_PAYLOAD_SCHEMA_REGISTER` to register the schema.
+ *
+ * \par Parameters
+ * - \b struct_id - name of the struct.
+ * - \b schema_name - (optional 1) schema name; default `NULL`.
+ * - \b prefix - (optional 2) prefix before the schema and attributes variables,
+ *   e.g. `static const`; leave empty if none.
+ * - \b schema_flags - (optional 3) flags to augment the payload schema;
+ *   default `NVTX_PAYLOAD_SCHEMA_FLAG_NONE`.
+ * - \b schema_id - (optional 4) user-defined schema ID.
+ * - \b entries - (required, last) `NVTX_PAYLOAD_ENTRIES(...)`.
+ *
+ * @note On MSVC, this macro requires the conforming preprocessor:
+ *       \c /Zc:preprocessor (VS 2019+) or \c /experimental:preprocessor
+ *       (VS 2017 v15.5+).  Not supported on older MSVC versions.
+ */
+#define NVTX_DEFINE_SCHEMA_FOR_STRUCT(struct_id, ...) \
+    _NVTX_DEFINE_SCHEMA_FOR_STRUCT(struct_id, __VA_ARGS__)
+
+
+/**
+ * \brief Define a C struct together with a matching schema.
+ *
+ * This macro does
+ *   1) define the payload type (typedef struct).
+ *   2) create schema description (array of schema entries).
+ *   3) set the schema attributes for a static data layout.
+ *
+ * The macro can be used in static code or within a function context.
+ *
+ * It defines the schema attributes in `struct_id##Attr`. Thus, it is recommended
+ * to use `NVTX_PAYLOAD_SCHEMA_REGISTER(domain, struct_id)` to register the schema.
+ *
+ * Example:
+ *  NVTX_DEFINE_STRUCT_WITH_SCHEMA(your_struct_name, "Your schema name",
+ *      NVTX_PAYLOAD_ENTRIES(
+ *          (int, index, TYPE_INT, "integer value"),
+ *          (double, dpfloat, TYPE_DOUBLE, "fp64 value"),
+ *          (const char, (text, 24), TYPE_CSTRING, "text", NULL, 24)
+ *      )
+ *  )
+ *
+ * The first three fields (C type, member, entry type) of each entry are required.
+ * A fixed-size array or string requires a special notation with the member
+ * name and the size separated by comma and put into brackets (see last entry
+ * in the example).
+ *
+ * The optional parameters are positional (only allowed to be passed in the
+ * predefined order). A maximum of 16 schema entries is supported.
+ *
+ * \par Parameters
+ * - \b struct_id - name of the struct.
+ * - \b schema_name - (optional 1) schema name; default `NULL`.
+ * - \b prefix - (optional 2) prefix before the schema and attributes variables,
+ *   e.g. `static const`; leave empty if none.
+ * - \b schema_flags - (optional 3) flags to augment the payload schema;
+ *   default `NVTX_PAYLOAD_SCHEMA_FLAG_NONE`.
+ * - \b schema_id - (optional 4) user-defined schema ID.
+ * - \b entries - (required, last) `NVTX_PAYLOAD_ENTRIES(...)`.
+ *
+ * @note On MSVC, this macro requires the conforming preprocessor:
+ *       \c /Zc:preprocessor (VS 2019+) or \c /experimental:preprocessor
+ *       (VS 2017 v15.5+).  Not supported on older MSVC versions.
+ */
+#define NVTX_DEFINE_STRUCT_WITH_SCHEMA(struct_id, ...) \
+    _NVTX_DEFINE_STRUCT_WITH_SCHEMA(struct_id, __VA_ARGS__)
+
+/**
+ * \brief Initialize and register the NVTX binary payload schema.
+ *
+ * This does essentially the same as `NVTX_DEFINE_STRUCT_WITH_SCHEMA`, but in
+ * addition the schema is registered. The schema ID will be defined as follows:
+ * `const uint64_t struct_id##_schemaId`.
+ *
+ * @param domain The NVTX domain handle.
+ * All other parameters are similar to `NVTX_DEFINE_STRUCT_WITH_SCHEMA`.
+ *
+ * @note On MSVC, this macro requires the conforming preprocessor:
+ *       \c /Zc:preprocessor (VS 2019+) or \c /experimental:preprocessor
+ *       (VS 2017 v15.5+).  Not supported on older MSVC versions.
+ */
+#define NVTX_DEFINE_STRUCT_WITH_SCHEMA_AND_REGISTER(domain, struct_id, ...) \
+    _NVTX_DEFINE_STRUCT_WITH_SCHEMA(struct_id, __VA_ARGS__) \
+    const uint64_t struct_id##_schemaId = nvtxPayloadSchemaRegister(domain, &struct_id##Attr);
+
+/**
+ * \brief Define payload schema for an existing `struct` and register the schema.
+ *
+ * This does essentially the same as `NVTX_DEFINE_SCHEMA_FOR_STRUCT`, but in
+ * addition, the schema is registered and `uint64_t struct_id##_schemaId` set.
+ *
+ * @param domain The NVTX domain handle.
+ * All other parameters are similar to `NVTX_DEFINE_SCHEMA_FOR_STRUCT`.
+ *
+ * @note On MSVC, this macro requires the conforming preprocessor:
+ *       \c /Zc:preprocessor (VS 2019+) or \c /experimental:preprocessor
+ *       (VS 2017 v15.5+).  Not supported on older MSVC versions.
+ */
+#define NVTX_DEFINE_SCHEMA_FOR_STRUCT_AND_REGISTER(domain, struct_id, ...) \
+    _NVTX_DEFINE_SCHEMA_FOR_STRUCT(struct_id, __VA_ARGS__) \
+    const uint64_t struct_id##_schemaId = nvtxPayloadSchemaRegister(domain, &struct_id##Attr);
+
+/**
+ * \brief Create a type definition for the given struct ID and members.
+ *
+ * This is a convenience macro. A normal `typedef` can be used instead.
+ *
+ * Example usage:
+ *   NVTX_DEFINE_STRUCT(your_struct,
+ *           (double, fp64),
+ *           (uint8_t, u8),
+ *           (float, fp32[3])
+ *   )
+ *
+ * \par Parameters
+ * - \b struct_id - name of the struct.
+ * - \b members - struct members as `(type, name)` pairs.
+ *
+ * @note On MSVC, this macro requires the conforming preprocessor:
+ *       \c /Zc:preprocessor (VS 2019+) or \c /experimental:preprocessor
+ *       (VS 2017 v15.5+).  Not supported on older MSVC versions.
+ */
+#define NVTX_DEFINE_STRUCT(struct_id, ...) \
+    _NVTX_PAYLOAD_TYPEDEF_STRUCT(struct_id, __VA_ARGS__)
+
+/**
+ * \brief Register an NVTX binary payload schema.
+ *
+ * This is a convenience macro, which takes the same `struct_id` that has been
+ * used in other helper macros. Instead, `nvtxPayloadSchemaRegister` can also be
+ * used, but `&struct_id##Attr` has to be passed.
+ *
+ * @param domain The NVTX domain handle.
+ * @param struct_id The name of the struct.
+ *
+ * @return NVTX schema ID
+ */
+#define NVTX_PAYLOAD_SCHEMA_REGISTER(domain, struct_id) \
+    nvtxPayloadSchemaRegister(domain, &struct_id##Attr)

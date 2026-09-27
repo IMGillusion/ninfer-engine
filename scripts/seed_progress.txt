@@ -1,0 +1,104 @@
+bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
+                                         MaterializationTransaction& transaction) {
+    auto& progress = transaction.seed;
+    auto& staged = *transaction.staged_prefill;
+    if (progress.done) { return true; }
+    const auto fail = [&]() {
+        progress.done = true;
+        staged.advertised_base = 0;
+        fprintf(stderr, "[l3-seed-yield] lane=%u phase=%u page=%u -> honest full recompute\n",
+                sequence.lane, progress.phase, progress.page);
+        return true;
+    };
+    const auto E = transaction.l3_restore_frontier.value_or(0);
+    if (!disk_kv || !disk_kv_restore || !sequence.kv || !host_state_images ||
+        !l3_state_scratch || !l3_kv_scratch || !state_images || !host_kv_arena ||
+        E == 0 || E >= staged.prompt_tokens || E > materialization_prefix_digests_.size() ||
+        staged.prompt.has_media() || staged.vision ||
+        (speculative_backend != SpeculativeBackend::None &&
+         speculative_backend != SpeculativeBackend::Mtp)) { return fail(); }
+    for (const auto& group : staged.capture_groups) {
+        if (group.frontier < E) { return fail(); }
+    }
+    const std::uint32_t tag = static_cast<std::uint32_t>(speculative_backend) |
+        (static_cast<std::uint32_t>(proposal_head) << 8U) |
+        (static_cast<std::uint32_t>(kv_storage) << 16U);
+    const auto identity = [&](std::uint32_t frontier) {
+        const auto digest = materialization_prefix_digests_.at(frontier);
+        return DiskKVIdentity{.lo=digest[0], .hi=digest[1], .tag=tag, .frontier=frontier};
+    };
+    // Each invocation submits or polls ONE CPU read. No store locks on the
+    // scheduler. Scratch ownership is the single context transaction's lifetime.
+    if (progress.phase == 0) {
+        if (!progress.read) {
+            progress.read = disk_kv->try_read(identity(E), DiskKVKind::StateImage,
+                {host_state_images->writable_view(*l3_state_scratch).data,
+                 state_images->host_layout().image_bytes});
+            return false;
+        }
+        const auto result = DiskKVBridge::poll(progress.read);
+        if (result == DiskReadResult::Pending) { return false; }
+        progress.read.reset();
+        if (result != DiskReadResult::Success) { return fail(); }
+        progress.phase = 1;
+        return false;
+    }
+    if (progress.phase == 1 || progress.phase == 2) {
+        const bool backend = progress.phase == 2;
+        const auto frontier = backend ? backend_frontier_at(speculative_backend, E) : E;
+        if ((backend && speculative_backend != SpeculativeBackend::Mtp) ||
+            progress.page == kv_pages_for_frontier(frontier)) {
+            ++progress.phase;
+            progress.page = 0;
+            return false;
+        }
+        auto* pages = backend ? backend_kv_pages.get() : text_kv_pages.get();
+        auto* addresses = backend ? backend_kv_addresses.get() : text_kv_addresses.get();
+        auto& scratch = backend ? l3_backend_scratch : l3_kv_scratch;
+        if (!pages || !addresses || !scratch || (backend && !sequence.kv->backend)) {
+            return fail();
+        }
+        const auto address = backend ? *sequence.kv->backend : sequence.kv->text;
+        const auto* layout = host_kv_arena->layout_for(pages->physical_pool().geometry());
+        if (!layout || progress.page >= addresses->mapped_pages(address)) { return fail(); }
+        if (!progress.read) {
+            const auto F = std::min((progress.page+1U)*std::uint32_t(kPagedKVPageSize), frontier);
+            progress.read = disk_kv->try_read(identity(F),
+                backend ? DiskKVKind::BackendKV : DiskKVKind::MainKV,
+                {host_kv_arena->writable_view(*scratch).data(), layout->page_stride});
+            return false;
+        }
+        const auto result = DiskKVBridge::poll(progress.read);
+        if (result == DiskReadResult::Pending) { return false; }
+        progress.read.reset();
+        if (result != DiskReadResult::Success) { return fail(); }
+        const auto destination = pages->physical(addresses->logical_page(address, progress.page));
+        // Deliberately synchronous single-page H2D on the compute stream: mapping
+        // and ordered_reset precede this copy on the SAME stream. No transfer
+        // pipeline event/wait is introduced. Return to scheduling after each page.
+        pages->physical_pool().copy_from_host(host_kv_arena->view(*scratch).subview(0,1),
+            std::span<const DeviceKVPageHandle>(&destination,1), device.stream);
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        ++progress.page;
+        return false;
+    }
+    if (progress.phase == 3) {
+        // Known remaining bound: whole-image state H2D (not segmented yet).
+        state_images->copy_from_host(host_state_images->view(*l3_state_scratch),
+                                     state_selectors(sequence).destination, device.stream);
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        ++progress.phase;
+        return false;
+    }
+    commit_sequence_kv(sequence, E, speculative_backend == SpeculativeBackend::Mtp
+                                      ? backend_frontier_at(speculative_backend,E) : 0U);
+    sequence.text_kv_valid = E;
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        sequence.mtp_kv_valid = backend_frontier_at(speculative_backend,E);
+    }
+    staged.base = staged.cursor = staged.advertised_base = E;
+    progress.done = progress.success = true;
+    fprintf(stderr, "[l3-seed-yield] lane=%u frontier=%u state=ok\n", sequence.lane,E);
+    return true;
+}
+

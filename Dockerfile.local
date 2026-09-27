@@ -1,0 +1,62 @@
+# Local variant: build+run on the locally-cached vllm image (CUDA 13.0, Ubuntu 22.04)
+# instead of nvidia/cuda:13.1.2 (unreachable via proxy for multi-GB layers).
+FROM vllm/vllm-openai:nightly AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; \
+    sed -i 's|archive.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g; s|security.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list 2>/dev/null; \
+    apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        cmake \
+        libavcodec-dev \
+        libavformat-dev \
+        libavutil-dev \
+        libcurl4-openssl-dev \
+        libswscale-dev \
+        ninja-build \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Ubuntu 22.04 apt cmake is 3.22; NInfer needs >=3.28 -> pip cmake (bundled binary)
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; \
+    python3 -m pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple cmake \
+    && rm -rf /root/.cache/pip
+
+WORKDIR /src
+COPY . .
+# NVTX headers absent from the vllm image's CUDA toolkit; vendored from NVIDIA/NVTX
+COPY nvtx3 /usr/local/cuda/targets/x86_64-linux/include/nvtx3/
+COPY nvtx3 /usr/local/cuda/include/nvtx3/
+
+RUN cmake -S . -B /build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DNINFER_BUILD_APPS=ON \
+        -DBUILD_TESTING=OFF \
+        -DNINFER_BUILD_BENCHMARKS=OFF \
+    && cmake --build /build --parallel --target ninfer ninfer-serve ninfer-perplexity
+
+FROM vllm/vllm-openai:nightly
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; \
+    sed -i 's|archive.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g; s|security.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list 2>/dev/null; \
+    apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        libavcodec58 \
+        libavformat58 \
+        libavutil56 \
+        libcurl4 \
+        libswscale5 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer
+COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
+COPY --from=build /build/apps/ninfer-perplexity /usr/local/bin/ninfer-perplexity
+
+WORKDIR /workspace
+EXPOSE 8080
+STOPSIGNAL SIGTERM
+# vllm base image ships an ENTRYPOINT; clear it so ninfer-serve/ninfer run directly
+ENTRYPOINT []
+CMD ["ninfer-serve", "--help"]
