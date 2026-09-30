@@ -3,6 +3,7 @@
 #include "targets/qwen3_6/impl/runtime/rebuild_work.h"
 #include "targets/qwen3_6/impl/runtime/owner_spill_plan.h"
 
+#include "core/disk_kv_log.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
@@ -1007,10 +1008,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             }
         }
         l3_state_scratch = host_state_images->allocate();
-        fprintf(stderr, "[l3-restore] scratch reserved: kv=%d backend=%d state=%d\n",
-                static_cast<int>(l3_kv_scratch.has_value()),
-                static_cast<int>(l3_backend_scratch.has_value()),
-                static_cast<int>(l3_state_scratch.has_value()));
+        disk_kv_logf('I', "l3-restore", "scratch reserved | kv=%d backend=%d state=%d",
+                     static_cast<int>(l3_kv_scratch.has_value()),
+                     static_cast<int>(l3_backend_scratch.has_value()),
+                     static_cast<int>(l3_state_scratch.has_value()));
     }
 
     io = qwen3_6::RoundState(backing, plan.persistent.round);
@@ -3098,10 +3099,10 @@ bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillPr
                    stall_now - p.last_warn_at > std::chrono::seconds(10)) {
             p.last_warn_at = stall_now;
             const auto bstats = disk_kv ? disk_kv->stats() : DiskKVBridgeStats{};
-            fprintf(stderr,
-                    "[l3-spill] STALL stage=%u page=%u saved=%llu batch(submit=%u ids=%zu "
+            disk_kv_logf('W', "l3-spill",
+                    "STALL | stage=%u page=%u saved=%llu batch(submit=%u ids=%zu "
                     "tickets=%zu copy_pending=%d copy_done=%d) ticket=%d probed=%d ready=%d "
-                    "writing=%d bridge(spills=%llu restores=%llu qdrops=%llu evicted=%llu) elapsed=%.1fs\n",
+                    "writing=%d | bridge(spills=%llu restores=%llu qdrops=%llu evicted=%llu) | elapsed=%.1fs",
                     p.stage, p.page, static_cast<unsigned long long>(p.saved), p.batch_submit,
                     p.batch_ids.size(), p.batch_tickets.size(),
                     static_cast<int>(p.batch_copy_pending),
@@ -3191,7 +3192,7 @@ bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillPr
                         // A copy implementation may have enqueued work before throwing.
                         const auto status = cudaStreamSynchronize(device.transfer_stream);
                         if (status != cudaSuccess) {
-                            fprintf(stderr, "[l3-spill-cuda] cleanup drain failed: %s; restart required\n", cudaGetErrorString(status));
+                            disk_kv_logf('E', "l3-spill-cuda", "cleanup drain failed: %s | restart required", cudaGetErrorString(status));
                             fflush(stderr); std::_Exit(70);
                         }
                         for (const auto h : device_pins) pages->unpin_source(h);
@@ -3209,8 +3210,8 @@ bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillPr
                 return !p.failed;
             };
             const auto result = p.OwnerSpillBatch::progress(*disk_kv, prepare, [&](SpillStatus status) {
-                ++p.saved;
-                if (status == SpillStatus::Present) ++p.dedup;
+                if (status == SpillStatus::Dropped) { ++p.dropped; }
+                else { ++p.saved; if (status == SpillStatus::Present) ++p.dedup; }
             });
             if (result == OwnerSpillBatch::Result::Failed) p.failed = true;
             if (result != OwnerSpillBatch::Result::Complete) return false;
@@ -3237,11 +3238,12 @@ bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillPr
             }
         }
         if (p.stage == 9) { return true; }
-        // Stage transitions are low-frequency diagnostics for the anchor
-        // extension (one line per stage per owner).
-        if (p.page == 0 && p.stage != p.last_logged_stage) {
+        // Stage transitions are trace-only diagnostics for the anchor
+        // extension: production gets the single "owner ok/fail" summary line.
+        static const bool spill_stage_trace = std::getenv("NINFER_SPILL_TRACE") != nullptr;
+        if (spill_stage_trace && p.page == 0 && p.stage != p.last_logged_stage) {
             p.last_logged_stage = p.stage;
-            fprintf(stderr, "[l3-spill] owner stage=%u anchors=%zu\n", p.stage,
+            disk_kv_logf('D', "l3-spill", "owner stage=%u | anchors=%zu", p.stage,
                     anchor_list.size());
         }
         const bool anchor_stage = p.stage >= 6;
@@ -3313,7 +3315,7 @@ bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillPr
             if (!addresses || !pages || !runtime_support::owner_spill_page_mapped(
                     page, addresses->mapped_pages(address))) {
                 if (anchor_stage) { cleanup_owner_spill(p); ++p.page; continue; }  // skip this anchor
-                fprintf(stderr, "[l3-spill-check] reason=mapping stage=%u page=%u frontier=%u mapped=%u addresses=%d pages=%d\n",
+                disk_kv_logf('E', "l3-spill-check", "FAIL | reason=mapping stage=%u page=%u frontier=%u | mapped=%u addresses=%d pages=%d",
                         p.stage, page, frontier,
                         addresses ? static_cast<unsigned>(addresses->mapped_pages(address)) : 0U,
                         static_cast<int>(addresses != nullptr), static_cast<int>(pages != nullptr));
@@ -3325,7 +3327,7 @@ bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillPr
                     frontier, page, kPagedKVPageSize);
                 if (!runtime_support::owner_spill_page_committed(
                         required, pages->committed_columns(logical))) {
-                    fprintf(stderr, "[l3-spill-check] reason=committed stage=%u page=%u frontier=%u required=%u committed=%u digests=%zu\n",
+                    disk_kv_logf('E', "l3-spill-check", "FAIL | reason=committed stage=%u page=%u frontier=%u | required=%u committed=%u digests=%zu",
                             p.stage, page, frontier, required,
                             static_cast<unsigned>(pages->committed_columns(logical)), sequence.prefix_digests.size());
                     p.failed = true; return false;
@@ -3335,16 +3337,23 @@ bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillPr
         }
         if (!runtime_support::owner_spill_digest_available(frontier, sequence.prefix_digests.size())) {
             if (anchor_stage) { cleanup_owner_spill(p); ++p.page; continue; }  // skip this anchor
-            fprintf(stderr, "[l3-spill-check] reason=digest stage=%u page=%u frontier=%u digests=%zu\n",
+            disk_kv_logf('E', "l3-spill-check", "FAIL | reason=digest stage=%u page=%u frontier=%u | digests=%zu",
                     p.stage, p.page, frontier, sequence.prefix_digests.size());
             p.failed = true; return false;
         }
         const auto digest = sequence.prefix_digests.at(frontier);
         const DiskKVIdentity id{.lo=digest[0], .hi=digest[1], .tag=tag, .frontier=frontier};
-        auto complete = [&] {
+        auto complete = [&](SpillStatus status) {
             cleanup_owner_spill(p);
-            ++p.saved;
-            if (state) { ++p.state_saved; }
+            if (status == SpillStatus::Dropped) {
+                // The store refused the page (full, no victim, I/O error): the
+                // persisted chain ends above it. Count it as a miss, not a save.
+                ++p.dropped;
+            } else {
+                ++p.saved;
+                if (state) { ++p.state_saved; }
+                if (anchor_stage) { ++p.anchors_spilled; }
+            }
             if (anchor_stage) { ++p.page; }
             else if (state || tail) { next_stage(); }
             else { ++p.page; }
@@ -3356,7 +3365,8 @@ bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillPr
             if (result == SpillStatus::Failed) { p.failed = true; return false; }
             if (p.writing || result == SpillStatus::Present) {
                 if (!p.writing) { ++p.dedup; }
-                complete(); continue;
+                complete(result);
+                continue;
             }
             p.probed = true;
         }
@@ -3512,9 +3522,9 @@ void ProgramImplCore::spill_dying_owner_pages(SequenceState& sequence) {
                 }
                 if (!ok) {
                     // DIAG: why the prefix ended here (data-loss triage).
-                    fprintf(stderr,
-                            "[l3-spill] kind=%d break p=%u fr=%u comm=%u host=%d dev=%d pin=%d "
-                            "ext=%u/%u spilled=%u\n",
+                    disk_kv_logf('W', "l3-spill",
+                            "break kind=%d | p=%u fr=%u comm=%u host=%d dev=%d pin=%d "
+                            "ext=%u/%u spilled=%u",
                             static_cast<int>(kind), p, page_frontier,
                             pages.committed_columns(logical),
                             static_cast<int>(pages.host_resident(logical)),
@@ -3529,9 +3539,8 @@ void ProgramImplCore::spill_dying_owner_pages(SequenceState& sequence) {
                         std::chrono::milliseconds(5000))) {
                     // Queue stalled past the deadline: stop at the prefix end
                     // (a hole would break the restore walk anyway).
-                    fprintf(stderr,
-                            "[l3-spill] kind=%d queue timeout p=%u fr=%u spilled=%u — "
-                            "prefix ends\n",
+                    disk_kv_logf('W', "l3-spill",
+                            "queue timeout kind=%d | p=%u fr=%u spilled=%u | prefix ends",
                             static_cast<int>(kind), p, page_frontier, spilled);
                     break;
                 }
@@ -3539,8 +3548,8 @@ void ProgramImplCore::spill_dying_owner_pages(SequenceState& sequence) {
             }
             const double spill_seconds =
                 std::chrono::duration<double>(Clock::now() - spill_started).count();
-            fprintf(stderr,
-                    "[l3-spill] kind=%d done total=%u spilled=%u dedup=%u d2h=%u elapsed=%.3fs\n",
+            disk_kv_logf('I', "l3-spill",
+                    "done | kind=%d | total=%u spilled=%u dedup=%u d2h=%u | elapsed=%.3fs",
                     static_cast<int>(kind), page_cap, spilled, duplicate_pages,
                     device_copies, spill_seconds);
         };
@@ -3775,7 +3784,7 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
         progress.read.reset();
         const auto drained = cudaStreamSynchronize(device.stream);
         if (drained != cudaSuccess) {
-            fprintf(stderr, "[l3-seed-yield] drain failed: %s; restart required\n", cudaGetErrorString(drained));
+            disk_kv_logf('E', "l3-seed-yield", "drain failed: %s | restart required", cudaGetErrorString(drained));
             fflush(stderr); std::_Exit(70);
         }
         // Partial state H2D/commit must not become the initial recurrent state
@@ -3784,7 +3793,7 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
             ordered_reset(sequence);
             commit_sequence_kv(sequence, 0, 0);
         } catch (...) {
-            fprintf(stderr, "[l3-seed-yield] rollback failed; restart required\n");
+            disk_kv_logf('E', "l3-seed-yield", "rollback failed | restart required");
             fflush(stderr); std::_Exit(70);
         }
         const auto reset_drained = cudaStreamSynchronize(device.stream);
@@ -3796,7 +3805,8 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
         progress.done = true;
         progress.state_scratch_lease.reset();
         staged.advertised_base = 0;
-        fprintf(stderr, "[l3-seed-yield] lane=%u phase=%u page=%u reason=%s elapsed_ms=%lld -> honest full recompute\n",
+        disk_kv_logf('W', "l3-seed-yield",
+                "lane=%u phase=%u page=%u | reason=%s elapsed_ms=%lld | honest full recompute",
                 sequence.lane, progress.phase, progress.page, progress.reason,
                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now()-progress.started).count()));
@@ -4001,7 +4011,8 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
     progress.done = progress.success = true;
     progress.state_scratch_lease.reset();
     const auto disk_stats_at_yield = disk_kv ? disk_kv->stats() : DiskKVBridgeStats{};
-    fprintf(stderr, "[l3-seed-yield] lane=%u frontier=%u state=ok elapsed_ms=%lld pages=%u batches=%llu max_batch=%u disk_restores=%llu disk_misses=%llu\n",
+    disk_kv_logf('I', "l3-seed-yield",
+            "lane=%u | frontier=%u state=ok elapsed_ms=%lld | pages=%u batches=%llu max_batch=%u disk_restores=%llu disk_misses=%llu",
             sequence.lane,E,
             static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now()-progress.started).count()),
@@ -4010,10 +4021,10 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
             static_cast<unsigned long long>(disk_stats_at_yield.restore_misses));
     return true;
     } catch (const std::exception& error) {
-        fprintf(stderr, "[l3-seed-yield] seed threw: %s\n", error.what());
+        disk_kv_logf('E', "l3-seed-yield", "seed threw | what=%s", error.what());
         return fail();
     } catch (...) {
-        fprintf(stderr, "[l3-seed-yield] seed threw: unknown CPU exception\n");
+        disk_kv_logf('E', "l3-seed-yield", "seed threw | unknown CPU exception");
         return fail();
     }
 }
@@ -6612,6 +6623,19 @@ void ProgramImplCore::publish_materialization_transfers(MaterializationTransacti
 
 void ProgramImplCore::abort_materialization_transfers(
     MaterializationTransaction& transaction) noexcept {
+    // Transfers are enqueued copy-by-copy on transfer_stream BEFORE
+    // transfer_submitted is set, so an exception mid-enqueue leaves device work
+    // in flight with the flag still false. The destinations below are returned
+    // to the free runs, so drain the stream UNCONDITIONALLY: recycling a page an
+    // in-flight H2D is still writing is a cross-stream write race. (The pressure
+    // cleanup path already drains unconditionally.)
+    if (const cudaError_t drained = cudaStreamSynchronize(device.transfer_stream);
+        drained != cudaSuccess) {
+        disk_kv_logf('E', "l3-materialize",
+                     "abort drain failed: %s | restart required", cudaGetErrorString(drained));
+        fflush(stderr);
+        std::_Exit(70);  // sticky CUDA error: recycled pages can no longer be trusted
+    }
     try {
         if (transaction.transfer_submitted) {
             context_completion_.synchronize();
@@ -6622,26 +6646,45 @@ void ProgramImplCore::abort_materialization_transfers(
             transaction.state_restore.reset();
         }
         if (transaction.text_activation || transaction.text_source_restore_reservation) {
-            DeviceKVPageReservation& reservation =
-                transaction.text_source_restore_reservation
-                    ? *transaction.text_source_restore_reservation
-                    : text_kv_addresses->page_reservation(*transaction.text_activation);
-            for (const MaterializationTransaction::KVRestorePage& restore :
-                 transaction.text_restores) {
-                text_kv_pages->abort_device_replica(restore.logical, reservation);
+            // A consumed (moved-from) activation means commit_activation already
+            // activated the address: its page reservation now lives in the address
+            // and the sequence teardown owns it. Skip instead of throwing.
+            if (transaction.text_activation && !transaction.text_activation->live()) {
+                transaction.text_activation.reset();
+            } else {
+                DeviceKVPageReservation& reservation =
+                    transaction.text_source_restore_reservation
+                        ? *transaction.text_source_restore_reservation
+                        : text_kv_addresses->page_reservation(*transaction.text_activation);
+                for (const MaterializationTransaction::KVRestorePage& restore :
+                     transaction.text_restores) {
+                    text_kv_pages->abort_device_replica(restore.logical, reservation);
+                }
             }
         }
         if (transaction.backend_activation || transaction.backend_source_restore_reservation) {
-            DeviceKVPageReservation& reservation =
-                transaction.backend_source_restore_reservation
-                    ? *transaction.backend_source_restore_reservation
-                    : backend_kv_addresses->page_reservation(*transaction.backend_activation);
-            for (const MaterializationTransaction::KVRestorePage& restore :
-                 transaction.backend_restores) {
-                backend_kv_pages->abort_device_replica(restore.logical, reservation);
+            if (transaction.backend_activation && !transaction.backend_activation->live()) {
+                transaction.backend_activation.reset();
+            } else {
+                DeviceKVPageReservation& reservation =
+                    transaction.backend_source_restore_reservation
+                        ? *transaction.backend_source_restore_reservation
+                        : backend_kv_addresses->page_reservation(*transaction.backend_activation);
+                for (const MaterializationTransaction::KVRestorePage& restore :
+                     transaction.backend_restores) {
+                    backend_kv_pages->abort_device_replica(restore.logical, reservation);
+                }
             }
         }
-    } catch (...) { std::terminate(); }
+    } catch (const std::exception& error) {
+        // Cleanup-side guard violations must be diagnosable: name the exception
+        // before the (deliberate) fail-fast. Never downgrade to a cache miss.
+        disk_kv_logf('E', "l3-materialize", "transfer abort failed | what=%s", error.what());
+        std::terminate();
+    } catch (...) {
+        disk_kv_logf('E', "l3-materialize", "transfer abort failed | unknown exception");
+        std::terminate();
+    }
     transaction.text_restores.clear();
     transaction.text_restore_destinations.clear();
     transaction.backend_restores.clear();
@@ -6947,13 +6990,12 @@ void ProgramImplCore::prepare_pressure_work(MaterializationTransaction::Pressure
     const SequenceKVBundle* kv = sequence != nullptr ? (sequence->kv ? &*sequence->kv : nullptr)
                                                      : (shared->kv ? &*shared->kv : nullptr);
     if (std::getenv("NINFER_BRIDGE_TRACE")) {
-        std::fprintf(stderr,
-                     "[l3-press] prepare resource=%d shared_owner=%d idx=%u seq=%p shared=%p "
-                     "kv=%p text_addr=%p text_pages=%p\n",
+        disk_kv_logf('D', "l3-press",
+                     "prepare | resource=%d shared_owner=%d idx=%u seq=%p shared=%p "
+                     "kv=%p text_addr=%p text_pages=%p",
                      static_cast<int>(resource), work.shared_owner ? 1 : 0,
                      work.continuation_index, (void*)sequence, (void*)shared, (void*)kv,
                      (void*)text_kv_addresses.get(), (void*)text_kv_pages.get());
-        std::fflush(stderr);
     }
     if (kv == nullptr) { throw std::logic_error("pressure owner has no KV address space"); }
     if (resource == runtime::ContextResourceClass::MainKV) {
@@ -6992,6 +7034,103 @@ void ProgramImplCore::prepare_pressure_work(MaterializationTransaction::Pressure
 #include "targets/qwen3_6/impl/runtime/proactive_impl.h"
 
 void ProgramImplCore::background_host_kv_tick() noexcept {
+    // L3 liveness sweep: re-stamp the in-memory LRU of every disk page
+    // belonging to a CATALOGUED session, so eviction ranks by last use
+    // (session liveness) instead of last write. Without it, one burst's fresh
+    // writes evict the chains of every OTHER catalogued session (only the
+    // single freshest checkpoint chain stays hot), and the restore probe's
+    // first-hole stop converts one missing page into that session's full
+    // recompute. In-memory only — no mmap header write (the known fault
+    // storm), no index dirtying; post-restart LRU order is stale until the
+    // first sweep completes, which is harmless. Caveat: if catalogued chains
+    // exceed the store's slot count, sweep order becomes the sacrifice order.
+    if (disk_kv != nullptr &&
+        !has_context_transaction() && !pending_transaction_ && !has_unsettled_state_fork()) {
+        try {
+            const auto now = Clock::now();
+            if (now >= l3_touch_next_) {
+                const auto deadline = now + std::chrono::milliseconds(2);
+                const std::uint32_t tag = static_cast<std::uint32_t>(speculative_backend) |
+                    (static_cast<std::uint32_t>(proposal_head) << 8U) |
+                    (static_cast<std::uint32_t>(kv_storage) << 16U);
+                while (Clock::now() < deadline && l3_touch_slot_ < continuation_capacity) {
+                    SequenceState& seq = continuation_states[l3_touch_slot_];
+                    if (continuation_slots[l3_touch_slot_].role == ContinuationSlotRole::Catalogued &&
+                        seq.kv && text_kv_addresses && text_kv_pages &&
+                        seq.execution_frontier != 0 && seq.execution_frontier < seq.prefix_digests.size()) {
+                        const auto address = seq.kv->text;
+                        const std::uint32_t mapped = std::min(
+                            text_kv_addresses->mapped_pages(address),
+                            kv_pages_for_frontier(seq.execution_frontier));
+                        std::uint32_t stop = std::min(mapped, l3_touch_page_ + 512);
+                        for (std::uint32_t p = l3_touch_page_; p < stop; ++p) {
+                            const std::uint32_t required =
+                                runtime_support::owner_spill_required_columns(
+                                    seq.execution_frontier, p, kPagedKVPageSize);
+                            const std::uint32_t f = p * kPagedKVPageSize + required;
+                            if (f >= seq.prefix_digests.size()) { stop = p; break; }
+                            const auto digest = seq.prefix_digests.at(f);
+                            disk_kv->touch_lru(
+                                DiskKVIdentity{.lo=digest[0], .hi=digest[1], .tag=tag, .frontier=f},
+                                DiskKVKind::MainKV);
+                            if (seq.kv->backend && backend_kv_addresses && backend_kv_pages &&
+                                speculative_backend == SpeculativeBackend::Mtp) {
+                                const std::uint32_t bf =
+                                    backend_frontier_at(speculative_backend, seq.execution_frontier);
+                                if (p < kv_pages_for_frontier(bf) &&
+                                    p < backend_kv_addresses->mapped_pages(*seq.kv->backend)) {
+                                    const std::uint32_t brequired =
+                                        runtime_support::owner_spill_required_columns(bf, p, kPagedKVPageSize);
+                                    const std::uint32_t bfz = p * kPagedKVPageSize + brequired;
+                                    if (bfz < seq.prefix_digests.size()) {
+                                        const auto bdigest = seq.prefix_digests.at(bfz);
+                                        disk_kv->touch_lru(
+                                            DiskKVIdentity{.lo=bdigest[0], .hi=bdigest[1], .tag=tag, .frontier=bfz},
+                                            DiskKVKind::BackendKV);
+                                    }
+                                }
+                            }
+                        }
+                        l3_touch_page_ = stop;
+                        if (l3_touch_page_ >= mapped) {
+                            // State anchors: the restore probe requires the state
+                            // image at the frontier — keep them hot with the chain.
+                            if (seq.endpoint_valid) {
+                                const auto d = seq.prefix_digests.at(seq.execution_frontier);
+                                disk_kv->touch_lru(
+                                    DiskKVIdentity{.lo=d[0], .hi=d[1], .tag=tag, .frontier=seq.execution_frontier},
+                                    DiskKVKind::StateImage);
+                            }
+                            if (seq.rewrite_checkpoint.valid && seq.rewrite_state &&
+                                seq.rewrite_checkpoint.frontier < seq.prefix_digests.size()) {
+                                const auto d = seq.prefix_digests.at(seq.rewrite_checkpoint.frontier);
+                                disk_kv->touch_lru(
+                                    DiskKVIdentity{.lo=d[0], .hi=d[1], .tag=tag, .frontier=seq.rewrite_checkpoint.frontier},
+                                    DiskKVKind::StateImage);
+                            }
+                            for (const auto& anchor : seq.long_anchors) {
+                                if (anchor.frontier != 0 && anchor.frontier < seq.prefix_digests.size()) {
+                                    const auto d = seq.prefix_digests.at(anchor.frontier);
+                                    disk_kv->touch_lru(
+                                        DiskKVIdentity{.lo=d[0], .hi=d[1], .tag=tag, .frontier=anchor.frontier},
+                                        DiskKVKind::StateImage);
+                                }
+                            }
+                            l3_touch_page_ = 0;
+                            ++l3_touch_slot_;
+                        }
+                    } else {
+                        ++l3_touch_slot_;
+                        l3_touch_page_ = 0;
+                    }
+                    if (l3_touch_slot_ >= continuation_capacity) {
+                        l3_touch_slot_ = 0;
+                        l3_touch_next_ = Clock::now() + std::chrono::seconds(30);
+                    }
+                }
+            }
+        } catch (...) {}
+    }
     if (!disk_kv || !host_kv_extents || !host_prewrite.enabled) return;
     // No overlap with transfer staging, owner consumption or capture publication.
     if (has_context_transaction() || pending_transaction_ || has_unsettled_state_fork()) return;
@@ -7396,6 +7535,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                 }
                 if (!work.owner_spill) {
                     work.owner_spill.emplace();
+                    work.owner_spill->id = index;
                     work.owner_spill->endpoint_valid_at_start =
                         continuation_states[index].endpoint_valid;
                     work.owner_spill->seam_valid_at_start =
@@ -7407,7 +7547,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                     const auto stalled_for =
                         std::chrono::steady_clock::now() - spill.last_progress_at;
                     if (!spill.failed && stalled_for > std::chrono::seconds(15)) {
-                        fprintf(stderr, "[l3-spill-r7] timeout: retain owner and drain accepted borrows\n");
+                        disk_kv_logf('W', "l3-spill", "r7 timeout | retain owner and drain accepted borrows");
                         spill.failed = true;
                     }
                     if (spill.failed && owner_spill_pending(spill)) {
@@ -7415,10 +7555,11 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                         return out;
                     }
                     if (spill.failed) {
-                        fprintf(stderr, "[l3-spill] owner retained: stage=%u page=%u write/read failed "
-                                        "(batch_tickets=%zu ticket=%d probed=%d writing=%d ready=%d "
-                                        "batch_ids=%zu batch_submit=%u stride=%zu)\n",
-                                spill.stage, spill.page,
+                        disk_kv_logf('E', "l3-spill",
+                                        "owner fail | id=%u | stage=%u page=%u write/read failed "
+                                        "| batch_tickets=%zu ticket=%d probed=%d writing=%d ready=%d "
+                                        "batch_ids=%zu batch_submit=%u stride=%zu",
+                                spill.id, spill.stage, spill.page,
                                 spill.batch_tickets.size(), (int)(spill.ticket != nullptr),
                                 (int)spill.probed, (int)spill.writing, (int)spill.ready,
                                 spill.batch_ids.size(), spill.batch_submit, spill.batch_stride);
@@ -7427,16 +7568,20 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                     } else { out.status = runtime::ContextTransactionStatus::InProgress; }
                     return out;
                 }
-                fprintf(stderr,
-                        "[l3-spill] owner done saved=%llu dedup=%llu d2h=%llu state=%llu "
-                        "ep=%d seam=%d elapsed=%.3fs batch=r7-probe32\n",
+                disk_kv_logf('I', "l3-spill",
+                        "owner ok | id=%u | stages=0-%u | pages=%llu dup=%llu dropped=%llu fail=0 anchors=%u d2h=%llu state=%llu "
+                        "| ep=%d seam=%d | ms=%lld batch=r7-probe32",
+                        spill.id, static_cast<unsigned>(spill.stage),
                         static_cast<unsigned long long>(spill.saved),
                         static_cast<unsigned long long>(spill.dedup),
+                        static_cast<unsigned long long>(spill.dropped),
+                        static_cast<unsigned long long>(spill.anchors_spilled),
                         static_cast<unsigned long long>(spill.d2h),
                         static_cast<unsigned long long>(spill.state_saved),
                         static_cast<int>(spill.endpoint_valid_at_start),
                         static_cast<int>(spill.seam_valid_at_start),
-                        std::chrono::duration<double>(std::chrono::steady_clock::now() - spill.started).count());
+                        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - spill.started).count()));
                 cleanup_owner_spill(spill);
                 const PhysicalReleaseResult released =
                     release_materialization_victim(transaction, position);
@@ -7666,8 +7811,8 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
             if (what == "consumed source KV is not destructively truncatable" ||
                 what == "stale source Host KV tail is not releasable" ||
                 what == "COW source KV suffix is not releasable") {
-                fprintf(stderr,
-                        "[l3-materialize] source truncation deferred (%s) -> retryable\n",
+                disk_kv_logf('W', "l3-materialize",
+                        "source truncation deferred (%s) -> retryable",
                         error.what());
                 out.status = runtime::ContextTransactionStatus::RetryableFailure;
                 return out;
@@ -13114,6 +13259,68 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 // Prompt transitions are canonical immediately. If this was the first write after
                 // an immutable source, close the Fork before potentially freezing a new rewrite.
                 settle_state_fork(sequence);
+
+                // L3 seam anchor at the prompt's rewrite-checkpoint frontier — the
+                // pre-opener boundary before this request's own generation opener.
+                // That frontier is strictly inside the prompt (the digest chain is
+                // valid there) and is exactly where the client-authored follow-up's
+                // re-rendered history can still match this execution: anything at or
+                // after the reply span diverges. Capturing at every historical
+                // boundary floods the state family (dozens of 146 MiB images per
+                // request) and LRU-evicts the very anchor the next turn needs. The
+                // in-memory capture transaction at this same frontier only covers the
+                // disk seam when the owner-spill path happens to run; this write is
+                // the per-request guarantee (synchronous, logged). Every failure is
+                // a silent degradation.
+                if (staged.prompt.identity.rewrite_checkpoint &&
+                    staged.cursor == staged.prompt.identity.rewrite_checkpoint->frontier &&
+                    disk_kv != nullptr &&
+                    l3_state_scratch && host_state_images && text_kv_pages && !staged.vision &&
+                    !staged.prompt.has_media() && speculative_backend != SpeculativeBackend::DFlash &&
+                    disk_kv->slot_count(DiskKVKind::StateImage) != 0 &&
+                    staged.cursor < sequence.prefix_digests.size()) {
+                  try {
+                    StateScratchLease::Lease seam_lease = l3_state_scratch_lease.try_acquire();
+                    if (seam_lease) {
+                        const auto seam_digest = sequence.prefix_digests.at(staged.cursor);
+                        const DiskKVIdentity seam{
+                            .lo       = seam_digest[0],
+                            .hi       = seam_digest[1],
+                            .tag      = static_cast<std::uint32_t>(speculative_backend) |
+                                       (static_cast<std::uint32_t>(proposal_head) << 8U) |
+                                       (static_cast<std::uint32_t>(kv_storage) << 16U),
+                            .frontier = staged.cursor,
+                        };
+                        if (disk_kv->contains(seam, DiskKVKind::StateImage)) {
+                            disk_kv->touch(seam, DiskKVKind::StateImage);
+                        } else {
+                            const auto view = host_state_images->writable_view(*l3_state_scratch);
+                            const std::size_t stride = state_images->host_layout().image_bytes;
+                            if (view.data != nullptr && view.layout != nullptr &&
+                                state_images->spill_copy_to_host(
+                                    state_store->physical_slot(sequence.state.read), view,
+                                    device.stream)) {
+                                const cudaError_t copied = cudaStreamSynchronize(device.stream);
+                                if (copied != cudaSuccess) {
+                                    disk_kv_logf('E', "l3-seam",
+                                                 "copy sync failed: %s | restart required",
+                                                 cudaGetErrorString(copied));
+                                    fflush(stderr);
+                                    std::_Exit(70);
+                                }
+                                (void)disk_kv->spill_page_sync(
+                                    seam, DiskKVKind::StateImage,
+                                    std::span<const std::byte>(view.data, stride));
+                                disk_kv_logf('I', "l3-seam",
+                                             "anchor written | frontier=%u digest=%016llx%016llx",
+                                             staged.cursor,
+                                             (unsigned long long)seam_digest[0],
+                                             (unsigned long long)seam_digest[1]);
+                            }
+                        }
+                    }
+                  } catch (...) {}
+                }
                 const bool reached_capture = capture_frontier && staged.cursor == *capture_frontier;
                 if (reached_capture) {
                     if (result.finalized) {

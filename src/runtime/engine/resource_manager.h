@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/disk_kv_log.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/context_cost.h"
@@ -323,7 +324,7 @@ public:
                     // "never triggered" — otherwise a silent run is unexplainable.
                     if (now-proactive_log_>std::chrono::seconds(10)) {
                         proactive_log_=now;
-                        fprintf(stderr,"[l3-proactive] candidate scan catalogued_candidates=%zu began=%d resident_mib=%llu reason=%s\n",
+                        disk_kv_logf('I',"l3-proactive","candidate scan | catalogued_candidates=%zu began=%d resident_mib=%llu | reason=%s",
                                 candidates.size(),static_cast<int>(proactive_victim_.has_value()),
                                 (unsigned long long)(proactive_victim_ ?
                                     program.proactive_victim_bytes(*catalog_[proactive_victim_->slot].handle)/(1ULL<<20) : 0),
@@ -334,13 +335,13 @@ public:
                     if (program.proactive_pending()) {
                         if (now-proactive_log_>std::chrono::seconds(10)) {
                             proactive_log_=now;
-                            fprintf(stderr,"[l3-proactive] preparing pages=%zu saved=%zu ticks=%llu tx_active=%llu\n",
+                            disk_kv_logf('I',"l3-proactive","preparing | pages=%zu saved=%zu ticks=%llu tx_active=%llu",
                                     program.proactive_entries(),program.proactive_done_entries(),
                                     (unsigned long long)proactive_ticks_,(unsigned long long)proactive_tx_skips_);
                         }
                     } else if (now-proactive_log_>std::chrono::seconds(10)) {
                         proactive_log_=now;
-                        fprintf(stderr,"[l3-proactive] waiting to prepare (boundary busy or no work step)\n");
+                        disk_kv_logf('I',"l3-proactive","waiting to prepare (boundary busy or no work step)");
                     }
                 }
                 // Turn-end incremental checkpoint branches, deliberately AFTER
@@ -362,8 +363,14 @@ public:
                             checkpoint_retry_=now+std::chrono::milliseconds(250);
                         } else {
                             int result = 0;
-                            const auto tick_deadline=now+std::chrono::milliseconds(3);
-                            for (unsigned n = 0; n < per_tick; ++n) {
+                            // Checkpoint work is host-cheap (the spill itself
+                            // runs on bridge workers + the transfer stream),
+                            // so this branch gets a wider step than eviction:
+                            // a 3ms budget let burst-era checkpoints lag their
+                            // sessions by thousands of tokens, and every stale
+                            // frontier is prefill the next request pays for.
+                            const auto tick_deadline=now+std::chrono::milliseconds(10);
+                            for (unsigned n = 0; n < 16; ++n) {
                                 result = program.proactive_tick(*entry.handle);
                                 if (result != 0) { break; }
                                 if (std::chrono::steady_clock::now() > tick_deadline) { break; }
@@ -391,15 +398,26 @@ public:
                         // Dirty scan: catalogued, unclaimed owners whose endpoint
                         // frontier moved past the last persisted one. Same
                         // candidate guards as eviction minus the pressure gate.
-                        for (std::uint32_t i=0;i<catalog_count_ && !checkpoint_victim_;++i) {
+                        // FRESHEST FIRST: under a burst, catalog order made a
+                        // just-advanced session wait behind every other dirty
+                        // entry while its disk chain churned out from under it
+                        // (the probe stops at the first evicted page), so serve
+                        // the largest unpersisted delta first.
+                        const CatalogEntry* best = nullptr;
+                        std::uint32_t best_slot = 0;
+                        std::uint64_t best_delta = 0;
+                        for (std::uint32_t i=0;i<catalog_count_;++i) {
                             const auto& entry=catalog_[i];
                             if (entry.state!=CatalogState::Catalogued || !entry.handle ||
                                 private_has_active_edge(i) || entry.summary.active_references!=0 ||
                                 !entry.summary.endpoint) continue;
                             if (entry.summary.endpoint->ref.frontier<=entry.disk_checkpoint_frontier) continue;
-                            if (program.proactive_begin_checkpoint(*entry.handle)) {
-                                checkpoint_victim_=private_capability(i);
-                            }
+                            const std::uint64_t delta =
+                                entry.summary.endpoint->ref.frontier - entry.disk_checkpoint_frontier;
+                            if (!best || delta>best_delta) { best=&entry; best_slot=i; best_delta=delta; }
+                        }
+                        if (best && program.proactive_begin_checkpoint(*best->handle)) {
+                            checkpoint_victim_=private_capability(best_slot);
                         }
                         if (!checkpoint_victim_) checkpoint_retry_=now+std::chrono::milliseconds(250);
                     }

@@ -1,5 +1,7 @@
 #include "core/disk_kv_store.h"
 
+#include "core/disk_kv_log.h"
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -15,6 +17,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 
 namespace ninfer {
 namespace {
@@ -223,33 +226,107 @@ bool DiskKVStore::load_index() {
     index_.reserve(hdr.count);
     free_slots_.clear();
     free_slots_.reserve(max_slots_);
-    std::uint32_t occupied = 0;
+
+    // Header-only check per row: the index row must agree with the slot
+    // header. If the slot was repurposed (different identity), drop the row.
+    // Data integrity is verified lazily at READ time (read_page CRC) — a
+    // corrupted page becomes a restore miss, not a startup cost.
+    //
+    // The header is pread from a small thread pool, NOT read through the
+    // mapping: one random 4 KiB mapping fault per live page serialized this
+    // loop into ~10 minutes at startup on the production volume (224K live
+    // rows and growing with the store, 83% CPU in fault churn), while the
+    // same reads through pread run in parallel. read_page_result still
+    // verifies identity and CRC on every restore, so this pass guards only
+    // the index's agreement with the data file — never data integrity.
+    struct HeaderCheck {
+        Header header{};
+        bool ok = false;
+    };
+    std::vector<IdxEntry> candidates;
+    candidates.reserve(rows.size());
     for (const IdxEntry& r : rows) {
-        if (r.slot >= max_slots_) { continue; }  // defensive: ignore bad row
-        const Header& h = *slot_hdr_c(r.slot);
-        const DiskKVIdentity id{r.lo, r.hi, r.tag, r.frontier};
-        // Header-only check (cheap): the index row must agree with the slot
-        // header. If the slot was repurposed (different identity), drop the
-        // row. Data integrity is verified lazily at READ time (read_page
-        // CRC) — a corrupted page becomes a restore miss, not a startup cost.
-        if (h.magic != Header::kMagic || h.lo != id.lo || h.hi != id.hi ||
-            h.tag != id.tag || h.frontier != id.frontier) {
-            continue;
+        if (r.slot < max_slots_) { candidates.push_back(r); }  // defensive: ignore bad row
+    }
+    std::vector<HeaderCheck> checks(candidates.size());
+    const auto validate_range = [&](std::size_t begin, std::size_t end) {
+        for (std::size_t i = begin; i < end; ++i) {
+            const IdxEntry& r = candidates[i];
+            Header h{};
+            std::size_t got = 0;
+            bool io_ok = true;
+            while (got < sizeof(Header)) {
+                const ssize_t n = ::pread(fd_, reinterpret_cast<char*>(&h) + got,
+                                          sizeof(Header) - got,
+                                          static_cast<off_t>(r.slot * slot_pitch_ + got));
+                if (n <= 0) {
+                    if (n < 0 && errno == EINTR) { continue; }
+                    io_ok = false;
+                    break;
+                }
+                got += static_cast<std::size_t>(n);
+            }
+            if (!io_ok) { continue; }  // unreadable header: drop the row
+            const DiskKVIdentity id{r.lo, r.hi, r.tag, r.frontier};
+            checks[i].ok = h.magic == Header::kMagic && h.lo == id.lo &&
+                           h.hi == id.hi && h.tag == id.tag && h.frontier == id.frontier;
+            if (checks[i].ok) { checks[i].header = h; }
         }
+    };
+    const auto load_started = std::chrono::steady_clock::now();
+    const std::size_t total = candidates.size();
+    if (total != 0) {
+        unsigned workers = std::thread::hardware_concurrency();
+        workers = std::clamp(workers == 0 ? 4U : workers, 2U, 8U);
+        struct Range {
+            std::size_t begin = 0;
+            std::size_t end = 0;
+        };
+        std::vector<Range> ranges;
+        for (unsigned t = 0; t < workers; ++t) {
+            const std::size_t b = total * t / workers;
+            const std::size_t e = total * (t + 1) / workers;
+            if (b < e) { ranges.push_back(Range{b, e}); }
+        }
+        std::vector<std::thread> pool;
+        std::size_t spawned = 1;  // range 0 always runs on this thread
+        try {
+            for (std::size_t i = 1; i < ranges.size(); ++i) {
+                pool.emplace_back(validate_range, ranges[i].begin, ranges[i].end);
+                spawned = i + 1;
+            }
+        } catch (...) {
+            // A smaller pool than planned is fine; unspawned ranges run below.
+        }
+        validate_range(ranges[0].begin, ranges[0].end);
+        for (auto& worker : pool) { worker.join(); }
+        for (std::size_t i = spawned; i < ranges.size(); ++i) {
+            validate_range(ranges[i].begin, ranges[i].end);
+        }
+    }
+    std::size_t dropped = 0;
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        if (!checks[i].ok) { ++dropped; continue; }
         // Rebuild the LRU map as well: a restart must never leave the
         // eviction index empty. Observed failure: the fast path filled
         // index_ but not lru_, so a full store failed EVERY upsert with
         // "no victim" after redeploy (208 FAILs / 19 owner-retained 503s
         // in one window) — evict_one_lru had no candidates at all.
-        record_live(id, r.slot, h.last_used);
+        const DiskKVIdentity id{candidates[i].lo, candidates[i].hi,
+                                candidates[i].tag, candidates[i].frontier};
+        record_live(id, candidates[i].slot, checks[i].header.last_used);
     }
+    disk_kv_logf('I', "l3-store",
+                 "index fast-path | rows=%zu dropped=%zu took=%.1fs",
+                 candidates.size(), dropped,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - load_started).count());
+
     // Rebuild the free pool from the (verified) live slots.
     std::vector<bool> live(max_slots_, false);
     for (const auto& [id, s] : index_) { live[s] = true; }
     for (std::uint32_t s = 0; s < max_slots_; ++s) {
         if (!live[s]) { free_slots_.push_back(s); }
     }
-    (void)occupied;
     return true;
 }
 
@@ -399,9 +476,8 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
     const bool trace = store_trace();
     const auto t0 = std::chrono::steady_clock::now();
     if (trace) {
-        fprintf(stderr, "[l3-store] upsert enter id=%llu/%llu\n",
-                static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi));
-        fflush(stderr);
+        disk_kv_logf('D', "l3-store", "upsert enter | id=%llu/%llu",
+                     static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi));
     }
     std::uint32_t slot = 0;
     std::uint64_t stamp = 0;
@@ -425,11 +501,8 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
             // Full: LRU-evict the coldest page.
             auto victim = evict_one_lru();
             if (!victim.has_value()) {
-                if (trace) {
-                    fprintf(stderr, "[l3-store] upsert EVICT-FAIL (no victim) id=%llu/%llu\n",
-                            static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi));
-                    fflush(stderr);
-                }
+                disk_kv_logf('E', "l3-store", "upsert EVICT-FAIL no-victim | id=%llu/%llu",
+                             static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi));
                 return false;
             }
             if (evicted != nullptr) {
@@ -445,10 +518,9 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
         zero_slot(slot);
     }
     if (trace) {
-        fprintf(stderr, "[l3-store] upsert stage-mu1 id=%llu/%llu took=%.3fs\n",
-                static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi),
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-        fflush(stderr);
+        disk_kv_logf('D', "l3-store", "upsert stage-mu1 | id=%llu/%llu | took=%.3fs",
+                     static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
 
     // ---- Unlocked region: the slot is off free_slots_ and absent from
@@ -473,11 +545,16 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
                                        static_cast<off_t>(payload_off + written));
             if (n <= 0) {
                 if (n < 0 && errno == EINTR) { continue; }
-                if (trace) {
-                    fprintf(stderr, "[l3-store] upsert PWRITE-FAIL errno=%d id=%llu/%llu\n",
-                            errno, static_cast<unsigned long long>(id.lo),
-                            static_cast<unsigned long long>(id.hi));
-                    fflush(stderr);
+                disk_kv_logf('E', "l3-store", "upsert PWRITE-FAIL | errno=%d written=%zu/%zu | id=%llu/%llu",
+                             errno, written, opts_.slot_size,
+                             static_cast<unsigned long long>(id.lo),
+                             static_cast<unsigned long long>(id.hi));
+                // The slot is off free_slots_ and absent from index_ (its header
+                // was zeroed), so returning it here loses nothing: the store is
+                // full-capacity again instead of leaking one slot per I/O error.
+                {
+                    std::lock_guard<std::mutex> lock(mu_);
+                    release_slot(slot);
                 }
                 return false;
             }
@@ -485,25 +562,22 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
         }
     }
     if (trace) {
-        fprintf(stderr, "[l3-store] upsert stage-write id=%llu/%llu took=%.3fs\n",
-                static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi),
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-        fflush(stderr);
+        disk_kv_logf('D', "l3-store", "upsert stage-write | id=%llu/%llu | took=%.3fs",
+                     static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
 
     if (trace) {
-        fprintf(stderr, "[l3-store] upsert stage-mu2-enter id=%llu/%llu took=%.3fs\n",
-                static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi),
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-        fflush(stderr);
+        disk_kv_logf('D', "l3-store", "upsert stage-mu2-enter | id=%llu/%llu | took=%.3fs",
+                     static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     {
         std::lock_guard<std::mutex> lock(mu_);
         if (trace) {
-            fprintf(stderr, "[l3-store] upsert stage-mu2-got id=%llu/%llu took=%.3fs\n",
-                    static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi),
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-            fflush(stderr);
+            disk_kv_logf('D', "l3-store", "upsert stage-mu2-got | id=%llu/%llu | took=%.3fs",
+                         static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi),
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         }
         if (index_.find(id) != index_.end()) {
             // Lost a race with another writer of the same id (both passed the
@@ -527,10 +601,9 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
         if (!opts_.defer_index_updates) { persist_index_unlocked(); }
     }
     if (trace) {
-        fprintf(stderr, "[l3-store] upsert done id=%llu/%llu took=%.3fs\n",
-                static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi),
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-        fflush(stderr);
+        disk_kv_logf('D', "l3-store", "upsert done | id=%llu/%llu | took=%.3fs",
+                     static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     return true;
 }
@@ -565,10 +638,9 @@ DiskReadResult DiskKVStore::read_page_result(const DiskKVIdentity& id, std::span
     // readers actually run in parallel (see readers_ in the header). Read via
     // pread, not the mmap: the store file is far larger than the VM's memory
     // and mmap reads fault-storm the same way writes do (see upsert_page).
-    bool crc_ok = true;
+    bool io_ok = true;
     {
         std::size_t got = 0;
-        bool io_ok = true;
         while (got < opts_.slot_size) {
             const ssize_t n = ::pread(fd_, dst.data() + got, opts_.slot_size - got,
                                       static_cast<off_t>(off + got));
@@ -579,15 +651,19 @@ DiskReadResult DiskKVStore::read_page_result(const DiskKVIdentity& id, std::span
             }
             got += static_cast<std::size_t>(n);
         }
-        crc_ok = io_ok && (!opts_.verify_crc ||
-            crc32c(std::span<const std::byte>(dst.data(), opts_.slot_size)) == expected_crc);
     }
     {
         std::lock_guard<std::mutex> lock(mu_);
         auto& pinned = readers_[slot];
         if (pinned) { --pinned; }
     }
-    if (!crc_ok) { return DiskReadResult::BadCRC; }
+    // A pread failure is an I/O problem (disk, mount, short file), not data
+    // corruption: report it as its own class so triage does not chase CRC ghosts.
+    if (!io_ok) { return DiskReadResult::IOFailure; }
+    if (opts_.verify_crc &&
+        crc32c(std::span<const std::byte>(dst.data(), opts_.slot_size)) != expected_crc) {
+        return DiskReadResult::BadCRC;
+    }
     return DiskReadResult::Success;
 }
 
@@ -605,8 +681,23 @@ bool DiskKVStore::touch(const DiskKVIdentity& id) {
     std::lock_guard<std::mutex> lock(mu_);
     const auto it = index_.find(id);
     if (it == index_.end()) { return false; }
-    (*slot_hdr(it->second)).last_used = bump_clock();
+    const auto stamp = bump_clock();
+    (*slot_hdr(it->second)).last_used = stamp;
+    // The in-memory LRU map decides eviction; updating only the header would
+    // leave the touched page at its old (cold) eviction position.
+    lru_insert(it->second, stamp);
     index_dirty_ = true;
+    return true;
+}
+
+bool DiskKVStore::touch_lru(const DiskKVIdentity& id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto it = index_.find(id);
+    if (it == index_.end()) { return false; }
+    // In-memory only by design (see the header comment): no mmap header write
+    // (each would cost one 4 KiB mapping fault — the sweep touches thousands
+    // of pages per pass) and no index dirtying (nothing persistent changed).
+    lru_insert(it->second, bump_clock());
     return true;
 }
 

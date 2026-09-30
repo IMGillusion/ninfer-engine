@@ -116,6 +116,13 @@ public:
     /** Refresh the slot's LRU timestamp without reading the page. */
     bool touch(const DiskKVIdentity& id);
 
+    /** Refresh ONLY the in-memory LRU position: no mmap header write (avoids
+     *  the per-page fault storm), no index dirtying. Used by the engine's
+     *  liveness sweep to re-rank eviction by session liveness; the on-disk
+     *  header timestamp goes stale, which only flattens the post-restart LRU
+     *  order until the first sweep — harmless. */
+    bool touch_lru(const DiskKVIdentity& id);
+
     /** Evict a specific page (if it currently holds `id`). */
     bool evict(const DiskKVIdentity& id);
 

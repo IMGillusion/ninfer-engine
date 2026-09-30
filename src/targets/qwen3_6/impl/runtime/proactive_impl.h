@@ -18,11 +18,11 @@ bool ProgramImplCore::proactive_pressure() noexcept {
         const auto pct = [](std::uint64_t u, std::uint64_t c) {
             return c ? static_cast<unsigned>(static_cast<long double>(u) * 100.0L / c) : 0U;
         };
-        fprintf(stderr,
-                "[l3-proactive] pressure active=%d host_kv=%u%% device_kv=%u%% host_state=%u%% device_state=%u%%\n",
-                static_cast<int>(active), pct(usage[0].first, usage[0].second),
-                pct(usage[2].first, usage[2].second), pct(usage[1].first, usage[1].second),
-                pct(usage[3].first, usage[3].second));
+        disk_kv_logf('I', "l3-proactive",
+                     "pressure | active=%d host_kv=%u%% device_kv=%u%% host_state=%u%% device_state=%u%%",
+                     static_cast<int>(active), pct(usage[0].first, usage[0].second),
+                     pct(usage[2].first, usage[2].second), pct(usage[1].first, usage[1].second),
+                     pct(usage[3].first, usage[3].second));
     }
     return active;
 }
@@ -55,6 +55,7 @@ bool ProgramImplCore::proactive_begin(const ContinuationHandle& owner) {
     // Drive the engine's OWN resumable owner spill (the same batched machinery the
     // on-demand materialization uses). A hand-rolled per-page closure was ~100x
     // slower: every page paid two store-queue round trips plus a read-back.
+    work->spill.id = index;
     work->spill.endpoint_valid_at_start = sequence.endpoint_valid;
     work->spill.seam_valid_at_start =
         sequence.rewrite_checkpoint.valid && static_cast<bool>(sequence.rewrite_state);
@@ -90,6 +91,7 @@ bool ProgramImplCore::proactive_begin_checkpoint(const ContinuationHandle& owner
     work->ledger=sequence.ledger_frontier;
     // Same resumable owner-spill machinery as the eviction path; the only
     // difference is what commit does with the finished spill.
+    work->spill.id = index;
     work->spill.endpoint_valid_at_start = sequence.endpoint_valid;
     work->spill.seam_valid_at_start =
         sequence.rewrite_checkpoint.valid && static_cast<bool>(sequence.rewrite_state);
@@ -164,7 +166,7 @@ bool ProgramImplCore::proactive_commit(ContinuationHandle& owner) noexcept {
             const auto state=proactive_->spill.state_saved;
             cleanup_owner_spill(proactive_->spill);
             proactive_.reset();
-            fprintf(stderr,"[l3-proactive] checkpoint frontier=%u saved=%llu dedup=%llu state=%llu\n",
+            disk_kv_logf('I',"l3-proactive","checkpoint | frontier=%u saved=%llu dedup=%llu state=%llu",
                 frontier,(unsigned long long)saved,(unsigned long long)dedup,
                 (unsigned long long)state);
             return true;
@@ -185,7 +187,8 @@ bool ProgramImplCore::proactive_commit(ContinuationHandle& owner) noexcept {
         const auto after=physical_occupancy();
         const auto host_bytes=before.host.kv_bytes-after.host.kv_bytes;
         proactive_released_host_bytes_+=host_bytes;
-        fprintf(stderr,"[l3-proactive] released host_kv_bytes=%llu device_kv_pages=%u host_state_slots=%u device_state_slots=%u verified_disk_bytes=%llu saved=%llu dedup=%llu d2h=%llu state=%llu\n",
+        disk_kv_logf('I',"l3-proactive",
+                     "released | host_kv_bytes=%llu device_kv_pages=%u host_state_slots=%u device_state_slots=%u | verified_disk_bytes=%llu saved=%llu dedup=%llu d2h=%llu state=%llu",
             (unsigned long long)host_bytes,before.device.main_kv_pages-after.device.main_kv_pages,
             before.host.state_slots-after.host.state_slots,before.device.state_slots-after.device.state_slots,
             (unsigned long long)(spill.saved*text_host_kv_page_stride),

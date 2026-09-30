@@ -731,6 +731,18 @@ public:
     std::uint64_t proactive_released_host_bytes_=0;
     const char* proactive_begin_fail_=nullptr;
     [[nodiscard]] const char* proactive_begin_fail() const noexcept { return proactive_begin_fail_; }
+    // L3 liveness sweep cursor (background_host_kv_tick): periodically re-stamps
+    // the in-memory LRU of every disk page belonging to a CATALOGUED session so
+    // eviction ranks by last use (session liveness) instead of last write.
+    // Without it, one burst's fresh writes evict the chains of every OTHER
+    // catalogued session — only the single freshest checkpoint chain stays hot
+    // — and the restore probe's first-hole stop converts one missing page into
+    // that session's full recompute. Resumable (slot, page) cursor keeps each
+    // boundary's cost bounded; caveat: if catalogued chains exceed the store's
+    // slot count, sweep order becomes the sacrifice order (round robin).
+    std::chrono::steady_clock::time_point l3_touch_next_{};
+    std::uint32_t l3_touch_slot_ = 0;
+    std::uint32_t l3_touch_page_ = 0;
     // Low-frequency diagnostics (only meaningful with the opt-in env var on):
     // production stays quiet once the watermark state is stable.
     bool proactive_log_pressure_=false;
@@ -890,7 +902,10 @@ private:
         std::optional<LogicalKVPageHandle> pinned_page;
         std::span<const std::byte> bytes;
         std::uint64_t saved = 0, dedup = 0, d2h = 0;
+        std::uint64_t dropped = 0;  // store refused the page (full/IO): not persisted
         std::uint64_t state_saved = 0;  // endpoint/seam/anchor state images written
+        std::uint32_t anchors_spilled = 0;  // long-anchor pages persisted (stages 6-8)
+        std::uint32_t id = 0;               // victim continuation slot (log identity)
         bool endpoint_valid_at_start = false;  // diagnostics: stage-2 gate
         bool seam_valid_at_start = false;      // diagnostics: stage-3..5 gate
         std::uint8_t last_logged_stage = 255;  // stage-transition diagnostics

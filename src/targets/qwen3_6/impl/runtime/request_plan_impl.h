@@ -1,3 +1,4 @@
+#include "core/disk_kv_log.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 #include "targets/qwen3_6/impl/runtime/rebuild_work.h"
@@ -746,7 +747,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     if (plan->reuse == ReusePath::Root && disk_kv != nullptr && disk_kv_restore) {
         static const bool l3_trace_enter = std::getenv("NINFER_L3_TRACE") != nullptr;
         if (l3_trace_enter) {
-            fprintf(stderr, "[l3-probe] enter src=%d/%d spec=%d pub=%d slots=%u dig=%zu/%u\n",
+            disk_kv_logf('D', "l3-probe", "enter | src=%d/%d spec=%d pub=%d slots=%u dig=%zu/%u",
                     static_cast<int>(source != nullptr), static_cast<int>(shared_source != nullptr),
                     static_cast<int>(speculative_backend),
                     static_cast<int>(base.summary.publish_continuation),
@@ -770,7 +771,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         // The seed reads through scratch reserved at startup (never the shared
         // pools); without the reservation restores are simply unavailable.
         if (!l3_state_scratch || !l3_kv_scratch) {
-            fprintf(stderr, "[l3-probe] skip: no reserved seed scratch\n");
+            disk_kv_logf('D', "l3-probe", "skip | no reserved seed scratch");
         } else {
         const std::uint32_t tag = capture_identity_tag(speculative_backend, proposal_head,
                                                        kv_storage);
@@ -782,10 +783,28 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             if (E == 0) { continue; }
             if (E > plan->summary.prompt_tokens) {
                 if (l3_trace) {
-                    fprintf(stderr, "[l3-probe] E=%u > prompt=%u skip\n", E,
+                    disk_kv_logf('D', "l3-probe", "skip | E=%u > prompt=%u", E,
                             plan->summary.prompt_tokens);
                 }
                 continue;
+            }
+            // Cheap gate BEFORE the per-page chain walk: every passing
+            // candidate requires the state image at E (tail or aligned branch
+            // below), and one store lookup per frontier beats hundreds of
+            // chain probes on a store holding many live session endpoints.
+            {
+                const auto digest = base.prefix_digests.at(E);
+                const DiskKVIdentity gate{.lo      = digest[0],
+                                          .hi      = digest[1],
+                                          .tag     = tag,
+                                          .frontier = E};
+                if (!disk_kv->contains(gate, DiskKVKind::StateImage)) {
+                    if (l3_trace) {
+                        disk_kv_logf('D', "l3-probe", "skip | E=%u state=0 (gate) key=%016llx%016llx tag=%u", E,
+                                     (unsigned long long)digest[0], (unsigned long long)digest[1], tag);
+                    }
+                    continue;
+                }
             }
             const std::uint32_t full_pages = E / static_cast<std::uint32_t>(kPagedKVPageSize);
             bool covered = full_pages != 0;
@@ -807,7 +826,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             }
             if (!covered) {
                 if (l3_trace) {
-                    fprintf(stderr, "[l3-probe] E=%u main chain miss key=%u\n", E, fail_key);
+                    disk_kv_logf('D', "l3-probe", "E=%u main chain miss | key=%u", E, fail_key);
                 }
                 continue;
             }
@@ -820,15 +839,15 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                 if (!disk_kv->contains(id, DiskKVKind::MainKV) ||
                     !disk_kv->contains(id, DiskKVKind::StateImage)) {
                     if (l3_trace) {
-                        fprintf(stderr, "[l3-probe] E=%u tail main=%d state=%d\n", E,
+                        disk_kv_logf('D', "l3-probe", "E=%u tail miss | main=%d state=%d", E,
                                 static_cast<int>(disk_kv->contains(id, DiskKVKind::MainKV)),
                                 static_cast<int>(disk_kv->contains(id, DiskKVKind::StateImage)));
                     }
                     continue;
                 }
                 if (l3_trace) {
-                    fprintf(stderr,
-                            "[l3-probe] P1@%u lo=%016llx hi=%016llx tag=%u rw_n=%zu rw_tail=%u\n", E,
+                    disk_kv_logf('D', "l3-probe",
+                            "P1@%u | lo=%016llx hi=%016llx tag=%u rw_n=%zu rw_tail=%u", E,
                             (unsigned long long)digest[0], (unsigned long long)digest[1], tag,
                             prompt.identity.rewrite_execution_frontiers.size(),
                             prompt.identity.rewrite_execution_frontiers.empty()
@@ -843,7 +862,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                                         .frontier = E};
                 if (!disk_kv->contains(id, DiskKVKind::StateImage)) {
                     if (l3_trace) {
-                        fprintf(stderr, "[l3-probe] E=%u (aligned) state=0\n", E);
+                        disk_kv_logf('D', "l3-probe", "E=%u aligned state=0", E);
                     }
                     continue;
                 }
@@ -881,7 +900,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                 }
                 if (!backend_covered) {
                     if (l3_trace) {
-                        fprintf(stderr, "[l3-probe] E=%u backend miss bf=%u key=%u\n", E,
+                        disk_kv_logf('D', "l3-probe", "E=%u backend miss | bf=%u key=%u", E,
                                 bfrontier, bfail_key);
                     }
                     continue;
@@ -890,7 +909,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             if (!best_E || E > *best_E) { best_E = E; }
         }
         if (best_E) {
-            fprintf(stderr, "[l3-probe] best_E=%u\n", *best_E);
+            disk_kv_logf('I', "l3-probe", "best_E=%u", *best_E);
             const std::uint32_t E = *best_E;
             plan->reuse_base                     = E;
             plan->summary.reusable_prompt_tokens = E;
@@ -930,7 +949,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                 plan->rewrite_disposition = RewriteCheckpointDisposition::DropOptional;
             }
         } else {
-            if (l3_trace) { fprintf(stderr, "[l3-probe] no candidate passed\n"); }
+            if (l3_trace) { disk_kv_logf('D', "l3-probe", "no candidate passed"); }
         }
         }  // closes the host-state-slot availability else
     }

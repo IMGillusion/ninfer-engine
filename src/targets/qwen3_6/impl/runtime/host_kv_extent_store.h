@@ -254,6 +254,10 @@ public:
                 replica.extent != capability || replica.page_offset != index ||
                 replica.membership_node != node || membership.extent != capability.index_ ||
                 membership.offset != index ||
+                // A pinned page's host bytes are borrowed by an in-flight L3
+                // spill (the store write reads them until its ticket settles);
+                // releasing the extent would recycle the arena bytes under it.
+                extent.page_store->source_pins(page) != 0 ||
                 (!extent.page_store->device_resident(page) &&
                  extent.page_store->address_references(page) != 0)) {
                 return false;

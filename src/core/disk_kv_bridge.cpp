@@ -1,5 +1,7 @@
 #include "core/disk_kv_bridge.h"
 
+#include "core/disk_kv_log.h"
+
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
@@ -16,8 +18,12 @@ std::string family_path(const std::string& base, DiskKVKind kind) {
     return base + "/diskkv_" + name;
 }
 
-// Split the total budget across enabled families: 60% main / 30% backend /
-// 10% state (main KV dominates the working set in the 9-agent profile).
+// Split the total budget across enabled families: 65% main / 10% backend /
+// 25% state. Backend (MTP draft) pages are 16x smaller per token than main
+// (one layer, 4 heads), so 10% holds several times the draft working set;
+// state images are the restore bottleneck — the probe requires the state
+// image at the frontier, so an evicted state image orphans a complete KV
+// chain (measured: 43 slots vs 24+ sessions × endpoint+rewrite+anchors).
 std::size_t family_budget(std::size_t total, std::size_t stride, std::uint32_t share,
                          std::uint32_t denominator) {
     if (stride == 0) { return 0; }
@@ -52,8 +58,8 @@ DiskKVBridge::DiskKVBridge(Options opts) : opts_(std::move(opts)) {
         f.store = std::make_unique<DiskKVStore>(sopts);
     };
     const std::size_t total = opts_.capacity_bytes;
-    const std::uint32_t main_share    = opts_.backend_page_stride ? 65U : 85U;
-    const std::uint32_t backend_share = opts_.backend_page_stride ? 25U : 0U;
+    const std::uint32_t main_share    = opts_.backend_page_stride ? 65U : 75U;
+    const std::uint32_t backend_share = opts_.backend_page_stride ? 10U : 0U;
     const std::uint32_t main_denom    = 100U;
     make_family(DiskKVKind::MainKV, opts_.main_page_stride,
                 family_budget(total, opts_.main_page_stride, main_share, main_denom));
@@ -132,10 +138,10 @@ void DiskKVBridge::worker_loop() {
             in_flight_ += 1;
             have = true;
             if (bridge_trace()) {
-                fprintf(stderr, "[l3-bridge] dequeue id=%llu/%llu kind=%u queued=%zu in_flight=%zu\n",
-                        static_cast<unsigned long long>(job.id.lo), static_cast<unsigned long long>(job.id.hi),
-                        static_cast<unsigned>(job.kind), queue_.size(), in_flight_);
-                fflush(stderr);
+                disk_kv_logf('D', "l3-bridge",
+                             "dequeue | id=%llu/%llu kind=%u queued=%zu in_flight=%zu",
+                             static_cast<unsigned long long>(job.id.lo), static_cast<unsigned long long>(job.id.hi),
+                             static_cast<unsigned>(job.kind), queue_.size(), in_flight_);
             }
         }
         if (!have) {
@@ -199,18 +205,25 @@ void DiskKVBridge::worker_loop() {
 
 bool DiskKVBridge::spill_page(const DiskKVIdentity& id, DiskKVKind kind,
                               std::span<const std::byte> bytes) {
-    if (!enabled_) { return false; }
+    if (!enabled_ || kind_index(kind) >= std::size(families_)) { return false; }
     const Family& f = family(kind);
     if (f.store == nullptr || bytes.size() != f.stride) { return false; }
     {
         std::lock_guard<std::mutex> lock(mu_);
-        if (f.store->contains(id)) {
+        // touch() returns presence AND refreshes LRU residency: a dedupe hit
+        // proves the page is still wanted (its owner chain is being re-spilled),
+        // so the verified page must stop aging toward eviction. (contains()
+        // deliberately never refreshed — the reason live sessions' deep
+        // prefixes used to go cold on disk while their sessions stayed hot.)
+        if (f.store->touch(id)) {
             stats_.spill_dups += 1;
             return true;  // already restorable; shared-prefix dedupe
         }
     }
     std::lock_guard<std::mutex> lock(qmu_);
-    if (queue_.size() >= kQueueCap) {
+    // kQueueCap bounds TOTAL in-flight work: queued general, queued maintenance,
+    // and jobs already dequeued into a worker.
+    if (queue_.size() + priority_queue_.size() + in_flight_ >= kQueueCap) {
         std::lock_guard<std::mutex> stats_lock(mu_);
         stats_.queue_drops += 1;
         return false;  // backpressure: page won't be restorable (recompute later)
@@ -223,12 +236,12 @@ bool DiskKVBridge::spill_page(const DiskKVIdentity& id, DiskKVKind kind,
 bool DiskKVBridge::spill_page_wait(const DiskKVIdentity& id, DiskKVKind kind,
                                    std::span<const std::byte> bytes,
                                    std::chrono::milliseconds timeout) {
-    if (!enabled_) { return false; }
+    if (!enabled_ || kind_index(kind) >= std::size(families_)) { return false; }
     const Family& f = family(kind);
     if (f.store == nullptr || bytes.size() != f.stride) { return false; }
     {
         std::lock_guard<std::mutex> lock(mu_);
-        if (f.store->contains(id)) {
+        if (f.store->touch(id)) {  // presence + LRU refresh (see spill_page)
             stats_.spill_dups += 1;
             return true;  // already restorable; shared-prefix dedupe
         }
@@ -237,7 +250,9 @@ bool DiskKVBridge::spill_page_wait(const DiskKVIdentity& id, DiskKVKind kind,
     // Bounded backpressure: the owner-death sweep must land a CONTIGUOUS
     // chain, so wait for a free slot instead of dropping the page. The
     // worker notifies qcv_ after every pop; on shutdown we bail out.
-    if (!qcv_.wait_for(lock, timeout, [this] { return quit_ || queue_.size() < kQueueCap; })) {
+    if (!qcv_.wait_for(lock, timeout, [this] {
+            return quit_ || queue_.size() + priority_queue_.size() + in_flight_ < kQueueCap;
+        })) {
         std::lock_guard<std::mutex> stats_lock(mu_);
         stats_.queue_drops += 1;
         return false;
@@ -251,7 +266,10 @@ bool DiskKVBridge::spill_page_wait(const DiskKVIdentity& id, DiskKVKind kind,
 ReadTicket DiskKVBridge::try_read(const DiskKVIdentity& id, DiskKVKind kind,
                                   std::span<std::byte> dst) {
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
-    if (!lock || quit_ || queue_.size() + in_flight_ >= kQueueCap) { return {}; }
+    if (!lock || quit_ ||
+        queue_.size() + priority_queue_.size() + in_flight_ >= kQueueCap) {
+        return {};
+    }
     auto ticket = std::make_shared<ReadCompletion>();
     if (!enabled_ || kind_index(kind) >= std::size(families_) || !family(kind).store) {
         ticket->result.store(DiskReadResult::Disabled, std::memory_order_release);
@@ -291,7 +309,10 @@ void DiskKVBridge::spill_queued(SpillJob& job) {
         std::uint64_t present = 0;
         for (std::size_t i = 0; i < job.probe_ids.size(); ++i) {
             try {
-                const bool hit = family(job.kind).store->contains(job.probe_ids[i]);
+                // Verification refreshes residency (see spill_page): Present
+                // proves the page is still referenced by a live owner chain,
+                // so per-turn checkpoint probes keep active chains hot.
+                const bool hit = family(job.kind).store->touch(job.probe_ids[i]);
                 batch.results[i] = hit ? SpillStatus::Present : SpillStatus::Missing;
                 present += hit;
             } catch (...) {
@@ -314,7 +335,9 @@ void DiskKVBridge::spill_queued(SpillJob& job) {
     };
     try {
     if (job.probe) {
-        const bool present = f.store && f.store->contains(job.id);
+        // Verification refreshes residency (see spill_page): Present proves
+        // the page is still referenced by a live owner chain.
+        const bool present = f.store && f.store->touch(job.id);
         if (present) { std::lock_guard<std::mutex> lock(mu_); ++stats_.spill_dups; }
         finish(present ? SpillStatus::Present : SpillStatus::Missing);
         return;
@@ -322,11 +345,12 @@ void DiskKVBridge::spill_queued(SpillJob& job) {
     const auto bytes = job.borrowed.empty() ? std::span<const std::byte>(job.bytes) : job.borrowed;
     if (f.store == nullptr || bytes.size() != f.stride) {
         if (f.store != nullptr) {
-            fprintf(stderr, "[l3-bridge] FAIL kind=%u stride mismatch: bytes=%zu family=%zu id=%llu/%llu/%llu\n",
-                    static_cast<unsigned>(job.kind), bytes.size(), f.stride,
-                    static_cast<unsigned long long>(job.id.lo),
-                    static_cast<unsigned long long>(job.id.hi),
-                    static_cast<unsigned long long>(job.id.tag));
+            disk_kv_logf('E', "l3-bridge",
+                         "FAIL kind=%u | stride mismatch bytes=%zu family=%zu | id=%llu/%llu/%llu",
+                         static_cast<unsigned>(job.kind), bytes.size(), f.stride,
+                         static_cast<unsigned long long>(job.id.lo),
+                         static_cast<unsigned long long>(job.id.hi),
+                         static_cast<unsigned long long>(job.id.tag));
         }
         finish(SpillStatus::Failed);
         return;
@@ -337,11 +361,12 @@ void DiskKVBridge::spill_queued(SpillJob& job) {
         // evictable victim, or I/O error) must degrade to "page not cached"
         // — a future restore recompute — never a request failure. Settle as
         // Dropped so the demotion completes and the host extents release.
-        fprintf(stderr, "[l3-bridge] DROP upsert=false kind=%u size=%zu id=%llu/%llu/%llu\n",
-                static_cast<unsigned>(job.kind), bytes.size(),
-                static_cast<unsigned long long>(job.id.lo),
-                static_cast<unsigned long long>(job.id.hi),
-                static_cast<unsigned long long>(job.id.tag));
+        disk_kv_logf('W', "l3-bridge",
+                     "DROP upsert=false | kind=%u size=%zu | id=%llu/%llu/%llu",
+                     static_cast<unsigned>(job.kind), bytes.size(),
+                     static_cast<unsigned long long>(job.id.lo),
+                     static_cast<unsigned long long>(job.id.hi),
+                     static_cast<unsigned long long>(job.id.tag));
         finish(SpillStatus::Dropped);
         return;
     }
@@ -364,15 +389,16 @@ void DiskKVBridge::spill_queued(SpillJob& job) {
     stats_.evicted_slots += evicted.size();
     finish(SpillStatus::Written);
     } catch (const std::exception& e) {
-        fprintf(stderr, "[l3-bridge] FAIL exception kind=%u id=%llu/%llu/%llu what=%s\n",
-                static_cast<unsigned>(job.kind),
-                static_cast<unsigned long long>(job.id.lo),
-                static_cast<unsigned long long>(job.id.hi),
-                static_cast<unsigned long long>(job.id.tag), e.what());
+        disk_kv_logf('E', "l3-bridge",
+                     "FAIL exception | kind=%u id=%llu/%llu/%llu | what=%s",
+                     static_cast<unsigned>(job.kind),
+                     static_cast<unsigned long long>(job.id.lo),
+                     static_cast<unsigned long long>(job.id.hi),
+                     static_cast<unsigned long long>(job.id.tag), e.what());
         finish(SpillStatus::Failed);
     } catch (...) {
-        fprintf(stderr, "[l3-bridge] FAIL unknown exception kind=%u\n",
-                static_cast<unsigned>(job.kind));
+        disk_kv_logf('E', "l3-bridge", "FAIL unknown exception | kind=%u",
+                     static_cast<unsigned>(job.kind));
         finish(SpillStatus::Failed);
     }
 }
@@ -383,7 +409,10 @@ ProbeBatchTicket DiskKVBridge::try_probe_batch(std::span<const DiskKVIdentity> i
         throw std::invalid_argument("disk kv probe batch must contain 1..32 identities");
     }
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
-    if (!lock || quit_ || queue_.size() + in_flight_ >= kQueueCap) { return {}; }
+    if (!lock || quit_ ||
+        queue_.size() + priority_queue_.size() + in_flight_ >= kQueueCap) {
+        return {};
+    }
     auto ticket = std::make_shared<ProbeBatchCompletion>();
     ticket->size = ids.size();
     ticket->results.fill(SpillStatus::Failed);
@@ -402,8 +431,12 @@ ProbeBatchTicket DiskKVBridge::try_probe_batch(std::span<const DiskKVIdentity> i
 }
 
 SpillTicket DiskKVBridge::try_probe(const DiskKVIdentity& id, DiskKVKind kind) {
+    if (kind_index(kind) >= std::size(families_)) { return {}; }
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
-    if (!lock || quit_ || queue_.size() + in_flight_ >= kQueueCap) { return {}; }
+    if (!lock || quit_ ||
+        queue_.size() + priority_queue_.size() + in_flight_ >= kQueueCap) {
+        return {};
+    }
     auto ticket = std::make_shared<SpillCompletion>();
     SpillJob job{}; job.id = id; job.kind = kind; job.completion = ticket; job.probe = true;
     queue_.push_back(std::move(job));
@@ -413,16 +446,19 @@ SpillTicket DiskKVBridge::try_probe(const DiskKVIdentity& id, DiskKVKind kind) {
 
 SpillTicket DiskKVBridge::try_submit(const DiskKVIdentity& id, DiskKVKind kind,
                                     std::span<const std::byte> bytes) {
+    if (kind_index(kind) >= std::size(families_)) { return {}; }
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
-    if (!lock || quit_ || queue_.size() + in_flight_ >= kQueueCap) { return {}; }
+    if (!lock || quit_ ||
+        queue_.size() + priority_queue_.size() + in_flight_ >= kQueueCap) {
+        return {};
+    }
     auto ticket = std::make_shared<SpillCompletion>();
     SpillJob job{}; job.id = id; job.kind = kind; job.completion = ticket; job.borrowed = bytes;
     queue_.push_back(std::move(job));
     if (bridge_trace()) {
-        fprintf(stderr, "[l3-bridge] submit id=%llu/%llu kind=%u queued=%zu in_flight=%zu\n",
-                static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi),
-                static_cast<unsigned>(kind), queue_.size(), in_flight_);
-        fflush(stderr);
+        disk_kv_logf('D', "l3-bridge", "submit | id=%llu/%llu kind=%u queued=%zu in_flight=%zu",
+                     static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi),
+                     static_cast<unsigned>(kind), queue_.size(), in_flight_);
     }
     qcv_.notify_one();
     return ticket;
@@ -430,8 +466,12 @@ SpillTicket DiskKVBridge::try_submit(const DiskKVIdentity& id, DiskKVKind kind,
 
 SpillTicket DiskKVBridge::try_submit_owned(const DiskKVIdentity& id, DiskKVKind kind,
                                          std::vector<std::byte>& bytes) {
+    if (kind_index(kind) >= std::size(families_)) { return {}; }
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
-    if (!lock || quit_ || queue_.size() + in_flight_ >= kQueueCap) return {};
+    if (!lock || quit_ ||
+        queue_.size() + priority_queue_.size() + in_flight_ >= kQueueCap) {
+        return {};
+    }
     auto ticket = std::make_shared<SpillCompletion>();
     // Allocate queue storage BEFORE transferring ownership (exception-safe retry).
     queue_.emplace_back();
@@ -479,7 +519,7 @@ ReadTicket DiskKVBridge::try_read_priority(const DiskKVIdentity& id, DiskKVKind 
 
 bool DiskKVBridge::spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
                                    std::span<const std::byte> bytes) {
-    if (!enabled_) { return false; }
+    if (!enabled_ || kind_index(kind) >= std::size(families_)) { return false; }
     const Family& f = family(kind);
     if (f.store == nullptr || bytes.size() != f.stride) { return false; }
     {
@@ -500,7 +540,7 @@ bool DiskKVBridge::spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
 }
 
 bool DiskKVBridge::drop_page(const DiskKVIdentity& id, DiskKVKind kind) {
-    if (!enabled_) { return false; }
+    if (!enabled_ || kind_index(kind) >= std::size(families_)) { return false; }
     Family& f = family(kind);
     if (f.store == nullptr) { return false; }
     return f.store->evict(id);
@@ -508,7 +548,7 @@ bool DiskKVBridge::drop_page(const DiskKVIdentity& id, DiskKVKind kind) {
 
 bool DiskKVBridge::restore_page(const DiskKVIdentity& id, DiskKVKind kind,
                                 std::span<std::byte> dst) const {
-    if (!enabled_) { return false; }
+    if (!enabled_ || kind_index(kind) >= std::size(families_)) { return false; }
     const Family& f = family(kind);
     if (f.store == nullptr || dst.size() != f.stride) { return false; }
     if (!f.store->read_page(id, dst)) {
@@ -523,7 +563,7 @@ bool DiskKVBridge::restore_page(const DiskKVIdentity& id, DiskKVKind kind,
 }
 
 bool DiskKVBridge::contains(const DiskKVIdentity& id, DiskKVKind kind) const {
-    if (!enabled_) { return false; }
+    if (!enabled_ || kind_index(kind) >= std::size(families_)) { return false; }
     const Family& f = family(kind);
     if (f.store == nullptr) { return false; }
     return f.store->contains(id);
@@ -531,7 +571,7 @@ bool DiskKVBridge::contains(const DiskKVIdentity& id, DiskKVKind kind) const {
 
 std::size_t DiskKVBridge::probe_prefix(const std::vector<DiskKVIdentity>& page_ids,
                                        DiskKVKind kind) const {
-    if (!enabled_) { return 0; }
+    if (!enabled_ || kind_index(kind) >= std::size(families_)) { return 0; }
     const Family& f = family(kind);
     if (f.store == nullptr) { return 0; }
     // Walk from page 0; the first miss stops the prefix.
@@ -555,10 +595,17 @@ void DiskKVBridge::record_probe(std::uint32_t prompt_tokens,
 }
 
 void DiskKVBridge::touch(const DiskKVIdentity& id, DiskKVKind kind) {
-    if (!enabled_) { return; }
+    if (!enabled_ || kind_index(kind) >= std::size(families_)) { return; }
     const Family& f = family(kind);
     if (f.store == nullptr) { return; }
     f.store->touch(id);
+}
+
+void DiskKVBridge::touch_lru(const DiskKVIdentity& id, DiskKVKind kind) {
+    if (!enabled_ || kind_index(kind) >= std::size(families_)) { return; }
+    const Family& f = family(kind);
+    if (f.store == nullptr) { return; }
+    f.store->touch_lru(id);
 }
 
 std::vector<std::uint32_t> DiskKVBridge::live_state_frontiers() const {
@@ -578,17 +625,20 @@ DiskKVBridgeStats DiskKVBridge::stats() const {
 }
 
 std::size_t DiskKVBridge::used_bytes(DiskKVKind kind) const {
+    if (kind_index(kind) >= std::size(families_)) { return 0; }
     const Family& f = family(kind);
     return f.store ? f.store->used_bytes() : 0;
 }
 
 std::uint32_t DiskKVBridge::slot_count(DiskKVKind kind) const {
+    if (kind_index(kind) >= std::size(families_)) { return 0; }
     const Family& f = family(kind);
     return f.store ? f.store->slot_count() : 0;
 }
 
 const std::string& DiskKVBridge::path(DiskKVKind kind) const {
     static const std::string kEmpty;
+    if (kind_index(kind) >= std::size(families_)) { return kEmpty; }
     const Family& f = family(kind);
     return f.store ? f.path : kEmpty;
 }

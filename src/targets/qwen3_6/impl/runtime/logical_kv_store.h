@@ -107,6 +107,11 @@ public:
     KVActivationReservation(const KVActivationReservation&)            = delete;
     KVActivationReservation& operator=(const KVActivationReservation&) = delete;
 
+    // False once commit_activation consumed this reservation (or after a move).
+    // A consumed reservation's address is already activated; cleanup paths must
+    // skip it instead of treating it as stale.
+    [[nodiscard]] bool live() const noexcept { return owner_ != nullptr; }
+
 private:
     KVActivationReservation(KVAddressSpaceStore& owner, KVAddressSpaceHandle address,
                             std::uint32_t requested_entitlement,
@@ -1492,6 +1497,13 @@ public:
         Address& address = require_active(handle);
         if (frontier > address.committed_frontier) {
             throw std::invalid_argument("KV destructive truncate extends the frontier");
+        }
+        // The checkpoint floor protects pages a published checkpoint still
+        // claims (rebuild_checkpoint_protection asserts it); never dematerialize
+        // below it. The inactive variant clamps instead because its caller owns
+        // the checkpoint drop; the active variant must refuse.
+        if (address.checkpoint_frontier != 0 && frontier < address.checkpoint_frontier) {
+            throw std::logic_error("KV destructive truncate crosses the checkpoint frontier");
         }
         const std::uint32_t target = pages_for_tokens(frontier);
         if (frontier == address.committed_frontier && target == address.page_count) { return; }

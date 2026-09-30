@@ -237,6 +237,11 @@ public:
     /** Refresh LRU position after a successful restore. */
     void touch(const DiskKVIdentity& id, DiskKVKind kind);
 
+    /** Refresh ONLY the in-memory LRU position (no header write, no index
+     *  dirtying): the engine's liveness sweep re-ranks eviction by session
+     *  liveness through this, thousands of pages per pass. */
+    void touch_lru(const DiskKVIdentity& id, DiskKVKind kind);
+
     /** Frontiers of every live StateImage page (the state image at frontier E
      *  is keyed digest(E) — the same key as the partial tail KV page at E, so
      *  a restorable boundary is exactly a live state frontier whose digest the
