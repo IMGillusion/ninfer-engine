@@ -264,6 +264,15 @@ private:
     void worker_loop();
     /** Apply one queued job to the store (worker thread / destructor drain). */
     void spill_queued(SpillJob& job);
+    /** Deadline-bounded large read (state images): runs the store read into
+     *  attempt-owned memory on a transient thread; on timeout the attempt is
+     *  abandoned (IOFailure) so the caller never blocks on a wedged volume. */
+    DiskReadResult bounded_large_read(SpillJob& job);
+    /** Deadline-bounded synchronous write used by engine-thread spill paths
+     *  (seam anchors, owner-spill state): the payload is copied first, so an
+     *  abandoned attempt never touches engine memory. False on timeout. */
+    bool bounded_sync_write(const DiskKVIdentity& id, DiskKVKind kind,
+                            std::span<const std::byte> bytes);
 
     Family& family(DiskKVKind kind);
     const Family& family(DiskKVKind kind) const;
@@ -301,6 +310,16 @@ private:
     // store lock only briefly: four concurrent streams already reach ~880MB/s on
     // this volume against 421MB/s single-stream. Reads and writes share these.
     static constexpr std::size_t kWorkerCount = 8;
+    // Bounded large IO. The mounted volume has wedged single large preads and
+    // pwrites indefinitely (twice in production, freezing the engine's single
+    // context transaction past recovery). Large reads (state images) run on a
+    // transient thread with a deadline; an abandoned attempt settles as
+    // IOFailure so the transaction degrades to recompute instead of wedging.
+    // Small pages stay on the direct path (thread spawn per 1.5MB page would
+    // dominate); the per-syscall chunk cap in the store keeps each wait short.
+    static constexpr std::size_t kLargeIOBytes = 8U << 20;
+    static constexpr std::uint32_t kMaxAbandonedIO = 16;
+    std::atomic<std::uint32_t> abandoned_ios_{0};
 };
 
 } // namespace ninfer

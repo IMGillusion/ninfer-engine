@@ -30,6 +30,11 @@ inline bool store_trace() {
 
 constexpr std::size_t kAlignment = 4096;
 constexpr std::size_t kTrailerSize = 128;
+// Cap per-syscall IO. A 146 MiB single pread/pwrite against the mounted
+// volume (docker-desktop bind mount over VHDX) wedged the VM I/O stack twice
+// in production, hanging the caller indefinitely; every wait must be bounded
+// and individually restartable. Chunked calls reach the same bandwidth.
+constexpr std::size_t kMaxIOChunk = 8U << 20;
 
 std::size_t round_up(std::size_t v, std::size_t a) { return (v + (a - 1)) & ~(a - 1); }
 
@@ -540,8 +545,9 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
         const std::size_t payload_off = page_off(slot);
         std::size_t written = 0;
         while (written < opts_.slot_size) {
+            const std::size_t chunk = std::min(opts_.slot_size - written, kMaxIOChunk);
             const ssize_t n = ::pwrite(fd_, bytes.data() + written,
-                                       opts_.slot_size - written,
+                                       chunk,
                                        static_cast<off_t>(payload_off + written));
             if (n <= 0) {
                 if (n < 0 && errno == EINTR) { continue; }
@@ -642,7 +648,8 @@ DiskReadResult DiskKVStore::read_page_result(const DiskKVIdentity& id, std::span
     {
         std::size_t got = 0;
         while (got < opts_.slot_size) {
-            const ssize_t n = ::pread(fd_, dst.data() + got, opts_.slot_size - got,
+            const std::size_t chunk = std::min(opts_.slot_size - got, kMaxIOChunk);
+            const ssize_t n = ::pread(fd_, dst.data() + got, chunk,
                                       static_cast<off_t>(off + got));
             if (n <= 0) {
                 if (n < 0 && errno == EINTR) { continue; }

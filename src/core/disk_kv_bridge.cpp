@@ -3,6 +3,7 @@
 #include "core/disk_kv_log.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -120,6 +121,22 @@ namespace {
 inline bool bridge_trace() {
     static const bool on = std::getenv("NINFER_BRIDGE_TRACE") != nullptr;
     return on;
+}
+
+// Deadlines for the bounded large-IO paths (0 keeps the bound at the default).
+std::uint64_t env_ms(const char* name, std::uint64_t fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') { return fallback; }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value) { return fallback; }
+    return static_cast<std::uint64_t>(parsed);
+}
+std::chrono::milliseconds read_deadline() {
+    return std::chrono::milliseconds(env_ms("NINFER_L3_READ_TIMEOUT_MS", 60000));
+}
+std::chrono::milliseconds write_deadline() {
+    return std::chrono::milliseconds(env_ms("NINFER_L3_WRITE_TIMEOUT_MS", 30000));
 }
 } // namespace
 
@@ -291,7 +308,11 @@ void DiskKVBridge::spill_queued(SpillJob& job) {
     if (job.read) {
         DiskReadResult result = DiskReadResult::IOFailure;
         try {
-            result = family(job.kind).store->read_page_result(job.id, job.read_dst);
+            if (job.read_dst.size() >= kLargeIOBytes) {
+                result = bounded_large_read(job);
+            } else {
+                result = family(job.kind).store->read_page_result(job.id, job.read_dst);
+            }
             std::lock_guard<std::mutex> lock(mu_);
             if (result == DiskReadResult::Success) {
                 ++stats_.restores; stats_.restore_bytes += job.read_dst.size();
@@ -517,6 +538,99 @@ ReadTicket DiskKVBridge::try_read_priority(const DiskKVIdentity& id, DiskKVKind 
     return ticket;
 }
 
+DiskReadResult DiskKVBridge::bounded_large_read(SpillJob& job) {
+    // Shared attempt state: an abandoned thread may finish long after this
+    // call returned, so everything it touches is heap-owned by the attempt.
+    struct Attempt {
+        std::unique_ptr<std::byte[]> buffer;
+        std::atomic<bool> done{false};
+        std::atomic<bool> abandoned{false};
+        DiskReadResult result = DiskReadResult::IOFailure;
+    };
+    auto attempt     = std::make_shared<Attempt>();
+    const auto n     = job.read_dst.size();
+    attempt->buffer  = std::make_unique<std::byte[]>(n);
+    const auto id    = job.id;
+    const auto kind  = job.kind;
+    auto* store      = family(kind).store.get();
+    std::thread worker([this, attempt, id, kind, store, n] {
+        attempt->result = store->read_page_result(id, {attempt->buffer.get(), n});
+        attempt->done.store(true, std::memory_order_release);
+        if (attempt->abandoned.exchange(true)) { abandoned_ios_.fetch_sub(1); }
+    });
+    const auto deadline = std::chrono::steady_clock::now() + read_deadline();
+    bool finished = attempt->done.load(std::memory_order_acquire);
+    while (!finished && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        finished = attempt->done.load(std::memory_order_acquire);
+    }
+    if (finished) {
+        worker.join();
+        std::memcpy(job.read_dst.data(), attempt->buffer.get(), n);
+        return attempt->result;
+    }
+    // Timeout: settle as IOFailure and leave the syscall behind on its own
+    // thread (it cannot be cancelled). The engine's scratch was never touched
+    // — the read landed in the attempt buffer — so the transaction's fail()
+    // path (honest full recompute) is safe while the abandoned attempt drains.
+    if (!attempt->abandoned.exchange(true)) { abandoned_ios_.fetch_add(1); }
+    disk_kv_logf('W', "l3-bridge",
+                 "read abandoned | kind=%u bytes=%zu id=%llu/%llu outstanding=%u | volume wedged?",
+                 static_cast<unsigned>(kind), n,
+                 static_cast<unsigned long long>(id.lo),
+                 static_cast<unsigned long long>(id.hi),
+                 abandoned_ios_.load(std::memory_order_relaxed));
+    worker.detach();
+    return DiskReadResult::IOFailure;
+}
+
+bool DiskKVBridge::bounded_sync_write(const DiskKVIdentity& id, DiskKVKind kind,
+                                      std::span<const std::byte> bytes) {
+    struct Attempt {
+        std::vector<std::byte> bytes;
+        std::vector<std::uint32_t> evicted;
+        std::atomic<bool> done{false};
+        std::atomic<bool> abandoned{false};
+        bool ok = false;
+    };
+    auto attempt    = std::make_shared<Attempt>();
+    attempt->bytes.assign(bytes.begin(), bytes.end());
+    auto* store     = family(kind).store.get();
+    std::thread worker([this, attempt, id, store] {
+        attempt->ok = store->upsert_page(id, attempt->bytes, &attempt->evicted);
+        attempt->done.store(true, std::memory_order_release);
+        if (attempt->abandoned.exchange(true)) { abandoned_ios_.fetch_sub(1); }
+    });
+    const auto deadline = std::chrono::steady_clock::now() + write_deadline();
+    bool finished = attempt->done.load(std::memory_order_acquire);
+    while (!finished && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        finished = attempt->done.load(std::memory_order_acquire);
+    }
+    if (!finished) {
+        // Attempt owns its payload copy; the abandoned thread touches nothing
+        // the caller owns. The anchor degrades silently (best-effort by design).
+        if (!attempt->abandoned.exchange(true)) { abandoned_ios_.fetch_add(1); }
+        disk_kv_logf('W', "l3-bridge",
+                     "sync write abandoned | kind=%u bytes=%zu id=%llu/%llu outstanding=%u",
+                     static_cast<unsigned>(kind), bytes.size(),
+                     static_cast<unsigned long long>(id.lo),
+                     static_cast<unsigned long long>(id.hi),
+                     abandoned_ios_.load(std::memory_order_relaxed));
+        worker.detach();
+        return false;
+    }
+    worker.join();
+    if (!attempt->ok) { return false; }
+    const std::size_t evicted_n = attempt->evicted.size();
+    family(kind).store->flush_index();
+    std::lock_guard<std::mutex> lock(mu_);
+    stats_.spills += 1;
+    stats_.spill_bytes += bytes.size();
+    stats_.evicted_slots += evicted_n;
+    return true;
+}
+
 bool DiskKVBridge::spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
                                    std::span<const std::byte> bytes) {
     if (!enabled_ || kind_index(kind) >= std::size(families_)) { return false; }
@@ -529,6 +643,7 @@ bool DiskKVBridge::spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
             return true;  // already restorable (dedupe)
         }
     }
+    if (bytes.size() >= kLargeIOBytes) { return bounded_sync_write(id, kind, bytes); }
     std::vector<std::uint32_t> evicted;
     if (!f.store->upsert_page(id, bytes, &evicted)) { return false; }
     f.store->flush_index();

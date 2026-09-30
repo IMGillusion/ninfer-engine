@@ -1,5 +1,6 @@
 #include "serve/http_server.h"
 
+#include "core/disk_kv_log.h"
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
@@ -8,12 +9,31 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+
+namespace {
+
+// Sentinel thresholds come from the environment so an incident can be tuned
+// (or disabled with 0) without a rebuild.
+std::uint64_t env_ms(const char* name, std::uint64_t fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') { return fallback; }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value) { return fallback; }
+    return static_cast<std::uint64_t>(parsed);
+}
+
+} // namespace
 
 namespace ninfer::serve {
 namespace {
@@ -293,6 +313,28 @@ void HttpServer::run_stats_reporter() {
     const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
     Clock::time_point next_deadline = previous_time + interval;
 
+    // Wedge sentinels. A context transaction that outlives every healthy
+    // restore by two orders of magnitude means a bridge worker is stuck
+    // inside a disk syscall on the mounted volume: the transaction's accepted
+    // reads are irrevocable borrows with no deadline, so it can never settle
+    // and admission stays closed forever (observed: four minutes of
+    // "materializing 1" with zero progress after a store-read hang). There is
+    // no in-transaction abort that keeps the resource manager's planned
+    // actions aligned — a wall-clock budget was tried and reverted for
+    // exactly that reason — so recovery is a process exit: the container
+    // restart policy replaces the engine and the content-addressed disk tier
+    // survives untouched. The second shape covers a lane wedged outside a
+    // transaction (e.g. a synchronous store write on the prefill thread):
+    // running requests with zero token progress for minutes.
+    const std::uint64_t materializing_stall_ms =
+        env_ms("NINFER_L3_STALL_EXIT_MS", 300000);
+    const std::uint64_t running_stall_ms =
+        env_ms("NINFER_RUN_STALL_EXIT_MS", 900000);
+    Clock::time_point materializing_since{};
+    Clock::time_point running_idle_since{};
+    std::uint64_t previous_progress_tokens =
+        previous.computed_prefill_tokens + previous.committed_decode_tokens;
+
     for (;;) {
         {
             std::unique_lock lock(stats_mutex_);
@@ -303,6 +345,49 @@ void HttpServer::run_stats_reporter() {
 
         const ninfer::RuntimeStats current = service_->runtime_stats();
         const Clock::time_point now        = Clock::now();
+        const std::uint64_t progress_tokens =
+            current.computed_prefill_tokens + current.committed_decode_tokens;
+        if (materializing_stall_ms != 0) {
+            if (current.materializing_requests != 0) {
+                if (materializing_since.time_since_epoch().count() == 0) {
+                    materializing_since = now;
+                } else if (now - materializing_since >=
+                           std::chrono::milliseconds(materializing_stall_ms)) {
+                    disk_kv_logf('E', "l3-stall",
+                                 "materialization wedged | elapsed_ms=%lld running=%u waiting=%u "
+                                 "materializing=%u capture_pending=%u | exit for restart",
+                                 static_cast<long long>(std::chrono::duration_cast<
+                                     std::chrono::milliseconds>(now - materializing_since).count()),
+                                 current.running_requests, current.waiting_requests,
+                                 current.materializing_requests, current.capture_pending_requests);
+                    fflush(stderr);
+                    std::_Exit(75);
+                }
+            } else {
+                materializing_since = {};
+            }
+        }
+        if (running_stall_ms != 0) {
+            if (current.running_requests != 0 && progress_tokens == previous_progress_tokens) {
+                if (running_idle_since.time_since_epoch().count() == 0) {
+                    running_idle_since = now;
+                } else if (now - running_idle_since >=
+                           std::chrono::milliseconds(running_stall_ms)) {
+                    disk_kv_logf('E', "l3-stall",
+                                 "running lane wedged | idle_ms=%lld running=%u prefilling=%u "
+                                 "decode_ready=%u materializing=%u | exit for restart",
+                                 static_cast<long long>(std::chrono::duration_cast<
+                                     std::chrono::milliseconds>(now - running_idle_since).count()),
+                                 current.running_requests, current.prefilling_requests,
+                                 current.decode_ready_requests, current.materializing_requests);
+                    fflush(stderr);
+                    std::_Exit(75);
+                }
+            } else {
+                running_idle_since = {};
+            }
+        }
+        previous_progress_tokens = progress_tokens;
         const ThroughputReport report      = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
         if (report_has_activity(report)) { record_throughput(report); }

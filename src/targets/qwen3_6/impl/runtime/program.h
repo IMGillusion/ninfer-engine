@@ -1068,6 +1068,7 @@ private:
             // Restore instrumentation: the request path must show whether the disk
             // hit actually beat recomputing the same prompt.
             std::chrono::steady_clock::time_point started{};
+            std::chrono::steady_clock::time_point last_beat{};
             std::uint64_t batches = 0;
             std::uint32_t max_batch = 0;
             std::uint32_t pages_read = 0;

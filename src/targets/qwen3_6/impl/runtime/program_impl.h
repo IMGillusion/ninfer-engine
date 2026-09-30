@@ -3772,6 +3772,25 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
     // store on a VM-internal disk (2.9GB/s cold, 7-8GB/s cached) a 3.4GB chain
     // restores in ~1.2s, so the slow-cold-read case this guarded no longer exists.
     if (progress.started.time_since_epoch().count() == 0) { progress.started = std::chrono::steady_clock::now(); }
+    // Slow-restore heartbeat: a healthy restore logs its yield line in well
+    // under ten seconds even under load, so anything past a minute is
+    // forensics for a wedged store read (the serve-level stall sentinel is
+    // the recovery path; there is no in-transaction abort).
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = now - progress.started;
+        if (elapsed > std::chrono::seconds(60) &&
+            (progress.last_beat.time_since_epoch().count() == 0 ||
+             now - progress.last_beat > std::chrono::seconds(30))) {
+            progress.last_beat = now;
+            disk_kv_logf('W', "l3-seed-yield",
+                         "slow | lane=%u phase=%u page=%u elapsed_ms=%lld batch=%zu",
+                         sequence.lane, progress.phase, progress.page,
+                         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                             elapsed).count()),
+                         progress.batch.size());
+        }
+    }
     poll_seed_batch(progress);
     const auto fail = [&]() {
         progress.failing = true;
