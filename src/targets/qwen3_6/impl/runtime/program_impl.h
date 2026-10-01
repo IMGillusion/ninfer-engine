@@ -6664,37 +6664,55 @@ void ProgramImplCore::abort_materialization_transfers(
             state_store->abort_transfer(std::move(*transaction.state_restore));
             transaction.state_restore.reset();
         }
-        if (transaction.text_activation || transaction.text_source_restore_reservation) {
+    // One family's abort: roll back per-page device replicas against the
+    // reservation, or degrade cleanly when the state no longer supports it.
+    // This whole path is noexcept cleanup — every failure mode below either
+    // returns resources through RAII or is a true invariant violation.
+    const auto abort_family = [&](auto* addresses, auto* pages,
+                                  std::optional<KVActivationReservation>& activation,
+                                  std::optional<DeviceKVPageReservation>& source_reservation,
+                                  const std::vector<MaterializationTransaction::KVRestorePage>&
+                                      restores) {
+        if (!activation && !source_reservation) { return; }
+        if (activation && !activation->live()) {
             // A consumed (moved-from) activation means commit_activation already
             // activated the address: its page reservation now lives in the address
             // and the sequence teardown owns it. Skip instead of throwing.
-            if (transaction.text_activation && !transaction.text_activation->live()) {
-                transaction.text_activation.reset();
-            } else {
-                DeviceKVPageReservation& reservation =
-                    transaction.text_source_restore_reservation
-                        ? *transaction.text_source_restore_reservation
-                        : text_kv_addresses->page_reservation(*transaction.text_activation);
-                for (const MaterializationTransaction::KVRestorePage& restore :
-                     transaction.text_restores) {
-                    text_kv_pages->abort_device_replica(restore.logical, reservation);
-                }
+            activation.reset();
+            return;
+        }
+        DeviceKVPageReservation* reservation = nullptr;
+        if (source_reservation) {
+            reservation = &*source_reservation;
+        } else {
+            try {
+                reservation = &addresses->page_reservation(*activation);
+            } catch (const std::exception& error) {
+                // Live activation whose address space was torn down mid-restore
+                // (request teardown raced the abort): the transfer stream has
+                // already been drained above, so the reservation owns plain pool
+                // pages, and the address no longer exists to roll back per-page
+                // replica state against. Dropping the activation returns the
+                // reservation and its execution row through RAII. Degrade —
+                // this cleanup must never wedge the engine (observed: terminate
+                // from exactly this state when a client disconnected while its
+                // restore transaction was aborting).
+                disk_kv_logf('W', "l3-materialize",
+                             "abort skipped stale activation | what=%s", error.what());
+                activation.reset();
+                return;
             }
         }
-        if (transaction.backend_activation || transaction.backend_source_restore_reservation) {
-            if (transaction.backend_activation && !transaction.backend_activation->live()) {
-                transaction.backend_activation.reset();
-            } else {
-                DeviceKVPageReservation& reservation =
-                    transaction.backend_source_restore_reservation
-                        ? *transaction.backend_source_restore_reservation
-                        : backend_kv_addresses->page_reservation(*transaction.backend_activation);
-                for (const MaterializationTransaction::KVRestorePage& restore :
-                     transaction.backend_restores) {
-                    backend_kv_pages->abort_device_replica(restore.logical, reservation);
-                }
-            }
+        for (const MaterializationTransaction::KVRestorePage& restore : restores) {
+            pages->abort_device_replica(restore.logical, *reservation);
         }
+    };
+    abort_family(text_kv_addresses.get(), text_kv_pages.get(),
+                 transaction.text_activation, transaction.text_source_restore_reservation,
+                 transaction.text_restores);
+    abort_family(backend_kv_addresses.get(), backend_kv_pages.get(),
+                 transaction.backend_activation, transaction.backend_source_restore_reservation,
+                 transaction.backend_restores);
     } catch (const std::exception& error) {
         // Cleanup-side guard violations must be diagnosable: name the exception
         // before the (deliberate) fail-fast. Never downgrade to a cache miss.
