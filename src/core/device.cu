@@ -2,9 +2,14 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+#include <fcntl.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 namespace ninfer {
 namespace {
@@ -38,9 +43,54 @@ void destroy_event(cudaEvent_t& event) noexcept {
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     if (err == cudaSuccess) { return; }
-    std::fprintf(stderr, "%s:%d: CUDA_CHECK(%s) failed: %s: %s\n", file, line, expr,
-                 cudaGetErrorName(err), cudaGetErrorString(err));
-    std::abort();
+    // Report and exit WITHOUT stdio or abort(): both production crashes
+    // (SIGSEGV inside libc, GPF at warn+0x88 via the abort@plt call) died
+    // inside this error-report path itself — each was the first CUDA error
+    // of the process life, and the message was lost to a frozen stdout
+    // pipe. Raw write(2) only: the record lands in the request log (path
+    // parsed from our own --request-log-jsonl cmdline argument, the same
+    // file the fatal-signal handler uses) and on stderr non-blocking (a
+    // dead stdout pipe must not wedge the exit), then _Exit(70) — no
+    // stream flush, no raise, no error-path machinery — so the restart
+    // policy takes over with the evidence saved.
+    char message[512];
+    const int n = std::snprintf(
+        message, sizeof message,
+        "{\"event\":\"cuda_error\",\"file\":\"%s\",\"line\":%d,"
+        "\"expr\":\"%s\",\"code\":%d,\"name\":\"%s\",\"detail\":\"%s\"}\n",
+        file, line, expr, static_cast<int>(err), cudaGetErrorName(err),
+        cudaGetErrorString(err));
+    char cmdline[4096] = {};
+    int log_fd         = -1;
+    {
+        const int fd = ::open("/proc/self/cmdline", O_RDONLY);
+        if (fd >= 0) {
+            const ssize_t got = ::read(fd, cmdline, sizeof cmdline - 1);
+            ::close(fd);
+            for (ssize_t i = 0; i + 1 < got; ++i) {
+                if (cmdline[i] == '\0' &&
+                    std::strcmp(&cmdline[i + 1], "--request-log-jsonl") == 0) {
+                    log_fd = ::open(cmdline + i + 20, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                    break;
+                }
+            }
+        }
+    }
+    if (log_fd >= 0) {
+        std::size_t written = 0;
+        while (n > 0 && written < static_cast<std::size_t>(n)) {
+            const ssize_t w = ::write(log_fd, message + written,
+                                      static_cast<std::size_t>(n) - written);
+            if (w <= 0) { break; }
+            written += static_cast<std::size_t>(w);
+        }
+        ::close(log_fd);
+    }
+    // Best-effort stderr, non-blocking so a dead stdout pipe cannot stall the exit.
+    const int stderr_flags = ::fcntl(STDERR_FILENO, F_GETFL, 0);
+    if (stderr_flags >= 0) { ::fcntl(STDERR_FILENO, F_SETFL, stderr_flags | O_NONBLOCK); }
+    if (n > 0) { (void)::write(STDERR_FILENO, message, static_cast<std::size_t>(n)); }
+    std::_Exit(70);  // restart required: device state can no longer be trusted
 }
 
 DeviceContext::DeviceContext(int device_id) : device(device_id) {
