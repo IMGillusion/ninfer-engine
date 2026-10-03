@@ -1,5 +1,6 @@
 #include "product/logging/logging.h"
 #include "product/logging/startup_log.h"
+#include "serve/fatal_signal.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
 #include "serve/serve_options.h"
@@ -43,6 +44,12 @@ int main(int argc, char** argv) {
         std::cout << ninfer::serve::serve_usage_text(argv[0]);
         return 0;
     }
+
+    // Attribute fatal memory signals before anything else runs: a corrupted
+    // heap or a driver-level fault must leave a record (signal, fault address,
+    // thread, backtrace) in the request log even when the stdout pipe is dead.
+    ninfer::serve::fatal::install(
+        options.request_log_jsonl.empty() ? nullptr : options.request_log_jsonl.c_str());
 
     ninfer::product::LoggingRuntime logging(
         {.logger_name  = "ninfer-serve",
