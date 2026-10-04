@@ -7851,6 +7851,19 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                 disk_kv_logf('W', "l3-materialize",
                         "source truncation deferred (%s) -> retryable",
                         error.what());
+                // The manager answers this outcome by rolling its record back
+                // and calling finalize_context_transaction() — which clears the
+                // program side ONLY when transaction.terminal is set. Returning
+                // without it kept the program transaction open after the
+                // manager had dropped its own, and the next worker boundary
+                // failed every request ("Engine and Program disagree on
+                // context-transaction ownership"; observed once in production).
+                // Same close-out as abort_transaction, keeping the retryable
+                // status: staging is unprepared here, so there is nothing to
+                // acknowledge — the manager's retryable rollback expects zero
+                // acknowledgements by contract.
+                release_materialization_staging(transaction);
+                transaction.terminal = true;
                 out.status = runtime::ContextTransactionStatus::RetryableFailure;
                 return out;
             }
