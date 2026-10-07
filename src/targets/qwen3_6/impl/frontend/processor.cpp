@@ -748,11 +748,15 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     EncodedChat encoded;
     std::vector<std::size_t> byte_boundaries;
     byte_boundaries.reserve((rendered.rewrite_checkpoint ? 1U : 0U) +
+                            (rendered.pre_opener_boundary ? 1U : 0U) +
                             rendered.rewrite_execution_boundaries.size() +
                             rendered.message_boundaries.size() + rendered.cache_boundaries.size() +
                             rendered.media_token_runs.size() * 2U);
     if (rendered.rewrite_checkpoint) {
         byte_boundaries.push_back(rendered.rewrite_checkpoint->offset);
+    }
+    if (rendered.pre_opener_boundary) {
+        byte_boundaries.push_back(*rendered.pre_opener_boundary);
     }
     byte_boundaries.insert(byte_boundaries.end(), rendered.rewrite_execution_boundaries.begin(),
                            rendered.rewrite_execution_boundaries.end());
@@ -790,6 +794,20 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         }
         encoded.rewrite_checkpoint =
             RewriteCheckpointSpec{.kind = rendered.rewrite_checkpoint->kind, .frontier = frontier};
+    }
+    if (rendered.pre_opener_boundary) {
+        const TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
+        // The opener position is a message boundary and exact by construction; a non-exact
+        // result only means the boundary carries no independent token frontier, in which case
+        // the disk seam anchor degrades away rather than failing preparation.
+        if (boundary.exact_frontier) {
+            const std::uint32_t frontier =
+                to_frontier(*boundary.exact_frontier, "pre-opener boundary");
+            if (frontier != 0 &&
+                (!encoded.rewrite_checkpoint || frontier != encoded.rewrite_checkpoint->frontier)) {
+                encoded.pre_opener_frontier = frontier;
+            }
+        }
     }
     encoded.rewrite_execution_frontiers.reserve(rendered.rewrite_execution_boundaries.size());
     for (std::size_t remaining = rendered.rewrite_execution_boundaries.size(); remaining != 0;
@@ -1073,6 +1091,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     output.input_ids                   = std::move(encoded.input_ids);
     output.rewrite_checkpoint          = encoded.rewrite_checkpoint;
     output.rewrite_execution_frontiers = std::move(encoded.rewrite_execution_frontiers);
+    output.pre_opener_frontier         = encoded.pre_opener_frontier;
     output.message_boundaries          = std::move(encoded.message_boundaries);
     output.cache_boundaries            = std::move(encoded.cache_boundaries);
     stats.prompt_tokens                = output.input_ids.size();

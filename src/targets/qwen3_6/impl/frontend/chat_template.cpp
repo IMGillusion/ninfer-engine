@@ -513,6 +513,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     const long last_query_index  = last_real_user_query(messages);
     const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
+    std::optional<std::size_t> pre_opener_boundary;
     std::vector<std::size_t> rewrite_execution_boundaries;
     const auto add_rewrite_execution_boundary = [&] {
         if (rewrite_execution_boundaries.empty() ||
@@ -653,8 +654,21 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             rewrite_checkpoint = RewriteCheckpointByteSpec{
                 .kind = RewriteCheckpointKind::TurnClosure, .offset = generation_begin};
         }
+        // A tool loop's client-authored assistant/tool spans sit between the typed checkpoint
+        // and this opener. The follow-up request renders the same position as the in-flight
+        // assistant message's own opener boundary, so the prefix ending just after the opener
+        // is digest-shared between this render and the follow-up: exposing it as a disk seam
+        // boundary lets each loop round capture the accumulated turn at its own endpoint;
+        // without it every round recomputes the whole turn from the loop start. The anchor
+        // sits after the deterministic opener rather than at the pre-opener byte because the
+        // digest chain mixes in rewrite-frontier markers — the capture position has to be a
+        // boundary the successor's serialization marks too. Digest validation at restore keeps
+        // this a pure degradation when a caller rewrites history.
         rendered.append_template("<|im_start|>assistant\n");
         add_rewrite_execution_boundary();
+        if (rewrite_checkpoint && rewrite_checkpoint->offset < generation_begin) {
+            pre_opener_boundary = rendered.size();
+        }
         if (options.enable_thinking) {
             rendered.append_template("<think>\n");
             add_rewrite_execution_boundary();
@@ -698,6 +712,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                         .media_placeholders           = std::move(final.media_placeholders),
                         .rewrite_checkpoint           = rewrite_checkpoint,
                         .rewrite_execution_boundaries = std::move(rewrite_execution_boundaries),
+                        .pre_opener_boundary          = pre_opener_boundary,
                         .message_boundaries           = std::move(message_boundaries),
                         .cache_boundaries             = std::move(cache_boundaries)};
 }

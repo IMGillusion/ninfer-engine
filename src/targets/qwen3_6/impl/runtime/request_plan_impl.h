@@ -446,6 +446,148 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     return RequestBasePlan(std::move(base));
 }
 
+// Deepest matchable disk (L3) restore frontier for a prompt: a live StateImage at E keyed by
+// this prompt's prefix digest, a complete MainKV page chain at or below E, the unaligned tail
+// entry when E is not page aligned, and — for speculative backends — the matching BackendKV
+// chain. The scan is hash lookups only: one state gate per live frontier, and the page walk
+// runs only for candidates whose digests already agree. Shared by the Root admission probe and
+// by the shallow-candidate rejection below.
+std::optional<std::uint32_t> ProgramImplCore::l3_disk_restore_frontier(
+    const qwen3_6::detail::PrefixShortlistDigests& digests, std::uint32_t prompt_tokens,
+    bool trace) const {
+    if (disk_kv == nullptr || prompt_tokens == 0 || digests.size() < prompt_tokens) {
+        return std::nullopt;
+    }
+    const std::uint32_t tag =
+        capture_identity_tag(speculative_backend, proposal_head, kv_storage);
+    std::optional<std::uint32_t> best_E;
+    for (const std::uint32_t E : disk_kv->live_state_frontiers()) {
+        if (E == 0) { continue; }
+        if (E > prompt_tokens) {
+            if (trace) {
+                disk_kv_logf('D', "l3-probe", "skip | E=%u > prompt=%u", E, prompt_tokens);
+            }
+            continue;
+        }
+        // Cheap gate BEFORE the per-page chain walk: every passing candidate requires the
+        // state image at E (tail or aligned branch below), and one store lookup per frontier
+        // beats hundreds of chain probes on a store holding many live session endpoints.
+        {
+            const auto digest = digests.at(E);
+            const DiskKVIdentity gate{.lo      = digest[0],
+                                      .hi      = digest[1],
+                                      .tag     = tag,
+                                      .frontier = E};
+            if (!disk_kv->contains(gate, DiskKVKind::StateImage)) {
+                if (trace) {
+                    disk_kv_logf('D', "l3-probe",
+                                 "skip | E=%u state=0 (gate) key=%016llx%016llx tag=%u", E,
+                                 (unsigned long long)digest[0], (unsigned long long)digest[1], tag);
+                }
+                continue;
+            }
+        }
+        const std::uint32_t full_pages = E / static_cast<std::uint32_t>(kPagedKVPageSize);
+        bool covered = full_pages != 0;
+        std::uint32_t fail_key = 0;
+        if (covered) {
+            for (std::uint32_t p = 0; p < full_pages && covered; ++p) {
+                const auto digest = digests.at((p + 1) *
+                    static_cast<std::uint32_t>(kPagedKVPageSize));
+                const DiskKVIdentity id{.lo       = digest[0],
+                                        .hi       = digest[1],
+                                        .tag      = tag,
+                                        .frontier = (p + 1) *
+                                                    static_cast<std::uint32_t>(kPagedKVPageSize)};
+                if (!disk_kv->contains(id, DiskKVKind::MainKV)) {
+                    covered  = false;
+                    fail_key = id.frontier;
+                }
+            }
+        }
+        if (!covered) {
+            if (trace) {
+                disk_kv_logf('D', "l3-probe", "E=%u main chain miss | key=%u", E, fail_key);
+            }
+            continue;
+        }
+        if (E % static_cast<std::uint32_t>(kPagedKVPageSize) != 0) {
+            const auto digest = digests.at(E);
+            const DiskKVIdentity id{.lo       = digest[0],
+                                    .hi       = digest[1],
+                                    .tag      = tag,
+                                    .frontier = E};
+            if (!disk_kv->contains(id, DiskKVKind::MainKV) ||
+                !disk_kv->contains(id, DiskKVKind::StateImage)) {
+                if (trace) {
+                    disk_kv_logf('D', "l3-probe", "E=%u tail miss | main=%d state=%d", E,
+                            static_cast<int>(disk_kv->contains(id, DiskKVKind::MainKV)),
+                            static_cast<int>(disk_kv->contains(id, DiskKVKind::StateImage)));
+                }
+                continue;
+            }
+            if (trace) {
+                disk_kv_logf('D', "l3-probe",
+                        "P1@%u | lo=%016llx hi=%016llx tag=%u", E,
+                        (unsigned long long)digest[0], (unsigned long long)digest[1], tag);
+            }
+        } else {
+            const auto digest = digests.at(E);
+            const DiskKVIdentity id{.lo       = digest[0],
+                                    .hi       = digest[1],
+                                    .tag      = tag,
+                                    .frontier = E};
+            if (!disk_kv->contains(id, DiskKVKind::StateImage)) {
+                if (trace) {
+                    disk_kv_logf('D', "l3-probe", "E=%u aligned state=0", E);
+                }
+                continue;
+            }
+        }
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            // MTP draft KV is one token short of the main frontier.
+            const std::uint32_t bfrontier = backend_frontier_at(speculative_backend, E);
+            const std::uint32_t bfull_pages = bfrontier /
+                                             static_cast<std::uint32_t>(kPagedKVPageSize);
+            bool backend_covered = true;
+            std::uint32_t bfail_key = 0;
+            for (std::uint32_t p = 0; p < bfull_pages && backend_covered; ++p) {
+                const auto digest = digests.at((p + 1) *
+                    static_cast<std::uint32_t>(kPagedKVPageSize));
+                const DiskKVIdentity id{.lo       = digest[0],
+                                        .hi       = digest[1],
+                                        .tag      = tag,
+                                        .frontier = (p + 1) *
+                                                    static_cast<std::uint32_t>(kPagedKVPageSize)};
+                if (!disk_kv->contains(id, DiskKVKind::BackendKV)) {
+                    backend_covered = false;
+                    bfail_key       = id.frontier;
+                }
+            }
+            if (backend_covered && bfrontier % static_cast<std::uint32_t>(kPagedKVPageSize) != 0) {
+                const auto digest = digests.at(bfrontier);
+                const DiskKVIdentity id{.lo       = digest[0],
+                                        .hi       = digest[1],
+                                        .tag      = tag,
+                                        .frontier = bfrontier};
+                if (!disk_kv->contains(id, DiskKVKind::BackendKV)) {
+                    backend_covered = false;
+                    bfail_key       = bfrontier;
+                }
+            }
+            if (!backend_covered) {
+                if (trace) {
+                    disk_kv_logf('D', "l3-probe", "E=%u backend miss | bf=%u key=%u", E,
+                            bfrontier, bfail_key);
+                }
+                continue;
+            }
+        }
+        if (!best_E || E > *best_E) { best_E = E; }
+    }
+    return best_E;
+}
+
 std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base_plan,
     const SequenceState* source, const SharedPrefixState* shared_source,
@@ -543,6 +685,35 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             }
             plan->reuse      = restore_path(source->rewrite_checkpoint.kind);
             plan->reuse_base = selected.frontier;
+        }
+    }
+
+    // A disk seam anchor deeper than the selected shared/rewrite restore beats it: the shallow
+    // candidate would restore at reuse_base and recompute [reuse_base, prompt) on the GPU —
+    // inside a tool loop that is the whole accumulated turn, every round — while the disk tier
+    // can seed the prefix to its own deeper frontier. Reject the shallow candidate so admission
+    // falls through to the Root path, whose L3 probe promotes reuse_base to the deepest
+    // matchable disk frontier. Guards mirror the Root probe block so a rejection only happens
+    // when that probe would actually run and restore.
+    if (plan->reuse != ReusePath::Root && disk_kv != nullptr && disk_kv_restore &&
+        (plan->reuse == ReusePath::SharedStablePrefix || is_rewrite_checkpoint_restore(plan->reuse)) &&
+        base.summary.publish_continuation && !prompt.has_media() &&
+        l3_state_scratch.has_value() && l3_kv_scratch.has_value() &&
+        (speculative_backend == SpeculativeBackend::None ||
+         speculative_backend == SpeculativeBackend::Mtp) &&
+        plan->summary.prompt_tokens != 0 &&
+        base.prefix_digests.size() >= plan->summary.prompt_tokens) {
+        static const bool l3_trace_shallow = std::getenv("NINFER_L3_TRACE") != nullptr;
+        const std::optional<std::uint32_t> disk_best =
+            l3_disk_restore_frontier(base.prefix_digests, plan->summary.prompt_tokens,
+                                     l3_trace_shallow);
+        if (disk_best && *disk_best > plan->reuse_base) {
+            if (l3_trace_shallow) {
+                disk_kv_logf('D', "l3-probe",
+                             "shallow rejected | path=%d base=%u disk=%u",
+                             static_cast<int>(plan->reuse), plan->reuse_base, *disk_best);
+            }
+            return std::nullopt;
         }
     }
 
@@ -773,141 +944,11 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         if (!l3_state_scratch || !l3_kv_scratch) {
             disk_kv_logf('D', "l3-probe", "skip | no reserved seed scratch");
         } else {
-        const std::uint32_t tag = capture_identity_tag(speculative_backend, proposal_head,
-                                                       kv_storage);
         // Candidate-level detail is debug-only (NINFER_L3_TRACE=1): the
         // per-candidate lines flood the log at one entry per frontier.
         static const bool l3_trace = std::getenv("NINFER_L3_TRACE") != nullptr;
-        std::optional<std::uint32_t> best_E;
-        for (const std::uint32_t E : disk_kv->live_state_frontiers()) {
-            if (E == 0) { continue; }
-            if (E > plan->summary.prompt_tokens) {
-                if (l3_trace) {
-                    disk_kv_logf('D', "l3-probe", "skip | E=%u > prompt=%u", E,
-                            plan->summary.prompt_tokens);
-                }
-                continue;
-            }
-            // Cheap gate BEFORE the per-page chain walk: every passing
-            // candidate requires the state image at E (tail or aligned branch
-            // below), and one store lookup per frontier beats hundreds of
-            // chain probes on a store holding many live session endpoints.
-            {
-                const auto digest = base.prefix_digests.at(E);
-                const DiskKVIdentity gate{.lo      = digest[0],
-                                          .hi      = digest[1],
-                                          .tag     = tag,
-                                          .frontier = E};
-                if (!disk_kv->contains(gate, DiskKVKind::StateImage)) {
-                    if (l3_trace) {
-                        disk_kv_logf('D', "l3-probe", "skip | E=%u state=0 (gate) key=%016llx%016llx tag=%u", E,
-                                     (unsigned long long)digest[0], (unsigned long long)digest[1], tag);
-                    }
-                    continue;
-                }
-            }
-            const std::uint32_t full_pages = E / static_cast<std::uint32_t>(kPagedKVPageSize);
-            bool covered = full_pages != 0;
-            std::uint32_t fail_key = 0;
-            if (covered) {
-                for (std::uint32_t p = 0; p < full_pages && covered; ++p) {
-                    const auto digest = base.prefix_digests.at((p + 1) *
-                        static_cast<std::uint32_t>(kPagedKVPageSize));
-                    const DiskKVIdentity id{.lo       = digest[0],
-                                            .hi       = digest[1],
-                                            .tag      = tag,
-                                            .frontier = (p + 1) *
-                                                        static_cast<std::uint32_t>(kPagedKVPageSize)};
-                    if (!disk_kv->contains(id, DiskKVKind::MainKV)) {
-                        covered  = false;
-                        fail_key = id.frontier;
-                    }
-                }
-            }
-            if (!covered) {
-                if (l3_trace) {
-                    disk_kv_logf('D', "l3-probe", "E=%u main chain miss | key=%u", E, fail_key);
-                }
-                continue;
-            }
-            if (E % static_cast<std::uint32_t>(kPagedKVPageSize) != 0) {
-                const auto digest = base.prefix_digests.at(E);
-                const DiskKVIdentity id{.lo       = digest[0],
-                                        .hi       = digest[1],
-                                        .tag      = tag,
-                                        .frontier = E};
-                if (!disk_kv->contains(id, DiskKVKind::MainKV) ||
-                    !disk_kv->contains(id, DiskKVKind::StateImage)) {
-                    if (l3_trace) {
-                        disk_kv_logf('D', "l3-probe", "E=%u tail miss | main=%d state=%d", E,
-                                static_cast<int>(disk_kv->contains(id, DiskKVKind::MainKV)),
-                                static_cast<int>(disk_kv->contains(id, DiskKVKind::StateImage)));
-                    }
-                    continue;
-                }
-                if (l3_trace) {
-                    disk_kv_logf('D', "l3-probe",
-                            "P1@%u | lo=%016llx hi=%016llx tag=%u rw_n=%zu rw_tail=%u", E,
-                            (unsigned long long)digest[0], (unsigned long long)digest[1], tag,
-                            prompt.identity.rewrite_execution_frontiers.size(),
-                            prompt.identity.rewrite_execution_frontiers.empty()
-                                ? 0U
-                                : prompt.identity.rewrite_execution_frontiers.back());
-                }
-            } else {
-                const auto digest = base.prefix_digests.at(E);
-                const DiskKVIdentity id{.lo       = digest[0],
-                                        .hi       = digest[1],
-                                        .tag      = tag,
-                                        .frontier = E};
-                if (!disk_kv->contains(id, DiskKVKind::StateImage)) {
-                    if (l3_trace) {
-                        disk_kv_logf('D', "l3-probe", "E=%u aligned state=0", E);
-                    }
-                    continue;
-                }
-            }
-            if (speculative_backend == SpeculativeBackend::Mtp) {
-                // MTP draft KV is one token short of the main frontier.
-                const std::uint32_t bfrontier = backend_frontier_at(speculative_backend, E);
-                const std::uint32_t bfull_pages = bfrontier /
-                                                 static_cast<std::uint32_t>(kPagedKVPageSize);
-                bool backend_covered = true;
-                std::uint32_t bfail_key = 0;
-                for (std::uint32_t p = 0; p < bfull_pages && backend_covered; ++p) {
-                    const auto digest = base.prefix_digests.at((p + 1) *
-                        static_cast<std::uint32_t>(kPagedKVPageSize));
-                    const DiskKVIdentity id{.lo       = digest[0],
-                                            .hi       = digest[1],
-                                            .tag      = tag,
-                                            .frontier = (p + 1) *
-                                                        static_cast<std::uint32_t>(kPagedKVPageSize)};
-                    if (!disk_kv->contains(id, DiskKVKind::BackendKV)) {
-                        backend_covered = false;
-                        bfail_key       = id.frontier;
-                    }
-                }
-                if (backend_covered && bfrontier % static_cast<std::uint32_t>(kPagedKVPageSize) != 0) {
-                    const auto digest = base.prefix_digests.at(bfrontier);
-                    const DiskKVIdentity id{.lo       = digest[0],
-                                            .hi       = digest[1],
-                                            .tag      = tag,
-                                            .frontier = bfrontier};
-                    if (!disk_kv->contains(id, DiskKVKind::BackendKV)) {
-                        backend_covered = false;
-                        bfail_key       = bfrontier;
-                    }
-                }
-                if (!backend_covered) {
-                    if (l3_trace) {
-                        disk_kv_logf('D', "l3-probe", "E=%u backend miss | bf=%u key=%u", E,
-                                bfrontier, bfail_key);
-                    }
-                    continue;
-                }
-            }
-            if (!best_E || E > *best_E) { best_E = E; }
-        }
+        const std::optional<std::uint32_t> best_E =
+            l3_disk_restore_frontier(base.prefix_digests, plan->summary.prompt_tokens, l3_trace);
         if (best_E) {
             disk_kv_logf('I', "l3-probe", "best_E=%u", *best_E);
             const std::uint32_t E = *best_E;

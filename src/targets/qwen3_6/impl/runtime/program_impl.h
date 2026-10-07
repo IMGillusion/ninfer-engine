@@ -998,6 +998,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             host_kv_arena->layout_for(text_kv_pages->physical_pool().geometry());
         if (main_scratch_layout != nullptr) {
             l3_kv_scratch = host_kv_arena->allocate(*main_scratch_layout, kL3ScratchPages);
+            // Dedicated two-page scratch for the prefill seam write: it must never contend
+            // with the shared seed/spill scratch a proactive owner spill may hold mid-batch
+            // while the next round's prefill runs.
+            l3_seam_scratch = host_kv_arena->allocate(*main_scratch_layout, 2U);
         }
         if (backend_host_kv_page_stride != 0 && backend_kv_pages != nullptr) {
             const HostKVPageLayout* backend_scratch_layout =
@@ -1005,6 +1009,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             if (backend_scratch_layout != nullptr) {
                 l3_backend_scratch =
                     host_kv_arena->allocate(*backend_scratch_layout, kL3ScratchPages);
+                l3_seam_backend_scratch =
+                    host_kv_arena->allocate(*backend_scratch_layout, 2U);
             }
         }
         l3_state_scratch = host_state_images->allocate();
@@ -13322,8 +13328,13 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 // disk seam when the owner-spill path happens to run; this write is
                 // the per-request guarantee (synchronous, logged). Every failure is
                 // a silent degradation.
-                if (staged.prompt.identity.rewrite_checkpoint &&
-                    staged.cursor == staged.prompt.identity.rewrite_checkpoint->frontier &&
+                const bool rewrite_seam =
+                    staged.prompt.identity.rewrite_checkpoint &&
+                    staged.cursor == staged.prompt.identity.rewrite_checkpoint->frontier;
+                const bool preopener_seam =
+                    staged.prompt.identity.pre_opener_frontier != 0 &&
+                    staged.cursor == staged.prompt.identity.pre_opener_frontier;
+                if ((rewrite_seam || preopener_seam) &&
                     disk_kv != nullptr &&
                     l3_state_scratch && host_state_images && text_kv_pages && !staged.vision &&
                     !staged.prompt.has_media() && speculative_backend != SpeculativeBackend::DFlash &&
@@ -13362,10 +13373,123 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                     seam, DiskKVKind::StateImage,
                                     std::span<const std::byte>(view.data, stride));
                                 disk_kv_logf('I', "l3-seam",
-                                             "anchor written | frontier=%u digest=%016llx%016llx",
+                                             "anchor written | kind=%s frontier=%u digest=%016llx%016llx",
+                                             preopener_seam ? "preopener" : "rewrite",
                                              staged.cursor,
                                              (unsigned long long)seam_digest[0],
                                              (unsigned long long)seam_digest[1]);
+                            }
+                        }
+                        // A pre-opener anchor is only restorable when the probe can walk a
+                        // complete KV chain to it. The chain keys are page-end digests of
+                        // client-authored content — byte-stable across rounds — so this round
+                        // synchronously persists the pages it owns beyond its restore base
+                        // [base, cursor): the increment the next round would otherwise have to
+                        // wait for (the owner spill runs asynchronously at release) or
+                        // recompute. Already-present pages dedup to a touch. The write uses
+                        // the dedicated seam scratch, so it never contends with a proactive
+                        // owner spill holding the shared seed/spill scratch.
+                        const auto spill_one_seam_page =
+                            [&](auto* addresses, auto address, auto* pages, std::size_t stride,
+                                DiskKVKind kind, std::uint32_t frontier, const auto& digest,
+                                auto& scratch) {
+                                if (addresses == nullptr || pages == nullptr || !scratch) {
+                                    return;
+                                }
+                                const DiskKVIdentity id{.lo       = digest[0],
+                                                        .hi       = digest[1],
+                                                        .tag      = seam.tag,
+                                                        .frontier = frontier};
+                                if (disk_kv->contains(id, kind)) {
+                                    disk_kv->touch(id, kind);
+                                    return;
+                                }
+                                // The chain entry for the page holding tokens up to `frontier`
+                                // is keyed at that page-end frontier: page (frontier-1)/size
+                                // covers both aligned ends and the unaligned tail.
+                                const std::uint32_t page =
+                                    (frontier - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+                                if (page >= addresses->mapped_pages(address)) { return; }
+                                const auto logical = addresses->logical_page(address, page);
+                                // Mid-prefill this sequence is the sole writer of the pages it
+                                // computed (writer_references == 1): those pin through the
+                                // active-source variant and must be read from the Device
+                                // replica (any host replica is stale). Restored immutable
+                                // pages (writers == 0) pin through the plain variant and may
+                                // be read from a current host replica. One unpinnable page
+                                // only skips itself.
+                                const bool active_writer =
+                                    pages->writer_references(logical) != 0;
+                                if (!active_writer && pages->host_resident(logical)) {
+                                    const auto replica = pages->host_replica(logical);
+                                    const auto view = host_kv_extents->view(replica.extent)
+                                                          .subview(replica.page_offset, 1);
+                                    if (view.data() == nullptr) { return; }
+                                    (void)disk_kv->spill_page_sync(
+                                        id, kind, std::span<const std::byte>(view.data(), stride));
+                                    return;
+                                }
+                                if (!pages->device_resident(logical)) { return; }
+                                const bool pinnable = active_writer
+                                                          ? pages->can_pin_active_source(logical)
+                                                          : pages->can_pin_source(logical);
+                                if (!pinnable) { return; }
+                                const auto destination =
+                                    host_kv_arena->writable_view(*scratch).subview(0, 1);
+                                if (destination.data() == nullptr) { return; }
+                                pages->pin_source(logical);
+                                const std::array device_page{pages->physical(logical)};
+                                const bool copied =
+                                    pages->physical_pool().spill_copy_to_host(
+                                        std::span<const decltype(pages->physical(logical))>(
+                                            device_page.data(), device_page.size()),
+                                        destination, device.transfer_stream);
+                                const cudaError_t status =
+                                    copied ? cudaStreamSynchronize(device.transfer_stream)
+                                           : cudaErrorUnknown;
+                                pages->unpin_source(logical);
+                                if (status != cudaSuccess) { return; }
+                                (void)disk_kv->spill_page_sync(
+                                    id, kind,
+                                    std::span<const std::byte>(destination.data(), stride));
+                            };
+                        if (preopener_seam && sequence.kv) {
+                            const std::uint32_t page_size =
+                                static_cast<std::uint32_t>(kPagedKVPageSize);
+                            const std::uint32_t begin_page = staged.base / page_size;
+                            const std::uint32_t full_pages = staged.cursor / page_size;
+                            for (std::uint32_t p = begin_page; p < full_pages; ++p) {
+                                const std::uint32_t frontier = (p + 1) * page_size;
+                                spill_one_seam_page(
+                                    text_kv_addresses.get(), sequence.kv->text,
+                                    text_kv_pages.get(), text_host_kv_page_stride,
+                                    DiskKVKind::MainKV, frontier,
+                                    sequence.prefix_digests.at(frontier), l3_seam_scratch);
+                            }
+                            spill_one_seam_page(
+                                text_kv_addresses.get(), sequence.kv->text, text_kv_pages.get(),
+                                text_host_kv_page_stride, DiskKVKind::MainKV, staged.cursor,
+                                seam_digest, l3_seam_scratch);
+                            if (sequence.kv->backend && backend_kv_pages &&
+                                speculative_backend != SpeculativeBackend::None) {
+                                const std::uint32_t bfrontier =
+                                    backend_frontier_at(speculative_backend, staged.cursor);
+                                const std::uint32_t bfull_pages = bfrontier / page_size;
+                                for (std::uint32_t p = begin_page; p < bfull_pages; ++p) {
+                                    const std::uint32_t frontier = (p + 1) * page_size;
+                                    spill_one_seam_page(
+                                        backend_kv_addresses.get(), *sequence.kv->backend,
+                                        backend_kv_pages.get(), backend_host_kv_page_stride,
+                                        DiskKVKind::BackendKV, frontier,
+                                        sequence.prefix_digests.at(frontier),
+                                        l3_seam_backend_scratch);
+                                }
+                                spill_one_seam_page(
+                                    backend_kv_addresses.get(), *sequence.kv->backend,
+                                    backend_kv_pages.get(), backend_host_kv_page_stride,
+                                    DiskKVKind::BackendKV, bfrontier,
+                                    sequence.prefix_digests.at(bfrontier),
+                                    l3_seam_backend_scratch);
                             }
                         }
                     }

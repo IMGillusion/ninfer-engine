@@ -702,6 +702,10 @@ public:
     // state slots / KV arena) can neither fail nor block a restore.
     std::optional<HostKVAllocation> l3_kv_scratch;
     std::optional<HostKVAllocation> l3_backend_scratch;
+    // Dedicated seam-write scratch (two pages each): independent of the shared seed/spill
+    // scratch so a proactive owner spill never blocks the prefill seam write.
+    std::optional<HostKVAllocation> l3_seam_scratch;
+    std::optional<HostKVAllocation> l3_seam_backend_scratch;
     std::optional<qwen3_6::HostStateSlotHandle> l3_state_scratch;
     StateScratchLease l3_state_scratch_lease;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
@@ -1254,6 +1258,9 @@ private:
                                                      const RewriteCheckpointSpec& desired,
                                                      const SequenceState& sequence, ReusePath reuse,
                                                      std::uint32_t reuse_base) const;
+    [[nodiscard]] std::optional<std::uint32_t>
+    l3_disk_restore_frontier(const qwen3_6::detail::PrefixShortlistDigests& digests,
+                             std::uint32_t prompt_tokens, bool trace) const;
     [[nodiscard]] std::uint32_t device_kv_prefix_pages(const KVAddressSpaceStore& addresses,
                                                        KVAddressSpaceHandle address,
                                                        std::uint32_t frontier) const;

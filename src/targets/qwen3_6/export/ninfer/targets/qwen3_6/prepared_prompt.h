@@ -87,6 +87,13 @@ struct PromptIdentity {
     // by an earlier turn. Prefill splits at these frontiers so resumed and root execution use the
     // same GDN decomposition; they are not capture requests by themselves.
     std::vector<std::uint32_t> rewrite_execution_frontiers;
+    // Token frontier of the final generation opener when an in-flight tool loop places
+    // client-authored assistant content between the typed checkpoint and the opener; 0 when
+    // absent. The client-authored prefix ending here is render-stable for the follow-up
+    // request; prefill synchronously spills a disk seam anchor at this frontier so the next
+    // loop round restores at the previous round's endpoint. Digest validation at restore time
+    // makes a stale value a harmless degradation.
+    std::uint32_t pre_opener_frontier = 0;
 };
 
 inline constexpr std::size_t kPreparedSessionKeyCapacity = kMaximumContextCacheSessionKeyBytes;

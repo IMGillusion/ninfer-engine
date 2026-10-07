@@ -125,6 +125,13 @@ struct RenderedChat {
     std::vector<MediaTokenRunByteSpec> media_token_runs;
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
     std::vector<std::size_t> rewrite_execution_boundaries;
+    // Byte frontier of the final generation opener (where the generation suffix begins). Set
+    // when the in-flight turn already contains client-authored assistant content after the
+    // last real user query, so this boundary sits strictly inside the typed checkpoint's
+    // rewrite span. The client-authored prefix ending here is render-stable for the follow-up
+    // request, and a disk seam anchor at this frontier lets the next loop round restore at the
+    // previous round's endpoint instead of recomputing the accumulated turn.
+    std::optional<std::size_t> pre_opener_boundary;
     // Index n is the exact byte frontier after serializing the first n input messages. A missing
     // value means the template has no independent boundary there (for example, before a leading
     // instruction message folded into the system preamble).

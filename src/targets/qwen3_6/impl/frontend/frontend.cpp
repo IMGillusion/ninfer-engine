@@ -1462,6 +1462,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(processed.rewrite_execution_frontiers);
+        result.identity.pre_opener_frontier = processed.pre_opener_frontier;
         message_boundaries = std::move(processed.message_boundaries);
         cache_boundaries   = std::move(processed.cache_boundaries);
     } else {
@@ -1480,6 +1481,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(encoded.rewrite_execution_frontiers);
+        result.identity.pre_opener_frontier = encoded.pre_opener_frontier;
         message_boundaries = std::move(encoded.message_boundaries);
         cache_boundaries   = std::move(encoded.cache_boundaries);
         assign_text_positions(result);

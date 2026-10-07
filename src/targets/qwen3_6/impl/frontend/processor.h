@@ -109,6 +109,9 @@ struct ProcessedInput {
     std::vector<std::shared_ptr<const qwen3_6::PreparedMediaPayload>> media_payloads;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
     std::vector<std::uint32_t> rewrite_execution_frontiers;
+    // Token frontier of the final generation opener; 0 when absent. See RenderedChat
+    // pre_opener_boundary for the semantics.
+    std::uint32_t pre_opener_frontier = 0;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
     PreprocessStats stats;
@@ -129,6 +132,8 @@ struct EncodedChat {
     std::vector<MediaTokenRun> media_token_runs;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
     std::vector<std::uint32_t> rewrite_execution_frontiers;
+    // Token frontier of the final generation opener; 0 when absent.
+    std::uint32_t pre_opener_frontier = 0;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
 };
