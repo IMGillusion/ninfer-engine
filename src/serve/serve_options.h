@@ -57,6 +57,8 @@ struct ServeOptions {
     std::optional<std::uint32_t> default_thinking_budget;
     std::optional<std::string> default_reasoning_effort; // --reasoning-effort none|low|medium|xhigh
     std::uint32_t kv_capacity_headroom_mib = 1024;       // --kv-headroom-mib sizing headroom
+    AdmissionOrder admission_order         = AdmissionOrder::Fifo; // --admission-order fifo|prefill-first
+    std::uint32_t prefill_yield_max_ms     = 0;          // --prefill-yield-max-ms (0 = disabled)
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     // Process-level explicit overrides layered between registered model/mode defaults and request

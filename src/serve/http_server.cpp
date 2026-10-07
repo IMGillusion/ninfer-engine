@@ -368,7 +368,10 @@ void HttpServer::run_stats_reporter() {
             }
         }
         if (running_stall_ms != 0) {
-            if (current.running_requests != 0 && progress_tokens == previous_progress_tokens) {
+            if (current.running_requests != 0 && progress_tokens == previous_progress_tokens &&
+                // A paused prefill (yield) makes no token progress by design and the pause
+                // deadline bounds it; exempt so the yield window never reads as a wedge.
+                !current.prefill_yield_paused) {
                 if (running_idle_since.time_since_epoch().count() == 0) {
                     running_idle_since = now;
                 } else if (now - running_idle_since >=

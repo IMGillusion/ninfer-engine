@@ -169,6 +169,11 @@ struct ContextCostOptions {
     std::filesystem::path preset_path;
 };
 
+enum class AdmissionOrder : std::uint8_t {
+    Fifo,
+    PrefillFirst,
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
@@ -194,6 +199,17 @@ struct EngineOptions {
     // a fresh process starts from - scheduler reset, program teardown, resources
     // released - so the engine can keep serving after failing the in-flight requests.
     bool recover_after_failure             = false;
+    // Admission order for the pending queue. Fifo keeps the strict contract; PrefillFirst
+    // picks, among requests younger than the aging threshold, the one with the smallest
+    // remaining prefill work (prompt tokens minus reusable prefix), so near-full cache hits
+    // jump ahead of cold large prompts. Requests older than the threshold always run in
+    // submit order ahead of all younger ones - bounded, fair, no starvation.
+    AdmissionOrder admission_order         = AdmissionOrder::Fifo;
+    // While one lane runs a large staged prefill, allow the pipe to pause at a chunk
+    // boundary (device work quiesces between chunks by construction) for at most this
+    // many milliseconds so a waiting admission can materialize and run its short prefill
+    // first. Zero disables yielding.
+    std::uint32_t prefill_yield_max_ms     = 0;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;
@@ -896,6 +912,9 @@ struct RuntimeStats {
     std::uint64_t decode_row_rounds         = 0;
     std::uint32_t running_requests          = 0;
     std::uint32_t prefilling_requests       = 0;
+    // The staged prefill is deliberately paused at a chunk boundary (prefill yield) — not
+    // wedged. Monitoring exempts this state from zero-progress stall detection.
+    bool prefill_yield_paused               = false;
     std::uint32_t decode_ready_requests     = 0;
     std::uint32_t waiting_requests          = 0;
     std::uint32_t materializing_requests    = 0;

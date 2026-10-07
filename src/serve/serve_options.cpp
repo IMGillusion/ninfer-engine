@@ -105,6 +105,10 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom (--kv-headroom-mib N overrides)\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --admission-order prefill-first admits the smallest remaining prefill first "
+           "(aging keeps older requests ahead; default fifo)\n"
+           "       --prefill-yield-max-ms pauses a large staged prefill at a chunk boundary up "
+           "to N ms so short prefills can run first (0 = disabled)\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
@@ -174,6 +178,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--admission-order") {
+            const std::string value = require_value("--admission-order");
+            if (value == "fifo") {
+                options.admission_order = AdmissionOrder::Fifo;
+            } else if (value == "prefill-first") {
+                options.admission_order = AdmissionOrder::PrefillFirst;
+            } else {
+                throw std::invalid_argument("--admission-order must be fifo or prefill-first");
+            }
+        } else if (arg == "--prefill-yield-max-ms") {
+            options.prefill_yield_max_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--prefill-yield-max-ms"), "prefill-yield-max-ms"));
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {

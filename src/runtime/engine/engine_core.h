@@ -35,6 +35,11 @@
 
 namespace ninfer::runtime {
 
+// Requests waiting at least this long admission-jump the queue in strict submit order,
+// ahead of every younger request regardless of its remaining prefill work (bounded
+// fairness for the prefill-first admission order).
+inline constexpr std::chrono::milliseconds kAdmissionAgingThreshold{5000};
+
 template <class Instance>
 class EngineCore {
 
@@ -79,6 +84,9 @@ public:
         }
         recover_after_failure_ = options.recover_after_failure ||
                                  std::getenv("NINFER_ENGINE_RECOVER") != nullptr;
+        admission_order_       = options.admission_order;
+        prefill_yield_max_ms_  = options.prefill_yield_max_ms;
+        prefill_chunk_         = options.prefill_chunk;
         if (const char* s = std::getenv("NINFER_TEST_THROW_BOUNDARY")) {
             test_throw_budget_ = static_cast<std::uint32_t>(std::strtoul(s, nullptr, 10));
         }
@@ -541,6 +549,7 @@ private:
             lane && slots_[*lane] != nullptr && !slots_[*lane]->capture_pending) {
             snapshot.prefilling_requests = 1;
         }
+        snapshot.prefill_yield_paused = prefill_yield_paused_.load(std::memory_order_acquire);
         snapshot.materializing_requests = materializing_.has_value() ? 1U : 0U;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
@@ -1419,6 +1428,7 @@ private:
         auto progress =
             instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
         program_call.finish(progress.timing);
+        prefill_ran_since_resume_ = true;
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         publish_runtime_stats();
     }
@@ -1426,6 +1436,145 @@ private:
     [[nodiscard]] FifoSnapshot pending_snapshot() const {
         std::lock_guard lock(queue_mutex_);
         return Scheduling::fifo_snapshot(pending_);
+    }
+
+    // Prefill-first admission order: among requests younger than the aging threshold, admit
+    // the one with the smallest remaining prefill work (planned prompt tokens minus the
+    // reusable prefix; unplanned requests fall back to their full prompt estimate). Requests
+    // older than the threshold run oldest-first ahead of every younger one — bounded wait,
+    // no starvation, and the aging tier degenerates to FIFO. Runs before head observation so
+    // any head change flows through observe_fifo_head's clean protection reset. Every other
+    // pending_ consumer counts or erases by pointer, so the reorder touches nothing else.
+    void reorder_pending_for_admission() {
+        if (admission_order_ != AdmissionOrder::PrefillFirst) { return; }
+        std::lock_guard lock(queue_mutex_);
+        if (pending_.size() <= 1) { return; }
+        const auto now = Clock::now();
+        const auto key = [&](const std::shared_ptr<Request>& request) {
+            const bool aged = now - request->submitted >= kAdmissionAgingThreshold;
+            if (aged) {
+                return std::pair<std::uint64_t, std::uint64_t>{0U,
+                                                               static_cast<std::uint64_t>(
+                                                                   request->submitted.time_since_epoch().count())};
+            }
+            const std::uint64_t remaining =
+                request->base_plan
+                    ? static_cast<std::uint64_t>(
+                          request->base_plan->summary().prompt_tokens) -
+                          request->base_plan->summary().reusable_prompt_tokens
+                    : request->prompt_summary.prompt_tokens;
+            return std::pair<std::uint64_t, std::uint64_t>{1U, remaining};
+        };
+        std::stable_sort(pending_.begin(), pending_.end(),
+                         [&](const std::shared_ptr<Request>& left,
+                             const std::shared_ptr<Request>& right) {
+                             return key(left) < key(right);
+                         });
+    }
+
+    // Pauses the active staged prefill at a chunk boundary so a waiting admission can take
+    // the freed prefill pipe first. The device stream is idle between chunks by construction
+    // and the request's progress (cursor, captures, seed state) lives entirely in its slot,
+    // so pausing is bookkeeping only: clear the scheduler's pipe ownership, remember the
+    // lane, and re-arm the admission flag. One yield window per pending-queue head (a wave):
+    // after a resume the owner keeps running until a different head arrives or an adoption
+    // preempts the pipe, so the owner never degenerates to one chunk per window. Pausing
+    // also requires a free lane (otherwise no admission could use the window) and more than
+    // one full chunk of remaining work (otherwise the prefill is about to finish anyway).
+    void maybe_pause_prefill_for_admission() {
+        if (prefill_yield_max_ms_ == 0 || paused_prefill_lane_.has_value() ||
+            !prefill_ran_since_resume_) {
+            return;
+        }
+        const auto lane = scheduler_.prefill_lane();
+        if (!lane) { return; }
+        const Request* request =
+            *lane < max_concurrency_ ? slots_[*lane].get() : nullptr;
+        if (request == nullptr || !request->is_prefilling() || request->capture_pending) {
+            return;
+        }
+        if (instance_.program->has_context_transaction()) { return; }
+        const FifoSnapshot queued = pending_snapshot();
+        if (queued.empty()) {
+            yielded_pending_head_.reset();
+            return;
+        }
+        const std::uint64_t head_id = queued.head()->id;
+        if (yielded_pending_head_ && *yielded_pending_head_ == head_id) { return; }
+        bool lane_free = false;
+        for (std::uint32_t index = 0; index < max_concurrency_; ++index) {
+            if (slots_[index] == nullptr) { lane_free = true; break; }
+        }
+        if (!lane_free) { return; }
+        const std::uint32_t remaining =
+            request->admitted_begin
+                ? request->admitted_begin->prompt_tokens -
+                      request->admitted_begin->reused_prompt_tokens -
+                      request->computed_prompt_tokens
+                : request->prompt_summary.prompt_tokens;
+        if (remaining <= prefill_chunk_) { return; }
+        scheduler_.clear_prefill_lane(*lane);
+        paused_prefill_lane_     = *lane;
+        prefill_pause_deadline_  = Clock::now() + std::chrono::milliseconds(prefill_yield_max_ms_);
+        yielded_pending_head_    = head_id;
+        prefill_ran_since_resume_ = false;
+        ++prefill_yield_count_;
+        prefill_yield_paused_.store(true, std::memory_order_release);
+        request_admission_check();
+        std::fprintf(stderr, "[engine] prefill yield | lane=%u remaining=%u head=%llu yield#=%llu\n",
+                     *lane, remaining, static_cast<unsigned long long>(head_id),
+                     static_cast<unsigned long long>(prefill_yield_count_));
+        std::fflush(stderr);
+    }
+
+    // Returns the pipe to a paused prefill when the yield window ends: the pause deadline
+    // elapsed, the wave drained, or the paused request became invalid (cancelled mid-pause).
+    // An owned pipe (the wave's short prefill is running) simply waits.
+    void resume_paused_prefill() {
+        if (!paused_prefill_lane_) { return; }
+        const std::uint32_t lane = *paused_prefill_lane_;
+        const Request* request =
+            lane < max_concurrency_ ? slots_[lane].get() : nullptr;
+        if (request == nullptr || !request->is_prefilling()) {
+            // Cancelled or failed while paused; its terminal settle owns the slot.
+            paused_prefill_lane_.reset();
+            prefill_yield_paused_.store(false, std::memory_order_release);
+            return;
+        }
+        if (request->capture_pending) { return; }
+        const bool deadline_hit = Clock::now() >= prefill_pause_deadline_;
+        const bool wave_drained = !has_pending_requests();
+        if (wave_drained) { yielded_pending_head_.reset(); }
+        if (!deadline_hit && !wave_drained) { return; }
+        if (scheduler_.prefill_lane().has_value()) { return; }
+        scheduler_.set_prefill_lane(lane);
+        paused_prefill_lane_.reset();
+        prefill_yield_paused_.store(false, std::memory_order_release);
+        std::fprintf(stderr, "[engine] prefill resume | lane=%u %s\n", lane,
+                     deadline_hit ? "deadline" : "wave-drained");
+        std::fflush(stderr);
+    }
+
+    // Materialization adoption needs the pipe for the newly started prefill. While yielding
+    // is enabled, a pipe owned by another prefilling request is parked again (adoption
+    // always wins); without this, the resumed owner would make set_prefill_lane throw.
+    void yield_pipe_for_adoption(std::uint32_t lane) {
+        if (prefill_yield_max_ms_ == 0) { return; }
+        const auto owner = scheduler_.prefill_lane();
+        if (!owner || *owner == lane) { return; }
+        const Request* owner_request =
+            *owner < max_concurrency_ ? slots_[*owner].get() : nullptr;
+        if (owner_request == nullptr || !owner_request->is_prefilling()) { return; }
+        scheduler_.clear_prefill_lane(*owner);
+        paused_prefill_lane_      = *owner;
+        prefill_pause_deadline_   = Clock::now() + std::chrono::milliseconds(prefill_yield_max_ms_);
+        prefill_ran_since_resume_ = false;
+        ++prefill_yield_count_;
+        prefill_yield_paused_.store(true, std::memory_order_release);
+        std::fprintf(stderr,
+                     "[engine] prefill yield | adoption preempts | paused=%u adopted=%u yield#=%llu\n",
+                     *owner, lane, static_cast<unsigned long long>(prefill_yield_count_));
+        std::fflush(stderr);
     }
 
     [[nodiscard]] bool has_pending_requests() const {
@@ -1564,6 +1713,7 @@ private:
                     slots_[lane]                 = request;
                     record_prefix_selection(control.summary);
                     materializing_.reset();
+                    yield_pipe_for_adoption(lane);
                     scheduler_.set_prefill_lane(lane);
                     request_admission_check();
                     publish_runtime_stats();
@@ -1708,6 +1858,7 @@ private:
         bool control_progress = false;
         for (;;) {
             ++admit_iters;
+            reorder_pending_for_admission();
             const auto t_snap = Clock::now();
             const FifoSnapshot queued = pending_snapshot();
             ns_snapshot += static_cast<std::uint64_t>(
@@ -1998,6 +2149,10 @@ private:
             pending.swap(pending_);
         }
         scheduler_.reset();
+        paused_prefill_lane_.reset();
+        yielded_pending_head_.reset();
+        prefill_ran_since_resume_ = true;
+        prefill_yield_paused_.store(false, std::memory_order_release);
         const std::shared_ptr<Request> materializing_request =
             materializing_ ? materializing_->request : nullptr;
         materializing_.reset();
@@ -2089,6 +2244,8 @@ private:
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
+                resume_paused_prefill();
+                maybe_pause_prefill_for_admission();
                 instance_.program->background_host_kv_tick();
                 background_pending = instance_.program->has_background_host_kv_work();
                 background_pending = resources_.proactive_tick(*instance_.program, have_pending) || background_pending;
@@ -2206,6 +2363,20 @@ private:
     // See EngineOptions::recover_after_failure. NINFER_ENGINE_RECOVER in the environment
     // turns it on without a CLI change; absent (the default) keeps fail-stop.
     bool recover_after_failure_ = false;
+    AdmissionOrder admission_order_         = AdmissionOrder::Fifo;
+    std::uint32_t prefill_yield_max_ms_     = 0;
+    std::uint32_t prefill_chunk_            = 1024;
+    // Prefill yield state (worker loop thread only except the published atomic): the lane
+    // whose staged prefill is deliberately parked at a chunk boundary, its pause deadline,
+    // the pending-queue head the current yield already served (one yield window per head so
+    // the owner keeps progress between waves), and the hysteresis flag requiring one chunk
+    // to run after a resume before another pause may start.
+    std::optional<std::uint32_t> paused_prefill_lane_;
+    Clock::time_point prefill_pause_deadline_{};
+    std::optional<std::uint64_t> yielded_pending_head_;
+    bool prefill_ran_since_resume_ = true;
+    std::atomic<bool> prefill_yield_paused_{false};
+    std::uint64_t prefill_yield_count_ = 0;
     // Test hook: NINFER_TEST_THROW_BOUNDARY=<n> throws inside the worker boundary the
     // first n times, so the fail_all + recovery path can be exercised on demand instead
     // of waiting for a real engine fault. Zero (the default) disables it entirely.
