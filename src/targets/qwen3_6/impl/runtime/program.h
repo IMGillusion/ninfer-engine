@@ -1005,6 +1005,10 @@ private:
         std::vector<MaterializationVictimResult> pressure_results;
         std::size_t host_release_cursor = 0;
         std::size_t shared_host_release_cursor = 0;
+        // Victim releases defer (instead of throwing) when a victim is transiently pinned or
+        // still referenced; this counts the deferral boundaries for exponential-backoff
+        // diagnostics. The materializing-stall sentinel bounds the wait.
+        std::uint32_t pressure_deferred_boundaries = 0;
         std::size_t pressure_cursor = 0;
         std::size_t victim_count    = 0;
         std::vector<std::uint32_t> shared_victim_indices;
@@ -1150,6 +1154,8 @@ private:
         bool transfer_submitted            = false;
         std::uint8_t transfer_timer_mask   = 0;
         bool published                     = false;
+        // Victim-release deferral diagnostics (same discipline as MaterializationTransaction).
+        std::uint32_t pressure_deferred_boundaries = 0;
     };
 
     std::uint64_t next_capture_offer_id_ = 1;

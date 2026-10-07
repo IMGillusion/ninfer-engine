@@ -1,8 +1,8 @@
 FROM nvidia/cuda:13.1.2-devel-ubuntu24.04 AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
-RUN sed -i "s|archive.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g; s|security.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g" /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list 2>/dev/null; \
-    sed -i "s|archive.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g; s|security.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g" /etc/apt/sources.list 2>/dev/null; \
+RUN sed -i "s|archive.ubuntu.com|mirrors.ustc.edu.cn|g; s|security.ubuntu.com|mirrors.ustc.edu.cn|g" /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list 2>/dev/null; \
+    sed -i "s|archive.ubuntu.com|mirrors.ustc.edu.cn|g; s|security.ubuntu.com|mirrors.ustc.edu.cn|g" /etc/apt/sources.list 2>/dev/null; \
     apt-get update \
     && apt-get install --yes --no-install-recommends \
         cmake \
@@ -28,7 +28,7 @@ RUN cmake -S . -B /build -G Ninja \
 FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
-RUN sed -i "s|archive.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g; s|security.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g" /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list 2>/dev/null; \
+RUN sed -i "s|archive.ubuntu.com|mirrors.ustc.edu.cn|g; s|security.ubuntu.com|mirrors.ustc.edu.cn|g" /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list 2>/dev/null; \
     apt-get update \
     && apt-get install --yes --no-install-recommends \
         ca-certificates \

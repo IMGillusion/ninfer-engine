@@ -7501,6 +7501,18 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         complete_victim_acknowledgement();
         complete_shared_victim_acknowledgement();
     };
+    // Activation failures that name transient pressure contention between the reserve-time
+    // revalidation and this boundary. The same class as the victim-release deferrals: surface
+    // a retryable failure instead of failing every running request at the worker boundary.
+    // ("belongs to another store" / "has no execution row" are real invariant breaches and
+    // stay fatal.)
+    const auto activation_contention = [](const std::logic_error& error) {
+        const std::string_view what = error.what();
+        return what == "KV activation has an unavailable Device page" ||
+               what == "KV activation destination changed after reservation" ||
+               what == "KV activation capacity reservation changed" ||
+               what == "KV activation reservation address is stale";
+    };
 
     if (cancellation.requested()) { transaction.cancel_pending = true; }
     // Cancellation cannot revoke a worker's borrowed scratch. Poll before ANY
@@ -7545,7 +7557,32 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                     throw std::logic_error("shared pressure eviction changed after reservation");
                 }
                 if (!can_release_shared_prefix_state(index, SharedPrefixSlotRole::Catalogued)) {
-                    throw std::logic_error("shared pressure victim is not strictly releasable");
+                    // Transient contention, not an invariant break: between the reserve-time
+                    // revalidation and this phase, a proactive spill that started earlier may
+                    // still pin pages aliased with the victim's KV, and another lane's finish
+                    // may not yet have dropped the state's checkpoint references. Cancel the
+                    // stale proactive work once (its checkpoint is content-addressed and can
+                    // redo) and leave the cursor on this victim — the phase retries on a later
+                    // boundary and completes once the pin or reference clears. (observed:
+                    // throwing here escaped to the worker boundary, failed every running
+                    // request via fail_all, and the victim was releasable one boundary later.)
+                    if (proactive_) {
+                        proactive_cancel();
+                        disk_kv_logf('W', "l3-materialize",
+                                     "victim deferred | cancelled in-flight proactive spill "
+                                     "| shared slot=%u", index);
+                    }
+                    ++transaction.pressure_deferred_boundaries;
+                    if (transaction.pressure_deferred_boundaries == 1U ||
+                        (transaction.pressure_deferred_boundaries &
+                         (transaction.pressure_deferred_boundaries - 1U)) == 0U) {
+                        disk_kv_logf('W', "l3-materialize",
+                                     "victim deferred | shared slot=%u not strictly releasable "
+                                     "| deferrals=%u", index,
+                                     transaction.pressure_deferred_boundaries);
+                    }
+                    out.status = runtime::ContextTransactionStatus::InProgress;
+                    return out;
                 }
                 const detail::PhysicalResources released =
                     release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
@@ -7626,6 +7663,29 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
                         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - spill.started).count()));
                 cleanup_owner_spill(spill);
+                // The spill has persisted the victim's pages; the strict release can still
+                // hit transient contention (a proactive spill started earlier pinning aliased
+                // pages, a lane finish not yet settled). Defer to a later boundary instead of
+                // throwing into the worker boundary — same discipline as the shared victims.
+                if (!can_release_continuation_slot_strict(index)) {
+                    if (proactive_) {
+                        proactive_cancel();
+                        disk_kv_logf('W', "l3-materialize",
+                                     "victim deferred | cancelled in-flight proactive spill "
+                                     "| private id=%u", index);
+                    }
+                    ++transaction.pressure_deferred_boundaries;
+                    if (transaction.pressure_deferred_boundaries == 1U ||
+                        (transaction.pressure_deferred_boundaries &
+                         (transaction.pressure_deferred_boundaries - 1U)) == 0U) {
+                        disk_kv_logf('W', "l3-materialize",
+                                     "victim deferred | private id=%u not strictly releasable "
+                                     "| deferrals=%u", index,
+                                     transaction.pressure_deferred_boundaries);
+                    }
+                    out.status = runtime::ContextTransactionStatus::InProgress;
+                    return out;
+                }
                 const PhysicalReleaseResult released =
                     release_materialization_victim(transaction, position);
                 if (released.status != runtime::ConsumeStatus::Consumed ||
@@ -7924,7 +7984,16 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         if (!transaction.seed_lifecycle.is_prepared()) {
             try { NINFER_SEED_STAGE("prepare"); }
             catch (...) { transaction.seed.failing = true; }
-            prepare_sequence(sequence.lane, sequence, transaction);
+            try {
+                prepare_sequence(sequence.lane, sequence, transaction);
+            } catch (const std::logic_error& error) {
+                if (!activation_contention(error)) { throw; }
+                disk_kv_logf('W', "l3-materialize",
+                             "sequence prepare retryable | what=%s", error.what());
+                abort_transaction();
+                out.status = runtime::ContextTransactionStatus::RetryableFailure;
+                return out;
+            }
             out.status = runtime::ContextTransactionStatus::InProgress;
             return out;
         }
@@ -7941,6 +8010,20 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         materialization_ledger_.clear();
         materialization_identity_.clear();
         materialization_prefix_digests_.clear();
+    } catch (const std::logic_error& error) {
+        if (activation_contention(error)) {
+            // The atomic start lost a Device page (or its reservation raced) to pressure that
+            // shifted after the reserve-time revalidation. The start path has already run its
+            // best-effort lane cleanup; close out the transaction cleanly and surface a
+            // retryable 503 for this request only.
+            disk_kv_logf('W', "l3-materialize",
+                         "sequence start retryable | what=%s", error.what());
+            abort_transaction();
+            out.status = runtime::ContextTransactionStatus::RetryableFailure;
+            return out;
+        }
+        release_materialization_staging(transaction);
+        throw;
     } catch (...) {
         release_materialization_staging(transaction);
         throw;
@@ -9554,7 +9637,17 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
                 }
             }
             if (!transaction.shared_index) {
-                throw std::logic_error("shared capture descriptor was not reserved by policy");
+                // A refusal, not an invariant breach: the capture publishes no shared
+                // descriptor this round. Skip the offer the same way the assessment-refusal
+                // path does — the request itself is unaffected — instead of escalating at the
+                // worker boundary.
+                disk_kv_logf('W', "l3-capture",
+                             "shared capture skipped | no free descriptor slot | lane=%u",
+                             transaction.lane);
+                abort_active_capture(transaction);
+                prefill.pending_capture_offer = 0;
+                ++prefill.next_capture;
+                return runtime::ContextTransactionReserveStatus::Aborted;
             }
         }
 
@@ -10098,6 +10191,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         if (cancellation.requested()) { return abort(); }
         for (std::size_t position = 0; position < transaction.shared_pressure.size(); ++position) {
             auto& work                     = transaction.shared_pressure[position];
+            if (work.completed) { continue; }
             const std::uint32_t index      = transaction.shared_victim_indices[position];
             const std::uint64_t generation = transaction.shared_victim_generations[position];
             if (work.option.evicts_continuation) {
@@ -10110,8 +10204,28 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                 const detail::PhysicalResources resident =
                     resident_resources(shared_prefix_states[index]);
                 if (!can_release_shared_prefix_state(index, SharedPrefixSlotRole::Catalogued)) {
-                    throw std::logic_error(
-                        "capture shared pressure victim is not strictly releasable");
+                    // Transient contention, not an invariant break — see the materialization
+                    // HostReleases deferral: a proactive spill started earlier may pin pages
+                    // aliased with the victim, or a lane finish has not settled yet. Cancel
+                    // the stale proactive work once and retry on a later boundary.
+                    if (proactive_) {
+                        proactive_cancel();
+                        disk_kv_logf('W', "l3-capture",
+                                     "victim deferred | cancelled in-flight proactive spill "
+                                     "| shared slot=%u", index);
+                    }
+                    ++transaction.pressure_deferred_boundaries;
+                    if (transaction.pressure_deferred_boundaries == 1U ||
+                        (transaction.pressure_deferred_boundaries &
+                         (transaction.pressure_deferred_boundaries - 1U)) == 0U) {
+                        disk_kv_logf('W', "l3-capture",
+                                     "victim deferred | shared slot=%u not strictly releasable "
+                                     "| deferrals=%u", index,
+                                     transaction.pressure_deferred_boundaries);
+                    }
+                    ActiveCaptureResult deferred;
+                    deferred.status = runtime::ContextTransactionStatus::InProgress;
+                    return deferred;
                 }
                 const detail::PhysicalResources released =
                     release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
@@ -10142,6 +10256,7 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
         }
         for (std::size_t position = 0; position < transaction.pressure.size(); ++position) {
             auto& work                     = transaction.pressure[position];
+            if (work.completed) { continue; }
             const std::uint32_t index      = transaction.victim_indices[position];
             const std::uint64_t generation = transaction.victim_generations[position];
             if (work.option.evicts_continuation) {
@@ -10153,7 +10268,25 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                         "capture private pressure victim changed before release");
                 }
                 if (!can_release_continuation_slot_strict(index)) {
-                    throw std::logic_error("capture private victim is not strictly releasable");
+                    // Same transient-contention deferral as the shared victims above.
+                    if (proactive_) {
+                        proactive_cancel();
+                        disk_kv_logf('W', "l3-capture",
+                                     "victim deferred | cancelled in-flight proactive spill "
+                                     "| private id=%u", index);
+                    }
+                    ++transaction.pressure_deferred_boundaries;
+                    if (transaction.pressure_deferred_boundaries == 1U ||
+                        (transaction.pressure_deferred_boundaries &
+                         (transaction.pressure_deferred_boundaries - 1U)) == 0U) {
+                        disk_kv_logf('W', "l3-capture",
+                                     "victim deferred | private id=%u not strictly releasable "
+                                     "| deferrals=%u", index,
+                                     transaction.pressure_deferred_boundaries);
+                    }
+                    ActiveCaptureResult deferred;
+                    deferred.status = runtime::ContextTransactionStatus::InProgress;
+                    return deferred;
                 }
                 const detail::PhysicalResources resident =
                     resident_resources(continuation_states[index]);

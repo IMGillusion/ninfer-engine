@@ -1748,10 +1748,21 @@ private:
             ns_base_plan += static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t_plan).count());
             const auto t_ih = Clock::now();
-            auto head_inspection = inspect_admission(head);
+            std::optional<ResourceInspection> head_inspection;
+            try {
+                head_inspection.emplace(inspect_admission(head));
+            } catch (...) {
+                // Planning can hit a stale recovery target (a checkpoint priced during base
+                // planning became unavailable before inspection). Fail this one pending
+                // request and keep the loop alive — the same per-candidate discipline as
+                // ensure_base_plan above — instead of escalating at the worker boundary.
+                (void)remove_pending_error(head, std::current_exception());
+                control_progress = true;
+                continue;
+            }
             ns_inspect_head += static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t_ih).count());
-            if (head_inspection.readiness == Readiness::PermanentlyInfeasible) {
+            if (head_inspection->readiness == Readiness::PermanentlyInfeasible) {
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
                               RequestErrorKind::ContextLengthExceeded,
@@ -1759,14 +1770,14 @@ private:
                 control_progress = true;
                 continue;
             }
-            if (head_inspection.readiness == Readiness::Ready ||
-                head_inspection.readiness == Readiness::NeedsTransfer) {
-                if (!head_inspection.choice) {
+            if (head_inspection->readiness == Readiness::Ready ||
+                head_inspection->readiness == Readiness::NeedsTransfer) {
+                if (!head_inspection->choice) {
                     throw std::logic_error("ready resource inspection has no admission choice");
                 }
                 AdmissionGrant grant = scheduler_.grant_head(
-                    head->id, head_inspection.choice->summary().service_work_quanta);
-                return admit_planned_request(head, std::move(*head_inspection.choice),
+                    head->id, head_inspection->choice->summary().service_work_quanta);
+                return admit_planned_request(head, std::move(*head_inspection->choice),
                                              std::move(grant));
             }
 
@@ -1825,10 +1836,19 @@ private:
                     continue;
                 }
                 const auto t_ib = Clock::now();
-                auto candidate_inspection = inspect_admission(candidate);
+                std::optional<ResourceInspection> candidate_inspection;
+                try {
+                    candidate_inspection.emplace(inspect_admission(candidate));
+                } catch (...) {
+                    // Per-candidate discipline: a stale recovery target or planning race
+                    // fails only this candidate's admission attempt.
+                    (void)remove_pending_error(candidate, std::current_exception());
+                    control_progress = true;
+                    continue;
+                }
                 ns_inspect_backfill += static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t_ib).count());
-                if (candidate_inspection.readiness == Readiness::PermanentlyInfeasible) {
+                if (candidate_inspection->readiness == Readiness::PermanentlyInfeasible) {
                     (void)remove_pending_error(
                         candidate, std::make_exception_ptr(RequestError(
                                        RequestErrorKind::ContextLengthExceeded,
@@ -1836,25 +1856,25 @@ private:
                     control_progress = true;
                     continue;
                 }
-                if ((candidate_inspection.readiness != Readiness::Ready &&
-                     candidate_inspection.readiness != Readiness::NeedsTransfer) ||
-                    !candidate_inspection.choice) {
+                if ((candidate_inspection->readiness != Readiness::Ready &&
+                     candidate_inspection->readiness != Readiness::NeedsTransfer) ||
+                    !candidate_inspection->choice) {
                     continue;
                 }
                 const auto t_pv = Clock::now();
                 const auto proof = resources_.prove_persistent_backfill(
-                    *instance_.program, *head->base_plan, *candidate_inspection.choice,
+                    *instance_.program, *head->base_plan, *candidate_inspection->choice,
                     std::span<const SequenceHandle>(persistent_borrowers.data(),
                                                     persistent_borrower_count));
                 ns_prove += static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t_pv).count());
                 if (!proof) { continue; }
-                const RequestPlanSummary& candidate_plan = candidate_inspection.choice->summary();
+                const RequestPlanSummary& candidate_plan = candidate_inspection->choice->summary();
                 auto grant =
                     scheduler_.qualify_backfill(candidate->id, candidate_plan.service_work_quanta,
                                                 active.span(), proof->resource_revision());
                 if (grant) {
-                    return admit_planned_request(candidate, std::move(*candidate_inspection.choice),
+                    return admit_planned_request(candidate, std::move(*candidate_inspection->choice),
                                                  std::move(*grant));
                 }
             }
