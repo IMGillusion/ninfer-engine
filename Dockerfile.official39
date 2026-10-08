@@ -37,6 +37,7 @@ RUN sed -i "s|archive.ubuntu.com|mirrors.ustc.edu.cn|g; s|security.ubuntu.com|mi
         libavutil58 \
         libcurl4t64 \
         libswscale7 \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer
