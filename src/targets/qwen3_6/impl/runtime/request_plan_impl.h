@@ -954,6 +954,15 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             const std::uint32_t E = *best_E;
             plan->reuse_base                     = E;
             plan->summary.reusable_prompt_tokens = E;
+            // A failed disk seed degrades to an honest full recompute, and that recompute
+            // re-splits at every capture/rewrite boundary — MORE prefill steps than the
+            // plain full-prompt chunk count the kept booking projected (observed:
+            // booking 32, recompute 33+ steps → "consumed 2 quanta with 0 remaining" →
+            // fail_all). Book the re-split margin explicitly; a successful seed simply
+            // leaves it unspent.
+            plan->summary.service_work_quanta +=
+                static_cast<std::uint64_t>(plan->capture_groups.size()) +
+                static_cast<std::uint64_t>(prompt.identity.rewrite_execution_frontiers.size()) + 1U;
             if (speculative_backend == SpeculativeBackend::Mtp &&
                 E == plan->summary.prompt_tokens) {
                 // Zero-suffix restore: the prefill takes the sample_from_hidden

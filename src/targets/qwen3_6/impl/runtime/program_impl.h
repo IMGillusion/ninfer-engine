@@ -66,6 +66,23 @@ std::uint32_t l3_seed_spin_ms() {
     return value;
 }
 
+// Queue-side deadline for seed read tickets. A ticket still Pending this long after
+// submission was never dequeued: every bridge worker is wedged in deadline-less store IO
+// on a hung volume, so the dequeued-side deadline (bounded_large_read, 60s) never starts.
+// Expiry is treated as IOFailure and the seed degrades to an honest full recompute —
+// bounded, instead of the sentinel exiting the process at 300s.
+// (observed: phase-0 seed read Pending 300s, l3-stall exit, 77s restart.)
+std::chrono::milliseconds l3_queue_deadline() {
+    static const std::chrono::milliseconds value = []() -> std::chrono::milliseconds {
+        if (const char* s = std::getenv("NINFER_L3_QUEUE_TIMEOUT_MS")) {
+            const long v = std::atol(s);
+            if (v > 0) { return std::chrono::milliseconds(v); }
+        }
+        return std::chrono::milliseconds(60000);
+    }();
+    return value;
+}
+
 std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
     if (!options.max_private_continuations || *options.max_private_continuations == 0) {
         throw std::logic_error("Qwen3.6 context cache private capacity is not normalized");
@@ -3754,13 +3771,20 @@ void ProgramImplCore::spill_dying_owner_pages(SequenceState& sequence) {
     }
     }
 
-void ProgramImplCore::poll_seed_batch(MaterializationTransaction::SeedProgress& progress) noexcept {
+void ProgramImplCore::poll_seed_batch(
+    MaterializationTransaction::SeedProgress& progress,
+    std::chrono::steady_clock::time_point now) noexcept {
     if (progress.batch.empty()) { return; }
     auto aggregate = DiskReadResult::Success;
     for (const auto& ticket : progress.batch) {
-        const auto result = DiskKVBridge::poll(ticket);
+        const auto result = DiskKVBridge::poll(ticket, now, l3_queue_deadline());
         if (result == DiskReadResult::Pending) { return; }   // aggregate stays Pending
         if (result != DiskReadResult::Success) { aggregate = result; }
+    }
+    if (aggregate != DiskReadResult::Success) {
+        // Forensics: an expired ticket means the queue never moved (all workers wedged),
+        // distinct from a real read miss.
+        progress.reason = "kv-read-queue-deadline";
     }
     if (progress.read) { progress.read->result.store(aggregate, std::memory_order_release); }
     progress.batch.clear();
@@ -3797,13 +3821,15 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
                          progress.batch.size());
         }
     }
-    poll_seed_batch(progress);
+    poll_seed_batch(progress, std::chrono::steady_clock::now());
     const auto fail = [&]() {
         progress.failing = true;
         // An accepted CPU borrow is irrevocable. Do not release the lease or
         // owner on an exception until its terminal acquire acknowledgement.
-        poll_seed_batch(progress);
-        if (progress.read && DiskKVBridge::poll(progress.read) == DiskReadResult::Pending) {
+        poll_seed_batch(progress, std::chrono::steady_clock::now());
+        if (progress.read &&
+            DiskKVBridge::poll(progress.read, std::chrono::steady_clock::now(),
+                               l3_queue_deadline()) == DiskReadResult::Pending) {
             return false;
         }
         progress.read.reset();
@@ -3875,10 +3901,16 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
                  state_images->host_layout().image_bytes});
             return false;
         }
-        const auto result = DiskKVBridge::poll(progress.read);
+        const auto now = std::chrono::steady_clock::now();
+        const auto result =
+            DiskKVBridge::poll(progress.read, now, l3_queue_deadline());
         if (result == DiskReadResult::Pending) { return false; }
+        const bool queue_expired = now - progress.read->submitted_at > l3_queue_deadline();
         progress.read.reset();
-        if (result != DiskReadResult::Success) { return fail(); }
+        if (result != DiskReadResult::Success) {
+            progress.reason = queue_expired ? "state-read-queue-deadline" : "state-read";
+            return fail();
+        }
         const auto sid = identity(E);
         NINFER_SEED_SNAPSHOT(sid.lo, sid.hi, sid.tag, sid.frontier,
             host_state_images->view(*l3_state_scratch).data,
@@ -3970,7 +4002,7 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
         // cache that this tier exists to protect. The restore is therefore bounded
         // by the schedule cadence (~160ms per batch, ~4.6s for a 93K prompt) which
         // still beats the 19-26s recompute by 4-5x.
-        poll_seed_batch(progress);
+        poll_seed_batch(progress, std::chrono::steady_clock::now());
         auto result = progress.read ? progress.read->result.load(std::memory_order_acquire)
                                     : DiskReadResult::Success;
         // Optional in-visit wait (NINFER_SEED_SPIN_MS, default 0 = return at once).
@@ -3985,13 +4017,16 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(spin_ms);
             while (result == DiskReadResult::Pending && std::chrono::steady_clock::now() < deadline) {
                 std::this_thread::yield();
-                poll_seed_batch(progress);
+                poll_seed_batch(progress, std::chrono::steady_clock::now());
                 result = progress.read ? progress.read->result.load(std::memory_order_acquire)
                                        : DiskReadResult::Success;
             }
         }
         if (result == DiskReadResult::Pending) { return false; }
-        if (result != DiskReadResult::Success) { progress.reason = "kv-read"; progress.batch_pages = 0; return fail(); }
+        if (result != DiskReadResult::Success) {
+            if (progress.reason == nullptr) { progress.reason = "kv-read"; }
+            progress.batch_pages = 0; return fail();
+        }
         progress.batch_destinations.clear();
         for (std::uint32_t i = 0; i < progress.batch_pages; ++i) {
             progress.batch_destinations.push_back(
@@ -5763,9 +5798,10 @@ void ProgramImplCore::release_materialization_staging(
     // batch's aggregate ticket only advances when poll_seed_batch() runs, so poll
     // it here too - otherwise this loop waits forever on a batch in flight.
     for (;;) {
-        poll_seed_batch(transaction.seed);
+        poll_seed_batch(transaction.seed, std::chrono::steady_clock::now());
         if (!transaction.seed.read ||
-            DiskKVBridge::poll(transaction.seed.read) != DiskReadResult::Pending) { break; }
+            DiskKVBridge::poll(transaction.seed.read, std::chrono::steady_clock::now(),
+                               l3_queue_deadline()) != DiskReadResult::Pending) { break; }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     if (transaction.seed_lifecycle.phase() != SeedLifecycle::Phase::Finalized) {
@@ -7519,7 +7555,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
     // abort path (including shutdown/error cleanup) can return the reservation.
     // poll_seed_batch must run first: the KV batch's aggregate ticket is only
     // advanced there, so a bare poll of it would never observe completion.
-    if (transaction.cancel_pending) { poll_seed_batch(transaction.seed); }
+    if (transaction.cancel_pending) { poll_seed_batch(transaction.seed, std::chrono::steady_clock::now()); }
     if (transaction.cancel_pending &&
         !transaction.seed_lifecycle.cancel_and_drained(transaction.seed.read)) {
         out.status = runtime::ContextTransactionStatus::InProgress;

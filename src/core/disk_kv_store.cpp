@@ -357,16 +357,13 @@ void DiskKVStore::rebuild_from_scan() {
     }
     rebuilt_from_scan_ = true;
     index_dirty_ = true;
-    persist_index_unlocked();
+    flush_index();
 }
 
-void DiskKVStore::persist_index_unlocked() {
-    if (!index_dirty_) { return; }
-    // Atomic publication only: no fsync on the hot path.
-    const std::string path = index_path(opts_.path);
-    const std::string tmp  = path + ".tmp";
-    FILE* f = std::fopen(tmp.c_str(), "wb");
-    if (f == nullptr) { return; }
+void DiskKVStore::serialize_index_unlocked(std::string& blob) {
+    // Caller holds mu_. Serialize the FULL index into memory (header + entries,
+    // ~1-3MB for production geometries): the file write itself happens outside mu_
+    // (see flush_index) so a wedged volume cannot hold the store lock.
     IdxHeader hdr{};
     hdr.magic     = IdxHeader::kMagic;
     hdr.version   = 1;
@@ -374,26 +371,35 @@ void DiskKVStore::persist_index_unlocked() {
     hdr.slot_size = static_cast<std::uint32_t>(slot_bytes());
     hdr.max_slots = max_slots_;
     hdr.clock     = clock_;
-    bool ok = std::fwrite(&hdr, sizeof(hdr), 1, f) == 1;
+    blob.append(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+    IdxEntry r{};
     for (const auto& [id, s] : index_) {
-        IdxEntry r{};
         r.lo = id.lo;
         r.hi = id.hi;
         r.tag = id.tag;
         r.frontier = id.frontier;
         r.slot = s;
-        if (std::fwrite(&r, sizeof(r), 1, f) != 1) { ok = false; break; }
+        blob.append(reinterpret_cast<const char*>(&r), sizeof(r));
     }
+}
+
+bool DiskKVStore::write_index_blob(const std::string& blob) {
+    // Atomic publication only: no fsync on the hot path. A torn index is
+    // recovered by a full header rescan on next open (cheap: slots are
+    // CRC-verified), and the spill worker would otherwise stall behind fsync
+    // latency per page.
+    const std::string path = index_path(opts_.path);
+    const std::string tmp  = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) { return false; }
+    bool ok = std::fwrite(blob.data(), 1, blob.size(), f) == blob.size();
     if (std::fflush(f) != 0) { ok = false; }
     if (std::fclose(f) != 0) { ok = false; }
-    // Deliberately NO fsync on the hot path: a torn index is recovered by a
-    // full header rescan on next open (cheap: slots are CRC-verified), and
-    // the spill worker would otherwise stall behind fsync latency per page.
     if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
         ::unlink(tmp.c_str());
-        return;
+        return false;
     }
-    index_dirty_ = false;
+    return true;
 }
 
 // ---------- internals ----------
@@ -603,9 +609,10 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
         std::memcpy(slot_hdr(slot), &nh, sizeof(Header));
         record_live(id, slot, nh.last_used);
         index_dirty_ = true;
-        // Preserve eager publication for direct users; batch workers opt in.
-        if (!opts_.defer_index_updates) { persist_index_unlocked(); }
     }
+    // Preserve eager publication for direct users; batch workers opt in
+    // (defer_index_updates). The flush writes the index OUTSIDE mu_.
+    if (!opts_.defer_index_updates) { flush_index(); }
     if (trace) {
         disk_kv_logf('D', "l3-store", "upsert done | id=%llu/%llu | took=%.3fs",
                      static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi),
@@ -620,6 +627,31 @@ bool DiskKVStore::read_page(const DiskKVIdentity& id, std::span<std::byte> dst) 
 
 DiskReadResult DiskKVStore::read_page_result(const DiskKVIdentity& id, std::span<std::byte> dst) {
     if (dst.size() != opts_.slot_size) { return DiskReadResult::BadSize; }
+    // Test-only wedge injection (NINFER_TEST_STORE_IO_HANG_READS ×
+    // NINFER_TEST_STORE_IO_HANG_S): hang the first N small (<8MB) reads so the
+    // queue-side ticket deadline can be exercised deterministically — the 8 workers
+    // wedge exactly like a hung volume, later tickets queue behind them, and the seed
+    // must degrade to an honest recompute instead of wedging. Zero cost when unset.
+    {
+        static const std::int64_t hang_reads = [] {
+            const char* s = std::getenv("NINFER_TEST_STORE_IO_HANG_READS");
+            return s != nullptr ? std::atoll(s) : 0;
+        }();
+        static const std::chrono::seconds hang_s = [] {
+            const char* s = std::getenv("NINFER_TEST_STORE_IO_HANG_S");
+            return std::chrono::seconds(s != nullptr ? std::atoll(s) : 0);
+        }();
+        static std::atomic<std::int64_t> budget{hang_reads};
+        if (hang_reads > 0 && hang_s.count() > 0 && dst.size() < (std::size_t{8} << 20)) {
+            const std::int64_t taken = budget.fetch_sub(1, std::memory_order_relaxed);
+            if (taken > 0) {
+                disk_kv_logf('W', "l3-store",
+                             "TEST IO HANG | sleeping %llds | budget was=%lld bytes=%zu",
+                             static_cast<long long>(hang_s.count()), taken, dst.size());
+                std::this_thread::sleep_for(hang_s);
+            }
+        }
+    }
     std::size_t off = 0;
     std::uint32_t slot = 0;
     std::uint64_t expected_crc = 0;
@@ -680,8 +712,23 @@ bool DiskKVStore::contains(const DiskKVIdentity& id) const {
 }
 
 void DiskKVStore::flush_index() {
-    std::lock_guard<std::mutex> lock(mu_);
-    persist_index_unlocked();
+    // Snapshot under mu_, file write OUTSIDE mu_ (serialized by index_io_mu_ across the
+    // whole cycle so a slower writer can never overwrite a newer snapshot with an older
+    // one). Holding mu_ across the index rewrite meant one hung fopen/rename on a wedged
+    // volume froze every worker's next mu_ section — the entire store — for as long as
+    // the volume stayed stuck. mu_ now only covers the ~1-3MB in-memory serialization.
+    std::lock_guard<std::mutex> io(index_io_mu_);
+    std::string blob;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!index_dirty_) { return; }
+        serialize_index_unlocked(blob);
+        index_dirty_ = false;
+    }
+    if (!write_index_blob(blob)) {
+        std::lock_guard<std::mutex> lock(mu_);
+        index_dirty_ = true;   // publish failed: retry on the next flush
+    }
 }
 
 bool DiskKVStore::touch(const DiskKVIdentity& id) {
@@ -709,33 +756,37 @@ bool DiskKVStore::touch_lru(const DiskKVIdentity& id) {
 }
 
 bool DiskKVStore::evict(const DiskKVIdentity& id) {
-    std::lock_guard<std::mutex> lock(mu_);
-    if (protected_identity(id)) return false;
-    const auto it = index_.find(id);
-    if (it == index_.end()) { return false; }
-    const std::uint32_t slot = it->second;
-    if (slot < readers_.size() && readers_[slot] != 0) { return false; }   // mid-read
-    index_.erase(it);
-    zero_slot(slot);
-    release_slot(slot);
-    index_dirty_ = true;
-    persist_index_unlocked();
+    bool dirty = false;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (protected_identity(id)) return false;
+        const auto it = index_.find(id);
+        if (it == index_.end()) { return false; }
+        const std::uint32_t slot = it->second;
+        if (slot < readers_.size() && readers_[slot] != 0) { return false; }   // mid-read
+        index_.erase(it);
+        zero_slot(slot);
+        release_slot(slot);
+        index_dirty_ = true;
+        dirty = true;
+    }
+    if (dirty) { flush_index(); }
     return true;
 }
 
 std::vector<DiskKVIdentity> DiskKVStore::evict_until_free(std::uint32_t free) {
-    std::lock_guard<std::mutex> lock(mu_);
     std::vector<DiskKVIdentity> gone;
-    // live + free == capacity normally; requests above capacity saturate.
-    while (free_slots_.size() < free && !index_.empty()) {
-        auto v = evict_one_lru();
-        if (!v.has_value()) { break; }
-        gone.push_back(v->id);
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        // live + free == capacity normally; requests above capacity saturate.
+        while (free_slots_.size() < free && !index_.empty()) {
+            auto v = evict_one_lru();
+            if (!v.has_value()) { break; }
+            gone.push_back(v->id);
+        }
+        if (!gone.empty()) { index_dirty_ = true; }
     }
-    if (!gone.empty()) {
-        index_dirty_ = true;
-        persist_index_unlocked();
-    }
+    if (!gone.empty()) { flush_index(); }
     return gone;
 }
 

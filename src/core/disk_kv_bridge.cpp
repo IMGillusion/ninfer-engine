@@ -643,15 +643,12 @@ bool DiskKVBridge::spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
             return true;  // already restorable (dedupe)
         }
     }
-    if (bytes.size() >= kLargeIOBytes) { return bounded_sync_write(id, kind, bytes); }
-    std::vector<std::uint32_t> evicted;
-    if (!f.store->upsert_page(id, bytes, &evicted)) { return false; }
-    f.store->flush_index();
-    std::lock_guard<std::mutex> lock(mu_);
-    stats_.spills += 1;
-    stats_.spill_bytes += bytes.size();
-    stats_.evicted_slots += evicted.size();
-    return true;
+    // ALL payloads take the bounded path. The old small-payload shortcut called
+    // upsert_page directly on the calling (engine) thread with no deadline, so a wedged
+    // volume would hold the engine forever — and the seam write runs per tool-loop
+    // round, making it a high-frequency exposure. bounded_sync_write handles any size
+    // (transient thread, 30s deadline, payload copy, abandon accounting).
+    return bounded_sync_write(id, kind, bytes);
 }
 
 bool DiskKVBridge::drop_page(const DiskKVIdentity& id, DiskKVKind kind) {

@@ -197,8 +197,10 @@ private:
     bool load_index();                    // fast path; false -> caller rebuilds
     void rebuild_from_scan();             // slow path: scan all slot headers
     /** Rewrite the index file atomically (tmp+rename, no fsync on hot path).
-     *  A torn index is safe: next open falls back to a header rescan. */
-    void persist_index_unlocked();
+     *  A torn index is safe: next open falls back to a header rescan. The
+     *  file write runs outside mu_ (index_io_mu_ serializes writers). */
+    void serialize_index_unlocked(std::string& blob);
+    [[nodiscard]] bool write_index_blob(const std::string& blob);
     std::uint64_t bump_clock() noexcept;
     void zero_slot(std::uint32_t slot);
     void record_live(const DiskKVIdentity& id, std::uint32_t slot, std::uint64_t last_used);
@@ -241,6 +243,11 @@ private:
     std::uint64_t clock_     = 0;
     bool         rebuilt_from_scan_ = false;
     bool         index_dirty_ = false; // protected by mu_ after construction
+    // Serializes index file WRITERS across the whole snapshot+write cycle. Never held
+    // together with mu_: the file write runs OUTSIDE mu_ so a wedged volume cannot
+    // freeze every worker's next short mu_ section (observed: flush_index held mu_
+    // across the full index rewrite; one hung rename froze the entire store).
+    mutable std::mutex index_io_mu_;
 
     std::unordered_map<DiskKVIdentity, std::uint32_t, DiskKVIdentityHash> index_;
     // Per-slot in-flight READ count (protected by mu_). Read payloads are

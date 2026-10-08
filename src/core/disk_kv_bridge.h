@@ -88,6 +88,12 @@ struct SpillJob {
 
 struct ReadCompletion {
     std::atomic<DiskReadResult> result{DiskReadResult::Pending};
+    // Set once at ticket creation. A Pending ticket older than the queue deadline means
+    // no worker ever dequeued it (all workers wedged in deadline-less store IO): the
+    // engine treats that as IOFailure and recomputes honestly instead of waiting forever
+    // — the deadline on the dequeued side (bounded_large_read) never starts for a ticket
+    // that is never dequeued. (observed: phase-0 seed read Pending for 300s, exit 75.)
+    std::chrono::steady_clock::time_point submitted_at{std::chrono::steady_clock::now()};
 };
 using ReadTicket = std::shared_ptr<ReadCompletion>;
 
@@ -205,6 +211,22 @@ public:
     ReadTicket try_read_priority(const DiskKVIdentity& id, DiskKVKind kind, std::span<std::byte> dst);
     static DiskReadResult poll(const ReadTicket& ticket) noexcept {
         return ticket->result.load(std::memory_order_acquire);
+    }
+    // Queue-side deadline: a ticket still Pending after `queue_deadline` since submission
+    // was never dequeued by any worker (every worker wedged in deadline-less store IO on a
+    // hung volume). The dequeued-side deadline (bounded_large_read, 60s) cannot cover this
+    // — it only starts once a worker picks the job up. Treat the expiry as IOFailure so the
+    // engine degrades to an honest full recompute instead of waiting forever.
+    // (observed: phase-0 seed read Pending for 300s, sentinel exit 75.)
+    static DiskReadResult poll(const ReadTicket& ticket,
+                               std::chrono::steady_clock::time_point now,
+                               std::chrono::milliseconds queue_deadline) noexcept {
+        const DiskReadResult result = ticket->result.load(std::memory_order_acquire);
+        if (result == DiskReadResult::Pending &&
+            now - ticket->submitted_at > queue_deadline) {
+            return DiskReadResult::IOFailure;
+        }
+        return result;
     }
     void wait_idle();
 

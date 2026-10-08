@@ -1218,7 +1218,8 @@ private:
     // seed contract polls. MUST run before ANY poll of transaction.seed.read: the
     // aggregate is only advanced here, so a cancellation that polls the aggregate
     // without this would never observe completion and would hang the transaction.
-    void poll_seed_batch(MaterializationTransaction::SeedProgress& progress) noexcept;
+    void poll_seed_batch(MaterializationTransaction::SeedProgress& progress,
+                         std::chrono::steady_clock::time_point now) noexcept;
     void start_sequence(std::uint32_t lane, SequenceState& sequence,
                         MaterializationTransaction& transaction);
     void release_materialization_staging(MaterializationTransaction& transaction) noexcept;
