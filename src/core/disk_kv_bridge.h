@@ -209,6 +209,13 @@ public:
     ReadTicket try_read(const DiskKVIdentity& id, DiskKVKind kind, std::span<std::byte> dst);
     // Maintenance lane for the read-back that validates a prepared closure.
     ReadTicket try_read_priority(const DiskKVIdentity& id, DiskKVKind kind, std::span<std::byte> dst);
+    // Volume circuit breaker: tripped when a queue-side deadline expires (workers
+    // wedged on a hung volume). While tripped, all NEW submissions are rejected
+    // instantly (null / false) so callers degrade to recompute instead of piling
+    // more IO behind the wedge; after the window the breaker auto-closes (lazy,
+    // on the next check) and submissions resume.
+    void trip_volume_breaker(std::chrono::milliseconds window) noexcept;
+    [[nodiscard]] bool volume_breaker_tripped() const noexcept;
     static DiskReadResult poll(const ReadTicket& ticket) noexcept {
         return ticket->result.load(std::memory_order_acquire);
     }
@@ -342,6 +349,9 @@ private:
     static constexpr std::size_t kLargeIOBytes = 8U << 20;
     static constexpr std::uint32_t kMaxAbandonedIO = 16;
     std::atomic<std::uint32_t> abandoned_ios_{0};
+    // Volume circuit breaker: steady-clock ticks (time_since_epoch count) of the
+    // trip deadline, 0 = closed. Single atomic, lock-free check on every submission.
+    std::atomic<std::int64_t> breaker_until_ticks_{0};
 };
 
 } // namespace ninfer

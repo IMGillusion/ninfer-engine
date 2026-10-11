@@ -72,13 +72,21 @@ std::uint32_t l3_seed_spin_ms() {
 // Expiry is treated as IOFailure and the seed degrades to an honest full recompute —
 // bounded, instead of the sentinel exiting the process at 300s.
 // (observed: phase-0 seed read Pending 300s, l3-stall exit, 77s restart.)
+// Queue-side deadline for seed read tickets. A ticket still Pending this long after
+// submission was never dequeued: every bridge worker is wedged in deadline-less store IO
+// on a hung volume, so the dequeued-side deadline (bounded_large_read) never starts.
+// Expiry is treated as IOFailure and the seed degrades to an honest full recompute —
+// bounded, instead of the sentinel exiting the process at 300s.
+// (observed: phase-0 seed read Pending 300s, l3-stall exit, 77s restart.)
+// 30s default: a healthy seed completes in well under 3s (2.5GB/s measured), so 30s is
+// 10x headroom — production policy is fail-fast-to-recompute, not wait-it-out.
 std::chrono::milliseconds l3_queue_deadline() {
     static const std::chrono::milliseconds value = []() -> std::chrono::milliseconds {
         if (const char* s = std::getenv("NINFER_L3_QUEUE_TIMEOUT_MS")) {
             const long v = std::atol(s);
             if (v > 0) { return std::chrono::milliseconds(v); }
         }
-        return std::chrono::milliseconds(60000);
+        return std::chrono::milliseconds(30000);
     }();
     return value;
 }
@@ -3864,6 +3872,29 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
         return true;
     };
     if (progress.failing) { return fail(); }
+    // Volume circuit breaker + submission-livelock deadline: with nothing in flight
+    // (no state read, no open batch) past the queue deadline — or with the breaker
+    // tripped by an earlier expiry — the volume is wedged and further submission
+    // attempts would just spin. Degrade to an honest full recompute immediately
+    // instead. (observed: phase-0 resubmit livelock for 210s on a wedged volume.)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const bool nothing_in_flight = !progress.read && progress.batch.empty() &&
+                                       progress.batch_pages == 0;
+        if (progress.phase < 3 && nothing_in_flight &&
+            (now - progress.started > l3_queue_deadline() ||
+             (disk_kv != nullptr && disk_kv->volume_breaker_tripped()))) {
+            if (disk_kv != nullptr && disk_kv->volume_breaker_tripped()) {
+                progress.reason = "volume-breaker";
+            } else {
+                progress.reason = "seed-submit-deadline";
+                if (disk_kv != nullptr) {
+                    disk_kv->trip_volume_breaker(std::chrono::seconds(30));
+                }
+            }
+            return fail();
+        }
+    }
     try {
     NINFER_SEED_STAGE("progress");
     const auto E = transaction.l3_restore_frontier.value_or(0);

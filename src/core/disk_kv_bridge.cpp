@@ -108,6 +108,30 @@ DiskKVBridge::~DiskKVBridge() {
     }
 }
 
+void DiskKVBridge::trip_volume_breaker(std::chrono::milliseconds window) noexcept {
+    // Volume circuit breaker: tripped by the engine when a queue-side deadline
+    // expires (submissions piling up behind workers wedged in deadline-less IO on
+    // a hung volume). While tripped, new submissions are rejected instantly so
+    // seeds fail fast to recompute; the window closes lazily on the next check
+    // and submissions resume — a still-wedged volume simply re-trips.
+    const auto ticks =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            (std::chrono::steady_clock::now() + window).time_since_epoch()).count();
+    breaker_until_ticks_.store(ticks, std::memory_order_release);
+    disk_kv_logf('W', "l3-bridge",
+                 "volume breaker TRIPPED | window=%lldms | submissions rejected until close",
+                 static_cast<long long>(window.count()));
+}
+
+bool DiskKVBridge::volume_breaker_tripped() const noexcept {
+    const auto until = breaker_until_ticks_.load(std::memory_order_acquire);
+    if (until == 0) { return false; }
+    const auto now =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    return now < until;
+}
+
 void DiskKVBridge::wait_idle() {
     {
         std::unique_lock<std::mutex> lock(qmu_);
@@ -282,6 +306,7 @@ bool DiskKVBridge::spill_page_wait(const DiskKVIdentity& id, DiskKVKind kind,
 
 ReadTicket DiskKVBridge::try_read(const DiskKVIdentity& id, DiskKVKind kind,
                                   std::span<std::byte> dst) {
+    if (volume_breaker_tripped()) { return {}; }   // volume wedged: reject submission
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
     if (!lock || quit_ ||
         queue_.size() + priority_queue_.size() + in_flight_ >= kQueueCap) {
@@ -519,6 +544,7 @@ SpillTicket DiskKVBridge::try_submit_owned_priority(const DiskKVIdentity& id, Di
 
 ReadTicket DiskKVBridge::try_read_priority(const DiskKVIdentity& id, DiskKVKind kind,
                                            std::span<std::byte> dst) {
+    if (volume_breaker_tripped()) { return {}; }   // volume wedged: reject submission
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
     if (!lock || quit_ || queue_.size() + priority_queue_.size() + in_flight_ >= kQueueCap) { return {}; }
     auto ticket = std::make_shared<ReadCompletion>();
@@ -634,6 +660,15 @@ bool DiskKVBridge::bounded_sync_write(const DiskKVIdentity& id, DiskKVKind kind,
 bool DiskKVBridge::spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
                                    std::span<const std::byte> bytes) {
     if (!enabled_ || kind_index(kind) >= std::size(families_)) { return false; }
+    if (volume_breaker_tripped()) {
+        // Volume wedged: degrade the (best-effort) synchronous write at once instead
+        // of parking the caller for the bounded-write window.
+        disk_kv_logf('W', "l3-bridge",
+                     "sync write rejected | volume breaker tripped | id=%llu/%llu",
+                     static_cast<unsigned long long>(id.lo),
+                     static_cast<unsigned long long>(id.hi));
+        return false;
+    }
     const Family& f = family(kind);
     if (f.store == nullptr || bytes.size() != f.stride) { return false; }
     {

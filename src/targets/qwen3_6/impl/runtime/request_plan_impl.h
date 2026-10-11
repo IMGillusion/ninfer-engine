@@ -1549,6 +1549,23 @@ void ProgramImplCore::select_shared_captures(AdmissionCandidate& candidate,
     plan.summary.service_work_quanta =
         projected_service_work(plan.summary, plan.reuse_base, prefill_chunk, prefill_splits,
                                plan.capture_groups, prompt.identity.rewrite_execution_frontiers);
+    // A probe-promoted Root candidate keeps a full-prompt booking so a failed disk
+    // seed can afford the honest full recompute. This shared-capture reprojection
+    // would erase it down to a suffix projection; keep the full recompute as the
+    // floor (with re-split margin). A successful seed simply leaves it unspent.
+    // (observed: suffix reprojection after promotion -> booking ~3 quanta -> the
+    // degraded-seed recompute consumed 4 -> fail_all.)
+    if (plan.reuse == ReusePath::Root && plan.reuse_base != 0) {
+        const std::uint64_t full_recompute_floor =
+            projected_service_work(plan.summary, 0, prefill_chunk, prefill_splits,
+                                   plan.capture_groups,
+                                   prompt.identity.rewrite_execution_frontiers) +
+            static_cast<std::uint64_t>(plan.capture_groups.size()) +
+            static_cast<std::uint64_t>(prompt.identity.rewrite_execution_frontiers.size()) + 1U;
+        if (plan.summary.service_work_quanta < full_recompute_floor) {
+            plan.summary.service_work_quanta = full_recompute_floor;
+        }
+    }
     std::uint64_t vision_items   = 0;
     std::uint64_t vision_patches = 0;
     if (plan.vision) {
