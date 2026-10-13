@@ -7498,7 +7498,13 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         }
         out.victims = std::move(transaction.pressure_results);
     };
-    const auto complete_source_acknowledgement = [&](bool published) {
+    // Tolerant mode (abort/RetryableFailure close-out): a pressure-shifted source
+    // entry may no longer match its claim. Skipping the fill is safe there — the
+    // manager's rollback/restore path (restore_unreported_materialization) recovers
+    // the claimed entry unconditionally, and a RetryableFailure without a source
+    // acknowledgement is a documented legal shape. Strict mode (publish) keeps the
+    // invariant throws.
+    const auto complete_source_acknowledgement = [&](bool published, bool tolerant = false) {
         if (!transaction.has_source) { return; }
         if (published && transaction.source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
             out.source.emplace(MaterializationSourceResult{
@@ -7510,26 +7516,49 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
             continuation_slots[transaction.source_index].role != ContinuationSlotRole::Catalogued ||
             continuation_slots[transaction.source_index].generation !=
                 transaction.source_generation) {
+            if (tolerant) {
+                disk_kv_logf('W', "l3-materialize",
+                             "source acknowledgement skipped | retained source unavailable "
+                             "| tolerant abort close-out");
+                return;
+            }
             throw std::logic_error("retained materialization source is unavailable");
         }
         SequenceState& source = continuation_states[transaction.source_index];
         if (!transaction.source_result) {
+            if (tolerant) {
+                disk_kv_logf('W', "l3-materialize",
+                             "source acknowledgement skipped | backing not reserved");
+                return;
+            }
             throw std::logic_error("materialization source backing was not reserved");
         }
         retain_private_result(*transaction.source_result, source);
         out.source.emplace(std::move(*transaction.source_result));
     };
-    const auto complete_shared_source_acknowledgement = [&](bool published) {
+    const auto complete_shared_source_acknowledgement = [&](bool published,
+                                                            bool tolerant = false) {
         if (!transaction.has_shared_source) { return; }
         if (transaction.shared_source_index >= shared_prefix_capacity ||
             shared_prefix_slots[transaction.shared_source_index].role !=
                 SharedPrefixSlotRole::Catalogued ||
             shared_prefix_slots[transaction.shared_source_index].generation !=
                 transaction.shared_source_generation) {
+            if (tolerant) {
+                disk_kv_logf('W', "l3-materialize",
+                             "shared source acknowledgement skipped | retained source "
+                             "unavailable | tolerant abort close-out");
+                return;
+            }
             throw std::logic_error("retained materialization shared source is unavailable");
         }
         const SharedPrefixState& source = shared_prefix_states[transaction.shared_source_index];
         if (!transaction.shared_source_result) {
+            if (tolerant) {
+                disk_kv_logf('W', "l3-materialize",
+                             "shared source acknowledgement skipped | backing not reserved");
+                return;
+            }
             throw std::logic_error("materialization shared-source backing was not reserved");
         }
         transaction.shared_source_result->final_summary = shared_prefix_summary(source);
@@ -7563,8 +7592,13 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         out.status                = runtime::ContextTransactionStatus::Aborted;
         out.transfer_observations = std::move(transaction.transfer_observations);
         out.operations            = transaction.operations;
-        complete_source_acknowledgement(false);
-        complete_shared_source_acknowledgement(false);
+        // Tolerant close-out: the abort itself runs from pressure-shifted contexts
+        // (activation contention, volume wedges) where the retained-source checks
+        // can legitimately fail; the manager's unconditional restore covers the
+        // claimed entries, and skipping the fill is a documented RetryableFailure
+        // shape. A throw here would escape the degrade path into fail_all.
+        complete_source_acknowledgement(false, /*tolerant=*/true);
+        complete_shared_source_acknowledgement(false, /*tolerant=*/true);
         complete_victim_acknowledgement();
         complete_shared_victim_acknowledgement();
     };

@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <optional>
 #include <span>
@@ -577,9 +578,23 @@ public:
             }
         }
 
-        std::optional<Choice> selected =
-            plan_materialization(program, prompt, base, *destination, candidates, publication_order,
-                                 planning_started, provisional_demand);
+        std::optional<Choice> selected;
+        try {
+            if (auto planned =
+                    plan_materialization(program, prompt, base, *destination, candidates,
+                                         publication_order, planning_started, provisional_demand)) {
+                selected.emplace(std::move(*planned));
+            }
+        } catch (const std::exception& e) {
+            // Planning (search/assess/seal) is pure computation over the catalog — a
+            // throw here (observed: pressure-target seal failure under state drift,
+            // 10-13 21:01 ×7) means this admission attempt cannot produce a plan.
+            // Degrade to TemporarilyBlocked so the request stays pending and retries,
+            // instead of escaping to the worker boundary and failing every running
+            // request. Nothing to roll back: the catalog is only mutated at reserve.
+            std::fprintf(stderr, "[admit] planning failed: %s\n", e.what());
+            return {.readiness = Readiness::TemporarilyBlocked};
+        }
         if (!selected) { return {.readiness = Readiness::TemporarilyBlocked}; }
         return {
             .readiness = selected->needs_transfer() ? Readiness::NeedsTransfer : Readiness::Ready,
