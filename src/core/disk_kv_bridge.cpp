@@ -61,6 +61,12 @@ DiskKVBridge::DiskKVBridge(Options opts) : opts_(std::move(opts)) {
     const std::size_t total = opts_.capacity_bytes;
     const std::uint32_t main_share    = opts_.backend_page_stride ? 65U : 75U;
     const std::uint32_t backend_share = opts_.backend_page_stride ? 10U : 0U;
+    // State images churn hard on multi-session bots (every round of every chat
+    // checkpoints one ~146MiB image); the derived 25% (110 slots on a 64G budget)
+    // evicted active chains' states within the hour (observed 10-13: probe rejects
+    // at the state gate, chain falls back to the shared head). +12 shares grows
+    // the state family to ~37% (~165 slots) without touching main/backend, whose
+    // budgets — and therefore on-disk geometries — stay byte-identical.
     const std::uint32_t main_denom    = 100U;
     make_family(DiskKVKind::MainKV, opts_.main_page_stride,
                 family_budget(total, opts_.main_page_stride, main_share, main_denom));
@@ -70,7 +76,8 @@ DiskKVBridge::DiskKVBridge(Options opts) : opts_(std::move(opts)) {
     // state). Give them a slice big enough to hold several, so a restarted
     // multi-turn session can restore its recurrent state at a shared frontier.
     make_family(DiskKVKind::StateImage, opts_.state_page_stride,
-                family_budget(total, opts_.state_page_stride, 100U - main_share - backend_share, 100U));
+                family_budget(total, opts_.state_page_stride,
+                              100U - main_share - backend_share + 12U, 100U));
     enabled_ = families_[0].store != nullptr;
     if (!enabled_) {
         throw std::invalid_argument("disk kv bridge budget too small for one main page");
