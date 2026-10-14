@@ -5729,12 +5729,12 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
         // in plan.summary.reusable_prompt_tokens. Mirror it into the transaction
         // so materialization seeds [0,E) from disk; if it fails, the prefill
         // replays [0,E) unreported and the admission contract still holds.
-        if (disk_kv != nullptr && request_plan.reuse == ReusePath::Root) {
-            if (disk_kv_restore &&
-                (speculative_backend == SpeculativeBackend::None ||
-                 speculative_backend == SpeculativeBackend::Mtp) &&
-                disk_kv->slot_count(DiskKVKind::StateImage) != 0 &&
-                request_plan.reuse_base != 0 &&
+        std::uint32_t prefill_probe_anchor = 0;
+        if (disk_kv != nullptr && disk_kv_restore &&
+            (speculative_backend == SpeculativeBackend::None ||
+             speculative_backend == SpeculativeBackend::Mtp) &&
+            disk_kv->slot_count(DiskKVKind::StateImage) != 0) {
+            if (request_plan.reuse == ReusePath::Root && request_plan.reuse_base != 0 &&
                 request_plan.reuse_base <= request_plan.summary.prompt_tokens) {
                 transaction.l3_restore_frontier = request_plan.reuse_base;
             }
@@ -5761,6 +5761,17 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
             const std::uint32_t hit_tokens =
                 static_cast<std::uint32_t>(hit_pages * static_cast<std::size_t>(kPagedKVPageSize));
             disk_kv->record_probe(prompt_tokens, hit_tokens);
+            // Probe-depth anchor: the page walk may run past the authorized restore
+            // base (pages persisted by earlier rounds) with no state anchor at or
+            // below the matched depth, pinning the round to an older boundary. Flag
+            // the matched depth for a seam anchor so the chain's authorized depth
+            // grows round over round. Restore needs a state at or below the page
+            // chain end, so anchoring exactly at the matched (page-aligned) depth
+            // makes the full matched prefix harvestable.
+            if (hit_tokens >= 16384 && hit_tokens > request_plan.reuse_base &&
+                hit_tokens < prompt_tokens) {
+                prefill_probe_anchor = hit_tokens;
+            }
         }
 
         const std::uint32_t initial_mtp_extent =
@@ -5784,6 +5795,7 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
                                       ? 0U : request_plan.reuse_base,
             .cursor             = request_plan.reuse == ReusePath::Root
                                       ? 0U : request_plan.reuse_base,
+            .probe_anchor_frontier = prefill_probe_anchor,
             .prompt_tokens      = prompt_tokens,
             .initial_mtp_extent = initial_mtp_extent,
             .elapsed_seconds    = 0.0,
@@ -13514,6 +13526,10 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                     (!split_frontier || *rewrite_split < *split_frontier)) {
                     split_frontier = *rewrite_split;
                 }
+                if (staged.probe_anchor_frontier > staged.cursor &&
+                    (!split_frontier || staged.probe_anchor_frontier < *split_frontier)) {
+                    split_frontier = staged.probe_anchor_frontier;
+                }
                 schedule::PrefillChunkResult result;
                 timing.pause();
                 if (staged.vision) {
@@ -13568,7 +13584,10 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 const bool preopener_seam =
                     staged.prompt.identity.pre_opener_frontier != 0 &&
                     staged.cursor == staged.prompt.identity.pre_opener_frontier;
-                if ((rewrite_seam || preopener_seam) &&
+                const bool probe_seam =
+                    staged.probe_anchor_frontier != 0 &&
+                    staged.cursor == staged.probe_anchor_frontier;
+                if ((rewrite_seam || preopener_seam || probe_seam) &&
                     disk_kv != nullptr &&
                     l3_state_scratch && host_state_images && text_kv_pages && !staged.vision &&
                     !staged.prompt.has_media() && speculative_backend != SpeculativeBackend::DFlash &&
@@ -13608,7 +13627,9 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                     std::span<const std::byte>(view.data, stride));
                                 disk_kv_logf('I', "l3-seam",
                                              "anchor written | kind=%s frontier=%u digest=%016llx%016llx",
-                                             preopener_seam ? "preopener" : "rewrite",
+                                             probe_seam       ? "probe"
+                                             : preopener_seam ? "preopener"
+                                                              : "rewrite",
                                              staged.cursor,
                                              (unsigned long long)seam_digest[0],
                                              (unsigned long long)seam_digest[1]);
@@ -13687,7 +13708,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                     id, kind,
                                     std::span<const std::byte>(destination.data(), stride));
                             };
-                        if (preopener_seam && sequence.kv) {
+                        if ((preopener_seam || probe_seam) && sequence.kv) {
                             const std::uint32_t page_size =
                                 static_cast<std::uint32_t>(kPagedKVPageSize);
                             const std::uint32_t begin_page = staged.base / page_size;

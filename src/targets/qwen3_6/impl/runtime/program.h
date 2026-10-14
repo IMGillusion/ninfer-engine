@@ -494,6 +494,15 @@ struct RequestControl {
         // [advertised_base, cursor) unreported, so the engine-visible contract
         // (suffix tokens = prompt_tokens - advertised_base) stays exact.
         std::uint32_t advertised_base       = 0;
+        // Disk probe-depth anchor: the deepest frontier the admission L3 page walk
+        // matched this round that no state anchor authorizes yet. Client behaviors
+        // that rewrite the conversation tail (per-turn tool/notification blocks
+        // inserted before the final user message) keep the page chain valid past
+        // the authorized restore base but starve it of anchors, pinning every
+        // round's hit to an old boundary. The chunker splits at this frontier and
+        // the seam block persists a state image there, so the next round restores
+        // at the matched depth and the chain's authorized depth grows each round.
+        std::uint32_t probe_anchor_frontier = 0;
         std::uint32_t prompt_tokens         = 0;
         std::uint32_t initial_mtp_extent    = 0;
         double elapsed_seconds              = 0.0;
