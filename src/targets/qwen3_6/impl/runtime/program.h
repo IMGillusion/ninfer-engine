@@ -35,8 +35,10 @@
 #include <array>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -726,6 +728,43 @@ public:
     // of host KV pages that are losing their last host replica under pressure;
     // a later re-admission restores them from disk instead of re-prefilling.
     std::unique_ptr<DiskKVBridge> disk_kv;
+    // Seam-anchor retention. Identities this process persisted as preopener/probe
+    // seam states. The supersede sweep erases ONLY identities from this table:
+    // proactive checkpoint states (the shared-candidate lifeblood) and anchors
+    // written before this process started are invisible to it and age out through
+    // plain LRU. Per chain — recognized by the anchor's digest sitting on the
+    // current request's prefix — the newest kSeamKeepAnchors anchors of each kind
+    // survive and older ones are dropped, so an active session holds a fixed
+    // handful of states instead of growing one set per round. Two rounds of
+    // history tolerate a client retry or a fork from the previous round without
+    // a cache miss.
+    struct SeamAnchorKey {
+        std::uint64_t lo = 0;
+        std::uint64_t hi = 0;
+        std::uint32_t frontier = 0;
+        bool operator==(const SeamAnchorKey&) const noexcept = default;
+    };
+    struct SeamAnchorKeyHash {
+        std::size_t operator()(const SeamAnchorKey& k) const noexcept {
+            const std::size_t h1 = std::hash<std::uint64_t>{}(k.lo);
+            const std::size_t h2 = std::hash<std::uint64_t>{}(k.hi);
+            const std::size_t h3 = std::hash<std::uint32_t>{}(k.frontier);
+            return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2)) ^
+                   (h3 + 0x9e3779b97f4a7c15ULL + (h2 << 6) + (h2 >> 2));
+        }
+    };
+    struct SeamAnchorTrack {
+        bool preopener = false;
+        std::uint64_t seq = 0;
+    };
+    std::mutex seam_track_mu_;
+    std::unordered_map<SeamAnchorKey, SeamAnchorTrack, SeamAnchorKeyHash> seam_track_;
+    std::uint64_t seam_track_seq_ = 0;
+    static constexpr std::uint32_t kSeamKeepAnchors = 2;
+    static constexpr std::size_t kSeamTrackCapacity = 4096;
+    void sweep_seam_anchors(DiskKVBridge& bridge, bool preopener, std::uint32_t frontier,
+                            const std::array<std::uint64_t, 2>& digest,
+                            const qwen3_6::detail::PrefixShortlistDigests& prefix_digests);
     struct HostPrewriteCandidate {
         std::uint32_t owner=0, page=0;
         std::uint64_t generation=0, epoch=0;

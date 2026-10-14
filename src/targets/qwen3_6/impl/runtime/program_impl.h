@@ -13327,6 +13327,65 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
                                     {minimum_count, maximum_count});
 }
 
+// Retain, per chain and per kind, the newest kSeamKeepAnchors seam anchors and
+// erase the older prefix-contained ones. A tracked identity belongs to this
+// chain when its digest equals the current request's prefix digest at the same
+// frontier — the engine is session-blind, and this is exactly the restore-match
+// condition, so "same chain" needs no session identity. Erasure goes through
+// the store's evict, which honors admission-protected keys and in-flight reads.
+void ProgramImplCore::sweep_seam_anchors(
+    DiskKVBridge& bridge, const bool preopener, const std::uint32_t frontier,
+    const std::array<std::uint64_t, 2>& digest,
+    const qwen3_6::detail::PrefixShortlistDigests& prefix_digests) {
+    std::vector<SeamAnchorKey> drop;
+    {
+        std::lock_guard<std::mutex> lock(seam_track_mu_);
+        seam_track_[SeamAnchorKey{digest[0], digest[1], frontier}] =
+            SeamAnchorTrack{preopener, ++seam_track_seq_};
+        if (seam_track_.size() > kSeamTrackCapacity) {
+            std::vector<std::pair<SeamAnchorKey, std::uint64_t>> aged;
+            aged.reserve(seam_track_.size());
+            for (const auto& [key, track] : seam_track_) { aged.emplace_back(key, track.seq); }
+            std::sort(aged.begin(), aged.end(),
+                      [](const auto& l, const auto& r) { return l.second < r.second; });
+            const std::size_t excess = seam_track_.size() - kSeamTrackCapacity;
+            for (std::size_t i = 0; i < excess; ++i) { seam_track_.erase(aged[i].first); }
+        }
+        struct SameChain {
+            SeamAnchorKey key;
+            std::uint32_t frontier;
+            std::uint64_t seq;
+        };
+        std::vector<SameChain> same;
+        for (const auto& [key, track] : seam_track_) {
+            if (track.preopener != preopener) { continue; }
+            if (key.frontier == 0 || key.frontier >= prefix_digests.size()) { continue; }
+            const auto at = prefix_digests.at(key.frontier);
+            if (at[0] != key.lo || at[1] != key.hi) { continue; }
+            same.push_back(SameChain{key, key.frontier, track.seq});
+        }
+        std::sort(same.begin(), same.end(), [](const SameChain& l, const SameChain& r) {
+            if (l.frontier != r.frontier) { return l.frontier > r.frontier; }
+            return l.seq > r.seq;
+        });
+        for (std::size_t i = kSeamKeepAnchors; i < same.size(); ++i) { drop.push_back(same[i].key); }
+    }
+    for (const auto& key : drop) {
+        const DiskKVIdentity id{
+            .lo = key.lo,
+            .hi = key.hi,
+            .tag = static_cast<std::uint32_t>(speculative_backend) |
+                   (static_cast<std::uint32_t>(proposal_head) << 8U) |
+                   (static_cast<std::uint32_t>(kv_storage) << 16U),
+            .frontier = key.frontier};
+        if (bridge.drop_page(id, DiskKVKind::StateImage)) {
+            std::lock_guard<std::mutex> lock(seam_track_mu_);
+            seam_track_.erase(key);
+            disk_kv_logf('I', "l3-seam", "anchor superseded | frontier=%u dropped", key.frontier);
+        }
+    }
+}
+
 void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) const {
     for (const TokenId token : tokens) {
         if (token < 0 || token >= TextConfig::token_domain) {
@@ -13566,28 +13625,26 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 // an immutable source, close the Fork before potentially freezing a new rewrite.
                 settle_state_fork(sequence);
 
-                // L3 seam anchor at the prompt's rewrite-checkpoint frontier — the
-                // pre-opener boundary before this request's own generation opener.
-                // That frontier is strictly inside the prompt (the digest chain is
-                // valid there) and is exactly where the client-authored follow-up's
-                // re-rendered history can still match this execution: anything at or
-                // after the reply span diverges. Capturing at every historical
-                // boundary floods the state family (dozens of 146 MiB images per
-                // request) and LRU-evicts the very anchor the next turn needs. The
-                // in-memory capture transaction at this same frontier only covers the
-                // disk seam when the owner-spill path happens to run; this write is
-                // the per-request guarantee (synchronous, logged). Every failure is
-                // a silent degradation.
-                const bool rewrite_seam =
-                    staged.prompt.identity.rewrite_checkpoint &&
-                    staged.cursor == staged.prompt.identity.rewrite_checkpoint->frontier;
+                // L3 seam anchors — the per-request guarantee that the next round
+                // can restore at a usable depth. Two kinds survive on disk:
+                // preopener (this request's own prompt end — pure-append clients
+                // and in-turn loop rounds match it directly) and probe (the
+                // admission page-walk depth — tail-rewriting clients whose next
+                // round diverges before the prompt end self-heal through it).
+                // The rewrite/TurnClosure frontier no longer persists to disk: it
+                // duplicated the preopener depth for live turns, and its across-
+                // restart restore path (private_turn_closure) degrades to the
+                // shared head. Capturing at every historical boundary floods the
+                // state family (dozens of 146 MiB images per request) and LRU-
+                // evicts the very anchor the next turn needs. Every failure is a
+                // silent degradation.
                 const bool preopener_seam =
                     staged.prompt.identity.pre_opener_frontier != 0 &&
                     staged.cursor == staged.prompt.identity.pre_opener_frontier;
                 const bool probe_seam =
                     staged.probe_anchor_frontier != 0 &&
                     staged.cursor == staged.probe_anchor_frontier;
-                if ((rewrite_seam || preopener_seam || probe_seam) &&
+                if ((preopener_seam || probe_seam) &&
                     disk_kv != nullptr &&
                     l3_state_scratch && host_state_images && text_kv_pages && !staged.vision &&
                     !staged.prompt.has_media() && speculative_backend != SpeculativeBackend::DFlash &&
@@ -13607,6 +13664,8 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                         };
                         if (disk_kv->contains(seam, DiskKVKind::StateImage)) {
                             disk_kv->touch(seam, DiskKVKind::StateImage);
+                            sweep_seam_anchors(*disk_kv, preopener_seam, staged.cursor,
+                                               seam_digest, sequence.prefix_digests);
                         } else {
                             const auto view = host_state_images->writable_view(*l3_state_scratch);
                             const std::size_t stride = state_images->host_layout().image_bytes;
@@ -13627,12 +13686,12 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                     std::span<const std::byte>(view.data, stride));
                                 disk_kv_logf('I', "l3-seam",
                                              "anchor written | kind=%s frontier=%u digest=%016llx%016llx",
-                                             probe_seam       ? "probe"
-                                             : preopener_seam ? "preopener"
-                                                              : "rewrite",
+                                             probe_seam ? "probe" : "preopener",
                                              staged.cursor,
                                              (unsigned long long)seam_digest[0],
                                              (unsigned long long)seam_digest[1]);
+                                sweep_seam_anchors(*disk_kv, preopener_seam, staged.cursor,
+                                                   seam_digest, sequence.prefix_digests);
                             }
                         }
                         // A pre-opener anchor is only restorable when the probe can walk a
