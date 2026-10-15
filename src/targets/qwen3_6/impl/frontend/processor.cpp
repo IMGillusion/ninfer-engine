@@ -12,6 +12,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <iomanip>
 #include <iterator>
 #include <limits>
@@ -724,6 +726,51 @@ void validate_special_token(const Tokenizer& tokenizer, std::string_view text, i
 
 } // namespace
 
+// Cross-request context-isolation diagnostics: when NINFER_PROMPT_KEYWORDS is set
+// (comma-separated), every prepared prompt is scanned for the listed keywords and
+// each hit is logged to stderr with its offset and surrounding text. This answers,
+// from the engine's own view of the rendered prompt (system, tool schemas, history
+// and the new turn alike), whether a given string was present in a request's
+// context — the serving-side ground truth for cross-request leakage reports.
+void trace_prompt_keywords(const std::string& text) {
+    static const std::vector<std::string> keywords = [] {
+        std::vector<std::string> out;
+        const char* env = std::getenv("NINFER_PROMPT_KEYWORDS");
+        if (env == nullptr) { return out; }
+        std::string_view rest(env);
+        while (!rest.empty()) {
+            const auto comma = rest.find(',');
+            const auto item = rest.substr(0, comma == std::string_view::npos ? rest.size() : comma);
+            if (!item.empty()) { out.emplace_back(item); }
+            rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+        }
+        return out;
+    }();
+    if (keywords.empty()) { return; }
+    std::string line = "[prompt-trace] chars=" + std::to_string(text.size());
+    bool any = false;
+    for (const auto& keyword : keywords) {
+        std::size_t pos = 0;
+        int count = 0;
+        std::size_t first = std::string::npos;
+        while ((pos = text.find(keyword, pos)) != std::string::npos) {
+            if (first == std::string::npos) { first = pos; }
+            ++count;
+            pos += keyword.size();
+        }
+        if (count == 0) { continue; }
+        any = true;
+        line += " | " + keyword + "x" + std::to_string(count) + "@";
+        line += std::to_string(first);
+        line += " …" + text.substr(first > 80 ? first - 80 : 0, 160) + "…";
+    }
+    if (!any) {
+        std::fprintf(stderr, "%s | (no keyword hits)\n", line.c_str());
+        return;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
 std::string PreprocessStats::summary() const {
     std::ostringstream out;
     out << "media=" << media_items << " media_bytes=" << media_bytes << " patches=" << raw_patches
@@ -1078,6 +1125,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
 
     check_preparation_control(control);
     rendered                    = expand_placeholders(std::move(rendered), items);
+    trace_prompt_keywords(rendered.text);
     const auto tokenize_started = Clock::now();
     EncodedChat encoded         = encode_rendered_chat(tokenizer_, rendered, encode_limit);
     stats.tokenize_seconds +=

@@ -21,6 +21,11 @@ namespace ninfer::targets::qwen3_6::frontend_internal {
 
 class MediaPreprocessCache;
 
+// Context-isolation diagnostics: when NINFER_PROMPT_KEYWORDS is set (comma-separated),
+// scans the rendered prompt for the listed keywords and logs each hit with its offset
+// and surrounding text to stderr. No-op when the variable is unset.
+void trace_prompt_keywords(const std::string& text);
+
 enum class ProcessorErrorKind {
     BudgetExceeded,
     ContextLengthExceeded,

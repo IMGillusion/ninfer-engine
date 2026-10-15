@@ -1468,6 +1468,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     } else {
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options, rendered_markers));
+        fi::trace_prompt_keywords(rendered.text);
         const auto tokenize_started = Clock::now();
         fi::EncodedChat encoded     = fi::encode_rendered_chat(
             *impl_->tokenizer, rendered, static_cast<std::size_t>(impl_->max_context) + 1U);
