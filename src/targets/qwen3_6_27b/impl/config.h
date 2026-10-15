@@ -90,6 +90,5 @@ inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
 inline constexpr std::uint32_t kNativeContext            = 262144;
-inline constexpr std::uint32_t kExtendedContext          = 400000;
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

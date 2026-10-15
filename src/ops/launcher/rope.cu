@@ -4,7 +4,6 @@
 #include "core/device.h" // CUDA_CHECK
 #include "ops/kernel/rope.cuh"
 
-#include <cmath>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
@@ -199,17 +198,3 @@ void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Te
 }
 
 } // namespace ninfer::ops::detail
-
-namespace ninfer::ops {
-
-void set_rope_yarn_extension(float factor, std::int32_t native_context) {
-    if (factor > 1.0F && native_context > 0) {
-        const float native  = static_cast<float>(native_context);
-        const float q_scale = 1.0F / (0.1F * std::log(factor) + 1.0F);
-        CUDA_CHECK(cudaMemcpyToSymbol(g_rope_yarn_factor, &factor, sizeof(float)));
-        CUDA_CHECK(cudaMemcpyToSymbol(g_rope_yarn_native, &native, sizeof(float)));
-        CUDA_CHECK(cudaMemcpyToSymbol(g_rope_yarn_q_scale, &q_scale, sizeof(float)));
-    }
-}
-
-} // namespace ninfer::ops

@@ -1,6 +1,5 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 
-#include <ninfer/ops/rope.h>
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
@@ -657,9 +656,6 @@ create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile
         throw std::invalid_argument(
             "loaded model weights profile does not match the sequence plan");
     }
-    ops::set_rope_yarn_extension(
-        static_cast<float>(Variant::maximum_context) / static_cast<float>(Variant::native_context),
-        static_cast<std::int32_t>(Variant::native_context));
     auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *plan.impl_, device,
                                                                startup_observer);
     plan.impl_.reset();
