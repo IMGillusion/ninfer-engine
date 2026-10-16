@@ -63,6 +63,30 @@ static __device__ __constant__ float kVisionRopeInvFrequency[18] = {
     4.641588834e-04F, 2.782559402e-04F, 1.668100537e-04F,
 };
 
+// YaRN context extension, configured once per process by ops::set_rope_yarn_extension. Positions
+// at or below the native context keep the trained rotation bit-exact; beyond it, text rotary
+// frequencies blend toward YaRN interpolation (beta_fast=32, beta_slow=1) and Q carries the YaRN
+// temperature so the extended regime keeps the paper's logits/t convention. K is never rescaled,
+// which keeps every persisted KV cache value valid.
+static __device__ float g_rope_yarn_factor  = 0.0F;
+static __device__ float g_rope_yarn_native  = 0.0F;
+static __device__ float g_rope_yarn_q_scale = 1.0F;
+
+__device__ __forceinline__ bool rope_yarn_active(float position) {
+    return g_rope_yarn_factor > 1.0F && position > g_rope_yarn_native;
+}
+
+__device__ __forceinline__ float rope_yarn_blend(float frequency) {
+    const double two_pi      = 6.28318530717958648e+00;
+    const double native      = static_cast<double>(g_rope_yarn_native);
+    const double wavelength  = two_pi / frequency;
+    const double short_range = native / 32.0; // beta_fast = 32: keep extrapolation below this
+    double interpolate       = (wavelength - short_range) / (native - short_range);
+    interpolate              = fmin(fmax(interpolate, 0.0), 1.0);
+    return static_cast<float>(frequency * (1.0 - interpolate) +
+                              (frequency / g_rope_yarn_factor) * interpolate);
+}
+
 template <RopeKernelMode Mode>
 __device__ __forceinline__ void fixed_axis_frequency(int pair, int* axis, float* frequency) {
     if constexpr (Mode == RopeKernelMode::Vision2D) {
@@ -83,7 +107,17 @@ __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int 
     if constexpr (Mode == RopeKernelMode::DflashText1D) {
         constexpr double kInvTwoPi = 1.59154943091895336e-01;
         constexpr double kTwoPi    = 6.28318530717958648e+00;
-        const double angle  = static_cast<double>(positions[token]) * kDflashRopeInvFrequency[pair];
+        const double position  = static_cast<double>(positions[token]);
+        double frequency       = kDflashRopeInvFrequency[pair];
+        if (rope_yarn_active(static_cast<float>(position))) {
+            const double wavelength  = kTwoPi / frequency;
+            const double native      = static_cast<double>(g_rope_yarn_native);
+            const double short_range = native / 32.0;
+            double interpolate       = (wavelength - short_range) / (native - short_range);
+            interpolate              = fmin(fmax(interpolate, 0.0), 1.0);
+            frequency = frequency * (1.0 - interpolate) + (frequency / g_rope_yarn_factor) * interpolate;
+        }
+        const double angle  = position * frequency;
         const double turns  = angle * kInvTwoPi;
         const float reduced = static_cast<float>(angle - nearbyint(turns) * kTwoPi);
         sincosf(reduced, sine, cosine);
@@ -91,17 +125,30 @@ __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int 
         int axis = 0;
         float frequency;
         fixed_axis_frequency<Mode>(pair, &axis, &frequency);
-        const float angle =
-            static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
-            frequency;
+        const float position = static_cast<float>(
+            positions[static_cast<std::int64_t>(axis) * tokens + token]);
+        float angle = position * frequency;
+        if (rope_yarn_active(position)) { angle = position * rope_yarn_blend(frequency); }
         sincosf(angle, sine, cosine);
     }
+}
+
+// Per-token YaRN temperature gate for Q: active only when the token's highest position axis is
+// beyond the native context, so native-range attention products are bit-exact.
+__device__ __forceinline__ float rope_yarn_q_scale(const std::int32_t* positions, int tokens,
+                                                   int token, int axes) {
+    float position = static_cast<float>(positions[token]);
+    for (int axis = 1; axis < axes; ++axis) {
+        position = fmaxf(
+            position, static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]));
+    }
+    return rope_yarn_active(position) ? g_rope_yarn_q_scale : 1.0F;
 }
 
 template <int HeadDim, int Half>
 __device__ __forceinline__ void apply_rope_head(__nv_bfloat16* data, std::int64_t token_stride,
                                                 int head, int token, int lane, float c0, float c1,
-                                                float s0, float s1) {
+                                                float s0, float s1, float output_scale) {
     constexpr int kHalfPair = Half / 2;
     if (lane >= kHalfPair) { return; }
     const std::int64_t base =
@@ -109,9 +156,11 @@ __device__ __forceinline__ void apply_rope_head(__nv_bfloat16* data, std::int64_
     auto* data2         = reinterpret_cast<__nv_bfloat162*>(data + base);
     const float2 first  = __bfloat1622float2(data2[lane]);
     const float2 second = __bfloat1622float2(data2[lane + kHalfPair]);
-    data2[lane] = __floats2bfloat162_rn(first.x * c0 - second.x * s0, first.y * c1 - second.y * s1);
+    data2[lane]         = __floats2bfloat162_rn((first.x * c0 - second.x * s0) * output_scale,
+                                        (first.y * c1 - second.y * s1) * output_scale);
     data2[lane + kHalfPair] =
-        __floats2bfloat162_rn(second.x * c0 + first.x * s0, second.y * c1 + first.y * s1);
+        __floats2bfloat162_rn((second.x * c0 + first.x * s0) * output_scale,
+                              (second.y * c1 + first.y * s1) * output_scale);
 }
 
 template <RopeKernelMode Mode, int QHeads, int KHeads>
@@ -135,6 +184,11 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* 
     }
     __syncthreads();
 
+    const float q_scale =
+        Mode == RopeKernelMode::Vision2D
+            ? 1.0F
+            : rope_yarn_q_scale(positions, tokens, token,
+                                Mode == RopeKernelMode::TextMrope ? 3 : 1);
     const int lane        = static_cast<int>(threadIdx.x) & 31;
     const int warp        = static_cast<int>(threadIdx.x) >> 5;
     const int block_warps = static_cast<int>(blockDim.x) >> 5;
@@ -149,10 +203,10 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* 
     for (int combined_head = warp; combined_head < QHeads + KHeads; combined_head += block_warps) {
         if (combined_head < QHeads) {
             apply_rope_head<kHeadDim, kHalf>(q, q_token_stride, combined_head, token, lane, c0, c1,
-                                             s0, s1);
+                                             s0, s1, q_scale);
         } else {
             apply_rope_head<kHeadDim, kHalf>(k, k_token_stride, combined_head - QHeads, token, lane,
-                                             c0, c1, s0, s1);
+                                             c0, c1, s0, s1, 1.0F);
         }
     }
 }
@@ -178,6 +232,7 @@ __global__ void rope_fixed_split_kernel(const std::int32_t* positions, __nv_bflo
     }
     __syncthreads();
 
+    const float q_scale     = rope_yarn_q_scale(positions, tokens, token, 1);
     const int lane          = static_cast<int>(threadIdx.x) & 31;
     const int local_head    = static_cast<int>(threadIdx.x) >> 5;
     const int combined_head = head_group * HeadsPerBlock + local_head;
@@ -189,10 +244,10 @@ __global__ void rope_fixed_split_kernel(const std::int32_t* positions, __nv_bflo
     const float s1 = sin_cache[pair + 1];
     if (combined_head < QHeads) {
         apply_rope_head<kHeadDim, kHalf>(q, q_token_stride, combined_head, token, lane, c0, c1, s0,
-                                         s1);
+                                         s1, q_scale);
     } else {
         apply_rope_head<kHeadDim, kHalf>(k, k_token_stride, combined_head - QHeads, token, lane, c0,
-                                         c1, s0, s1);
+                                         c1, s0, s1, 1.0F);
     }
 }
 
@@ -237,6 +292,7 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
     }
     __syncthreads();
 
+    const float q_scale = axes == 2 ? 1.0F : rope_yarn_q_scale(positions, tokens, token, axes);
     const int lane        = static_cast<int>(threadIdx.x) & 31;
     const int warp        = static_cast<int>(threadIdx.x) >> 5;
     const int block_warps = static_cast<int>(blockDim.x) >> 5;
@@ -244,6 +300,7 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
          combined_head += block_warps) {
         const bool is_q             = combined_head < q_heads;
         const int head              = is_q ? combined_head : combined_head - q_heads;
+        const float output_scale    = is_q ? q_scale : 1.0F;
         __nv_bfloat16* data         = is_q ? q : k;
         const std::int64_t stride_t = is_q ? q_token_stride : k_token_stride;
         const std::int64_t base     = static_cast<std::int64_t>(token) * stride_t +
@@ -253,8 +310,9 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
             const float second       = __bfloat162float(data[base + pair + half]);
             const float c            = cos_cache[pair];
             const float s            = sin_cache[pair];
-            data[base + pair]        = __float2bfloat16_rn(first * c - second * s);
-            data[base + pair + half] = __float2bfloat16_rn(second * c + first * s);
+            data[base + pair]        = __float2bfloat16_rn((first * c - second * s) * output_scale);
+            data[base + pair + half] =
+                __float2bfloat16_rn((second * c + first * s) * output_scale);
         }
     }
 }
