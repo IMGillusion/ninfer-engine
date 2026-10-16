@@ -896,14 +896,23 @@ public:
                addresses_[handle.index_].generation == handle.generation_;
     }
 
+    // stream feeds publish_membership's H2D. The execution streams are
+    // cudaStreamNonBlocking, so a default-stream publish would be a floating
+    // copy with no ordering against any consumer: it can land after the row is
+    // released and re-bound, overwriting the next tenant's freshly published
+    // page table entries with the previous tenant's physical pages (observed as
+    // one request attending another request's KV tail). Every live-data
+    // activation must pass the stream its attention runs on; the nullptr
+    // default remains only for empty/startup/capture-representative paths that
+    // publish no live rows.
     void activate(KVAddressSpaceHandle handle, std::uint32_t entitlement,
-                  std::int32_t execution_row) {
+                  std::int32_t execution_row, cudaStream_t stream = nullptr) {
         Address& address = require(handle);
         if (entitlement < address.page_count) {
             throw std::logic_error("KV address space is not activatable");
         }
         auto reservation = prepare_activation(handle, entitlement, execution_row);
-        commit_activation(std::move(reservation));
+        commit_activation(std::move(reservation), stream);
     }
 
     [[nodiscard]] KVActivationReservation

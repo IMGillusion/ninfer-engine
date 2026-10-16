@@ -10917,6 +10917,14 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
             while (cursor < end) {
                 const std::uint32_t count           = std::min(prefill_chunk, end - cursor);
                 const StateImageSelectors selectors = state_selectors(sequence);
+                // Same global-register hazard as advance_prefill: this forced
+                // prefill runs between other requests' admissions.
+                set_device_i32(io.text_kv_table_row,
+                               text_kv_addresses->bound_row(sequence.kv->text));
+                set_device_i32(io.backend_kv_table_row,
+                               sequence.kv->backend
+                                   ? backend_kv_addresses->bound_row(*sequence.kv->backend)
+                                   : 0);
                 schedule::PrefillContext schedule_state{
                     {device, model, work, state_images->linear(),
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
@@ -12773,12 +12781,17 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
     }
     try {
         if (!text_active) {
+            // The row publish must be ordered on the execution stream: a
+            // default-stream publish is a floating copy that can land after
+            // this row is released and re-bound, handing the next tenant the
+            // previous tenant's page table entries.
             text_kv_addresses->activate(sequence.kv->text,
-                                        text_kv_addresses->mapped_pages(sequence.kv->text), row);
+                                        text_kv_addresses->mapped_pages(sequence.kv->text), row,
+                                        device.stream);
             if (sequence.kv->backend) {
                 backend_kv_addresses->activate(
                     *sequence.kv->backend,
-                    backend_kv_addresses->mapped_pages(*sequence.kv->backend), row);
+                    backend_kv_addresses->mapped_pages(*sequence.kv->backend), row, device.stream);
             }
         }
         set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
@@ -13615,6 +13628,16 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         }
         StateImageSelectors selectors = state_selectors(sequence);
         Tensor rewrite_capture_hidden;
+        // The single-sequence prefill path reads its KV block-table rows from
+        // the global RoundState registers, which bind_sequence_kv writes once
+        // at admission. An admission landing inside a prefill-yield window
+        // rebinds them, so a resumed staged prefill would otherwise append and
+        // attend through another request's row. Re-arm them on every step.
+        set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
+        set_device_i32(io.backend_kv_table_row,
+                       sequence.kv->backend
+                           ? backend_kv_addresses->bound_row(*sequence.kv->backend)
+                           : 0);
         Tensor* rewrite_capture_hidden_ptr = nullptr;
         if (staged.next_capture < staged.capture_groups.size()) {
             rewrite_capture_hidden = state_images->continuation_hidden_slot(selectors.destination);
