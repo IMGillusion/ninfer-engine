@@ -7,9 +7,12 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -20,9 +23,53 @@ std::string sse_error_event(const ApiError& error) {
     return "data: " + make_error_body(error) + "\n\n";
 }
 
+// Cross-request leakage witness: hex canary codes in the raw request body (in) and in the
+// outcome about to be written to this HTTP connection (out). Gated by NINFER_TOKEN_FP.
+std::string scan_hex_passcodes(std::string_view text) {
+    std::string passcodes;
+    std::size_t pos = 0;
+    while (true) {
+        const auto start = text.find_first_of("0123456789abcdef", pos);
+        if (start == std::string_view::npos) { break; }
+        const auto end = text.find_first_not_of("0123456789abcdef", start);
+        const auto len = (end == std::string_view::npos ? text.size() : end) - start;
+        if (len == 16) { passcodes += " " + std::string(text.substr(start, 16)); }
+        pos = end == std::string_view::npos ? text.size() : end;
+    }
+    return passcodes;
+}
+
+void trace_serve_passcodes(std::uint64_t req_id, const std::string& in_codes,
+                           const GenerationOutcome& outcome) {
+    if (const char* tfp = std::getenv("NINFER_TOKEN_FP"); tfp != nullptr && tfp[0] != '\0') {
+        std::string out_codes = scan_hex_passcodes(outcome.text);
+        out_codes += scan_hex_passcodes(outcome.reasoning);
+        for (const auto& call : outcome.tool_calls) {
+            out_codes += scan_hex_passcodes(call.name);
+            out_codes += scan_hex_passcodes(call.arguments_json);
+        }
+        std::fprintf(stderr, "[serve-pass] req#%llu in:%s out:%s\n",
+                     static_cast<unsigned long long>(req_id), in_codes.c_str(),
+                     out_codes.c_str());
+    }
+}
+
 } // namespace
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
+    // The canary marker reaches the wire either as raw UTF-8 or as JSON \u escapes depending
+    // on the client encoder; hex codes themselves always survive verbatim.
+    const std::string raw_in_passcodes = [body = std::string_view(req.body)] {
+        static constexpr std::string_view kMarkerRaw = "本请求口令：";
+        static constexpr std::string_view kMarkerEscaped =
+            "\\u672c\\u8bf7\\u6c42\\u53e3\\u4ee4\\uff1a";
+        const auto marker = body.find(kMarkerRaw);
+        const auto escaped = body.find(kMarkerEscaped);
+        if (marker == std::string_view::npos && escaped == std::string_view::npos) {
+            return std::string{};
+        }
+        return scan_hex_passcodes(body);
+    }();
     OpenAIChatRequest request;
     try {
         RequestLimits limits;
@@ -89,6 +136,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             write_openai_error(res, error);
             return;
         }
+        trace_serve_passcodes(req_id, raw_in_passcodes, outcome);
         lifecycle->done(outcome);
         try {
             set_owned_json_content(res, make_chat_completion_response(identity, outcome),
@@ -115,8 +163,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         prepare_sse_response(res);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, stream, encoder, lifecycle, return_progress,
-             timings_per_token](std::size_t, httplib::DataSink& sink) -> bool {
+            [this, stream, encoder, lifecycle, return_progress, timings_per_token, req_id,
+             raw_in_passcodes](std::size_t, httplib::DataSink& sink) -> bool {
                 if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
                     return true;
@@ -208,6 +256,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                     return send_error(error);
                 }
 
+                trace_serve_passcodes(req_id, raw_in_passcodes, outcome);
                 lifecycle->done(outcome);
                 std::vector<std::string> terminal;
                 try {

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -41,6 +42,8 @@ public:
 
     [[nodiscard]] PromptSummary summary() const;
     [[nodiscard]] PromptPreparationStats preparation_stats() const noexcept;
+    // Canary codes extracted from the rendered prompt (empty when the prompt has none).
+    [[nodiscard]] const std::string& diagnostic_passcodes() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:

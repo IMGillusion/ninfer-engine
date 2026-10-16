@@ -226,10 +226,22 @@ public:
                 throw RequestError(RequestErrorKind::ThinkingBudgetCapacityInsufficient,
                                    error.what());
             }
+            std::string diagnostic_passcodes;
+            if (const char* tfp = std::getenv("NINFER_TOKEN_FP");
+                tfp != nullptr && tfp[0] != '\0') {
+                diagnostic_passcodes = prompt.diagnostic_passcodes();
+            }
             request = std::make_shared<Request>(request_id, publication_order, std::move(prompt),
                                                 std::move(output), prompt_summary, prepare_seconds,
                                                 std::move(options), consumer_mode, observation,
                                                 pending_deadline, submitted);
+            request->diagnostic_passcodes = std::move(diagnostic_passcodes);
+            if (const char* tfp = std::getenv("NINFER_TOKEN_FP");
+                tfp != nullptr && tfp[0] != '\0' && !request->diagnostic_passcodes.empty()) {
+                std::fprintf(stderr, "[req-pass] id=%llu in:%s\n",
+                             static_cast<unsigned long long>(request_id),
+                             request->diagnostic_passcodes.c_str());
+            }
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -867,7 +879,58 @@ private:
         result.content                 = std::move(request->content);
         result.reasoning               = std::move(request->reasoning);
         result.tool_calls              = request->output.take_tool_calls();
-        result.tool_call_parse         = request->output.tool_call_parse_diagnostics();
+        if (const char* tfp = std::getenv("NINFER_TOKEN_FP"); tfp != nullptr && tfp[0] != '\0') {
+            std::string passcodes;
+            const auto scan = [&passcodes](const std::string& s) {
+                for (std::size_t pos = 0; pos < s.size();) {
+                    const auto start = s.find_first_of("0123456789abcdef", pos);
+                    if (start == std::string::npos) { break; }
+                    const auto end = s.find_first_not_of("0123456789abcdef", start);
+                    const auto len = (end == std::string::npos ? s.size() : end) - start;
+                    if (len == 16) { passcodes += " " + s.substr(start, 16); }
+                    pos = end == std::string::npos ? s.size() : end;
+                }
+            };
+            scan(result.content);
+            scan(result.reasoning);
+            for (const auto& call : result.tool_calls) {
+                scan(call.name);
+                scan(call.arguments_json);
+            }
+            std::fprintf(stderr, "[resp-pass] id=%llu in:%s out:%zu passcodes:%s\n",
+                         static_cast<unsigned long long>(request->id),
+                         request->diagnostic_passcodes.c_str(),
+                         result.generated_token_ids.size(), passcodes.c_str());
+            // Context witness for every generated code that is not this
+            // request's own canary: shows the field it rode in and its
+            // surrounding text, so a foreign code can be traced to the
+            // sequence state that produced it.
+            const auto witness = [&request](const char* field, const std::string& s) {
+                for (std::size_t pos = 0; pos < s.size();) {
+                    const auto start = s.find_first_of("0123456789abcdef", pos);
+                    if (start == std::string::npos) { break; }
+                    const auto end = s.find_first_not_of("0123456789abcdef", start);
+                    const auto len = (end == std::string::npos ? s.size() : end) - start;
+                    pos = end == std::string::npos ? s.size() : end;
+                    if (len != 16) { continue; }
+                    const std::string code = s.substr(start, 16);
+                    if (request->diagnostic_passcodes.find(code) != std::string::npos) { continue; }
+                    const auto ctx_start = start > 100U ? start - 100U : 0U;
+                    std::string around = s.substr(ctx_start, std::min<std::size_t>(220, s.size() - ctx_start));
+                    for (char& ch : around) { if (ch == '\n' || ch == '\r') { ch = '\\'; } }
+                    std::fprintf(stderr,
+                                 "[foreign-pass] id=%llu field=%s code=%s ctx:\"%s\"\n",
+                                 static_cast<unsigned long long>(request->id), field, code.c_str(),
+                                 around.c_str());
+                }
+            };
+            witness("content", result.content);
+            witness("reasoning", result.reasoning);
+            for (const auto& call : result.tool_calls) {
+                witness("tool_name", call.name);
+                witness("tool_args", call.arguments_json);
+            }
+        }
         result.reasoning_tokens        = request->output.reasoning_tokens();
         result.finish_reason           = reason;
         result.matched_stop_string     = request->output.matched_stop_string();
@@ -1711,6 +1774,12 @@ private:
                         elapsed_ns(request->submitted, Clock::now());
                     request->queue_wait_recorded = true;
                     slots_[lane]                 = request;
+                    if (const char* tfp = std::getenv("NINFER_TOKEN_FP");
+                        tfp != nullptr && tfp[0] != '\0') {
+                        std::fprintf(stderr, "[admit] id=%llu lane=%u prompt=%u\n",
+                                     static_cast<unsigned long long>(request->id), lane,
+                                     request->prompt_summary.prompt_tokens);
+                    }
                     record_prefix_selection(control.summary);
                     materializing_.reset();
                     yield_pipe_for_adoption(lane);

@@ -8,6 +8,7 @@
 #include <optional>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -157,6 +158,10 @@ struct PreparedPromptData {
     std::shared_ptr<const frontend_internal::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;
     PrepareStats prepare;
+    // Space-separated hex canary codes extracted from the rendered prompt's
+    // "本请求口令：" marker (see frontend_internal::extract_prompt_passcodes). Diagnostics
+    // only; never read by execution.
+    std::string diagnostic_passcodes;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
 

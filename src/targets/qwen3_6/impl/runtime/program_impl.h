@@ -17,6 +17,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -3862,6 +3864,11 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
         staged.base = staged.cursor = 0;
         progress.success = false;
         progress.done = true;
+        // Bridge scratch barrier: the seed failure may have abandoned in-flight
+        // bridge read jobs that still target the shared l3 scratch. Block until
+        // every queued/in-flight job completes so the next seed's fill_batch
+        // cannot race a stale pread writing into the same pinned bytes.
+        if (disk_kv) { disk_kv->wait_idle(); }
         progress.state_scratch_lease.reset();
         staged.advertised_base = 0;
         disk_kv_logf('W', "l3-seed-yield",
@@ -5804,6 +5811,22 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
             .mtp_bridge         = request_plan.mtp_bridge,
         };
         transaction.staged_prefill.emplace(std::move(prefill));
+        if (const char* tfp = std::getenv("NINFER_TOKEN_FP"); tfp != nullptr && tfp[0] != '\0') {
+            static std::atomic<unsigned> seq{0};
+            std::uint64_t h = 1469598103934665603ULL;
+            for (int v : transaction.staged_prefill->prompt.token_ids) {
+                h ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(v));
+                h *= 1099511628211ULL;
+            }
+            std::fprintf(stderr,
+                         "[token-fp] phase=setup seq=%u n=%zu h=%016llx last=%d\n",
+                         seq.fetch_add(1),
+                         transaction.staged_prefill->prompt.token_ids.size(),
+                         static_cast<unsigned long long>(h),
+                         transaction.staged_prefill->prompt.token_ids.empty()
+                             ? 0
+                             : transaction.staged_prefill->prompt.token_ids.back());
+        }
         if (transaction.staged_prefill->vision_plan && !workspace_plan.vision) {
             throw std::logic_error("Vision prefill has no startup workspace plan");
         }
@@ -5826,6 +5849,19 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
             destination.role = ContinuationSlotRole::ReservedMaterialization;
         }
         advance_resource_revision();
+        // An owner spill started before planning may still hold accepted bridge
+        // jobs borrowing the shared KV scratch (copy D2H in flight or store
+        // writes reading borrowed bytes at dequeue). Its store worker would
+        // otherwise observe the seed's pages and persist them under the spilled
+        // session's identity, and its transfer-stream D2H races the seed's
+        // fills on the same slots. The persisted chain is content-addressed, so
+        // cancelling here only defers the increment to a later re-spill.
+        if (proactive_) {
+            proactive_cancel();
+            disk_kv_logf('I', "l3-materialize",
+                         "cancelled in-flight proactive spill at transaction begin "
+                         "| scratch handover to seed");
+        }
         context_transaction_.emplace<MaterializationTransaction>(std::move(transaction));
         return runtime::ContextTransactionReserveStatus::Reserved;
     } catch (...) {
@@ -5839,18 +5875,27 @@ void ProgramImplCore::release_materialization_staging(
     // Exceptional teardown is not the scheduler cancellation path. Keep the
     // borrowed startup allocation alive until the worker's final access. The KV
     // batch's aggregate ticket only advances when poll_seed_batch() runs, so poll
-    // it here too - otherwise this loop waits forever on a batch in flight.
+    // it here too - otherwise this loop waits forever on a batch in flight. A
+    // batch can also be open with no aggregate ticket (read == nullptr), so the
+    // open-batch set must be empty before the loop may break: those are accepted
+    // bridge reads still borrowing scratch slots.
     for (;;) {
         poll_seed_batch(transaction.seed, std::chrono::steady_clock::now());
-        if (!transaction.seed.read ||
-            DiskKVBridge::poll(transaction.seed.read, std::chrono::steady_clock::now(),
-                               l3_queue_deadline()) != DiskReadResult::Pending) { break; }
+        if ((!transaction.seed.read ||
+             DiskKVBridge::poll(transaction.seed.read, std::chrono::steady_clock::now(),
+                                l3_queue_deadline()) != DiskReadResult::Pending) &&
+            transaction.seed.batch.empty()) { break; }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     if (transaction.seed_lifecycle.phase() != SeedLifecycle::Phase::Finalized) {
         transaction.seed_lifecycle.abort(transaction.seed.read);
     }
     transaction.seed.read.reset();
+    // Queue-side deadline expiry folds a not-yet-run read into a terminal result
+    // while its worker still borrows the shared KV scratch. Like the seed-failure
+    // path, block until every accepted job is truly idle so the next request's
+    // fill_batch cannot race a stale pread into its own device KV.
+    if (disk_kv) { disk_kv->wait_idle(); }
     transaction.seed.state_scratch_lease.reset();
     transaction.staged_prefill.reset();
     const std::uint32_t lane = transaction.destination.value;
@@ -6187,6 +6232,45 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
             throw std::logic_error("root materialization destination is not reserved");
         }
         state_store->activate_reset(transaction.reserved_states[0], device.stream);
+        static const bool state_trace = std::getenv("NINFER_STATE_TRACE") != nullptr;
+        if (state_trace) {
+            const std::int32_t activated = state_store->physical_slot(transaction.reserved_states[0]);
+            std::fprintf(stderr, "[state-activate] lane=%u slot=%d frontier=%u\\n",
+                         transaction.destination.value, activated,
+                         transaction.plan ? transaction.plan->summary().prompt_tokens : 0U);
+            // A reset slot must read back zero before the first prompt chunk
+            // lands. Residue here is the previous occupant's recurrent state
+            // (observed as a fresh Root request narrating another request's
+            // prompt tail), so sample the layers that carry the recent-token
+            // window and fail loudly instead of blending silently.
+            const auto slot_view = state_images->slot_view(activated);
+            const auto scan = [&](const char* what, const Tensor& tensor) {
+                if (tensor.data == nullptr || tensor.bytes() == 0) { return; }
+                static constexpr std::size_t kProbeBytes = 8192;
+                alignas(64) static std::byte probe[kProbeBytes];
+                const std::size_t bytes = std::min(tensor.bytes(), kProbeBytes);
+                CUDA_CHECK(cudaMemcpyAsync(probe, tensor.data, bytes, cudaMemcpyDeviceToHost,
+                                           device.stream));
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                for (std::size_t i = 0; i < bytes; ++i) {
+                    if (probe[i] != std::byte{0}) {
+                        disk_kv_logf('E', "state-trace",
+                                     "reset slot %d %s non-zero at byte %zu (%#x) lane=%u "
+                                     "| stale state residue | restart required",
+                                     activated, what, i,
+                                     static_cast<unsigned>(probe[i]) & 0xFFU,
+                                     transaction.destination.value);
+                        fflush(stderr);
+                        std::_Exit(70);
+                    }
+                }
+            };
+            scan("hidden", slot_view.continuation_hidden);
+            if (slot_view.linear.layers != 0) {
+                scan("conv", slot_view.linear.conv_layer0);
+                scan("recurrent", slot_view.linear.recurrent_layer0);
+            }
+        }
     }
 
     KVAddressSpaceHandle text_address;
@@ -11971,6 +12055,9 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
     }
 
     std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
+    std::array<std::uint32_t, kMaximumConcurrency> fold_lanes{};
+    std::array<std::int32_t, kMaximumConcurrency> fold_sources{};
+    std::array<std::int32_t, kMaximumConcurrency> fold_destinations{};
     std::array<std::int32_t, kMaximumConcurrency> hidden_selectors{};
     bool needs_hidden_correction = false;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -12004,6 +12091,9 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             ops::GdnReplayFoldRow{.source_state_slot      = selectors.source,
                                   .destination_state_slot = selectors.destination,
                                   .commit_columns         = static_cast<std::int32_t>(committed)};
+        fold_lanes[row]       = lane;
+        fold_sources[row]     = selectors.source;
+        fold_destinations[row] = selectors.destination;
         const bool partial_terminal =
             !cancelled[row] && terminal[row] && committed < pending.produced;
         hidden_selectors[row] =
@@ -12014,6 +12104,8 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
     const auto tail_started = Clock::now();
     try {
         timing.resume_submit();
+        assert_state_batch("fold", lanes.size(), fold_lanes.data(), fold_sources.data(),
+                           fold_destinations.data());
         replay_fold->execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                              device.stream);
 
@@ -13333,6 +13425,42 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
 // frontier — the engine is session-blind, and this is exactly the restore-match
 // condition, so "same chain" needs no session identity. Erasure goes through
 // the store's evict, which honors admission-protected keys and in-flight reads.
+void ProgramImplCore::assert_state_batch(const char* kind, const std::size_t count,
+                                         const std::uint32_t* lanes, const std::int32_t* sources,
+                                         const std::int32_t* destinations) const {
+    for (std::size_t row = 0; row < count; ++row) {
+        for (std::size_t other = row + 1; other < count; ++other) {
+            if (destinations[row] == destinations[other]) {
+                disk_kv_logf('E', "state-trace",
+                             "%s destination slot %u shared by rows %zu(lane %u)/%zu(lane %u) "
+                             "| cross-request state alias | restart required",
+                             kind, destinations[row], row, lanes[row], other, lanes[other]);
+                fflush(stderr);
+                std::_Exit(70);
+            }
+            if (destinations[row] == sources[other] && destinations[row] != sources[row]) {
+                disk_kv_logf('E', "state-trace",
+                             "%s row %zu(lane %u) writes slot %u while row %zu(lane %u) reads it "
+                             "| cross-request state hazard | restart required",
+                             kind, row, lanes[row], destinations[row], other, lanes[other]);
+                fflush(stderr);
+                std::_Exit(70);
+            }
+        }
+    }
+    static const bool state_trace = std::getenv("NINFER_STATE_TRACE") != nullptr;
+    if (!state_trace) { return; }
+    std::string line = "[state-round] ";
+    line += kind;
+    line += " rows=" + std::to_string(count);
+    for (std::size_t row = 0; row < count; ++row) {
+        line += " (lane=" + std::to_string(lanes[row]) +
+                " src=" + std::to_string(sources[row]) +
+                " dst=" + std::to_string(destinations[row]) + ")";
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
 void ProgramImplCore::sweep_seam_anchors(
     DiskKVBridge& bridge, const bool preopener, const std::uint32_t frontier,
     const std::array<std::uint64_t, 2>& digest,
@@ -14019,6 +14147,9 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + 1, 0);
         }
+        assert_state_batch("ordinary", lanes.size(), lanes.data(),
+                           ordinary_host_ingress->state_source_slots.data(),
+                           ordinary_host_ingress->state_destination_slots.data());
 
         schedule::OrdinaryBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                        replay_records ? &*replay_records : nullptr,
@@ -14179,6 +14310,9 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             materialize_sequence_kv(sequence, frontier + extent + 1,
                                     std::min(capacity, frontier + extent + draft_window));
         }
+        assert_state_batch("mtp", lanes.size(), lanes.data(),
+                           mtp_host_ingress->state_source_slots.data(),
+                           mtp_host_ingress->state_destination_slots.data());
 
         schedule::MtpBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                   replay_records ? &*replay_records : nullptr, io,
@@ -14365,6 +14499,9 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->sampling[row]                = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
         }
+        assert_state_batch("dflash", lanes.size(), lanes.data(),
+                           dflash_host_ingress->state_source_slots.data(),
+                           dflash_host_ingress->state_destination_slots.data());
 
         schedule::DFlashBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                      replay_records ? &*replay_records : nullptr,

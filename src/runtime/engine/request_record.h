@@ -173,6 +173,9 @@ struct RequestRecord {
     std::vector<TokenId> generated;
     std::string content;
     std::string reasoning;
+    // Canary codes the prepared prompt carried (see PreparedPrompt::diagnostic_passcodes);
+    // paired against generated output in resp-pass diagnostics.
+    std::string diagnostic_passcodes;
     std::optional<LaneId> lane;
     std::optional<SequenceHandle> sequence;
     std::atomic<bool> cancelled{false};

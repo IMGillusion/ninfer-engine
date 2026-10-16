@@ -23,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <ctime>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::frontend_internal {
@@ -764,11 +765,53 @@ void trace_prompt_keywords(const std::string& text) {
         line += std::to_string(first);
         line += " …" + text.substr(first > 80 ? first - 80 : 0, 160) + "…";
     }
+    const std::size_t marker = text.find("本请求口令：");
+    if (marker != std::string::npos) {
+        std::string passcodes;
+        for (std::size_t pos = marker; pos < text.size();) {
+            const auto start = text.find_first_of("0123456789abcdef", pos + 14);
+            if (start == std::string::npos) { break; }
+            const auto end = text.find_first_not_of("0123456789abcdef", start);
+            const auto len = (end == std::string::npos ? text.size() : end) - start;
+            if (len >= 12) { passcodes += " " + text.substr(start, len); }
+            pos = end == std::string::npos ? text.size() : end;
+        }
+        std::fprintf(stderr, "[prompt-pass] chars=%zu passcodes:%s\n", text.size(),
+                     passcodes.c_str());
+    }
     if (!any) {
         std::fprintf(stderr, "%s | (no keyword hits)\n", line.c_str());
         return;
     }
     std::fprintf(stderr, "%s\n", line.c_str());
+}
+
+std::string extract_prompt_passcodes(const std::string& text) {
+    const std::size_t marker = text.find("本请求口令：");
+    if (marker == std::string::npos) { return {}; }
+    std::string passcodes;
+    for (std::size_t pos = marker; pos < text.size();) {
+        const auto start = text.find_first_of("0123456789abcdef", pos + 14);
+        if (start == std::string::npos) { break; }
+        const auto end = text.find_first_not_of("0123456789abcdef", start);
+        const auto len = (end == std::string::npos ? text.size() : end) - start;
+        if (len >= 12) { passcodes += " " + text.substr(start, len); }
+        pos = end == std::string::npos ? text.size() : end;
+    }
+    return passcodes;
+}
+
+// Tail fingerprint of the rendered prompt: the final 240 bytes contain the per-request
+// canary line in leakage investigations, so logging it per prepared request makes a
+// prompt-content swap visible from the engine's own view.
+void trace_prompt_tail(const std::string& text) {
+    const std::size_t n = text.size() > 240 ? 240 : text.size();
+    std::string tail = text.substr(text.size() - n);
+    for (char& ch : tail) { if (ch == '\n') { ch = '\\'; } }
+    std::time_t now = std::time(nullptr);
+    char stamp[32];
+    std::strftime(stamp, sizeof stamp, "%H:%M:%S", std::localtime(&now));
+    std::fprintf(stderr, "[prompt-tail] %s chars=%zu tail240=%s\n", stamp, text.size(), tail.c_str());
 }
 
 std::string PreprocessStats::summary() const {

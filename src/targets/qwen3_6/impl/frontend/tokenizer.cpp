@@ -5,6 +5,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <charconv>
 #include <cctype>
 #include <cstddef>
@@ -793,6 +797,16 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
 BoundaryEncodedText Tokenizer::encode_with_boundaries(
     std::string_view text, std::span<const std::size_t> byte_boundaries, EncodeOptions options,
     std::span<const ByteSpan> literal_spans) const {
+    if (const char* tfp = std::getenv("NINFER_TOKEN_FP"); tfp != nullptr && tfp[0] != '\0' &&
+                                                           text.size() > 256) {
+        const std::size_t tail_n = 200 < text.size() ? 200 : text.size();
+        std::string tail(text.substr(text.size() - tail_n));
+        for (char& ch : tail) { if (ch == '\n') { ch = '\\'; } }
+        static std::atomic<unsigned> seq{0};
+        std::fprintf(stderr, "[enc-tail] %s seq=%u n=%zu tail=%s\n",
+                     std::to_string(std::time(nullptr)).c_str(), seq.fetch_add(1), text.size(),
+                     tail.c_str());
+    }
     BoundaryEncodedText encoded;
     encoded.boundaries.resize(byte_boundaries.size());
     std::size_t previous_literal_end = 0;

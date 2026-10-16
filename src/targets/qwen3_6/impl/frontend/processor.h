@@ -25,6 +25,12 @@ class MediaPreprocessCache;
 // scans the rendered prompt for the listed keywords and logs each hit with its offset
 // and surrounding text to stderr. No-op when the variable is unset.
 void trace_prompt_keywords(const std::string& text);
+void trace_prompt_tail(const std::string& text);
+
+// Hex canary codes following the "本请求口令：" marker in the rendered prompt. Empty when the
+// marker is absent. Carried on the prepared prompt so the runtime can pair each request's
+// generated output against the canary its own prompt carried.
+[[nodiscard]] std::string extract_prompt_passcodes(const std::string& text);
 
 enum class ProcessorErrorKind {
     BudgetExceeded,

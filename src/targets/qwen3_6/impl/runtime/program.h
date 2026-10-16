@@ -765,6 +765,14 @@ public:
     void sweep_seam_anchors(DiskKVBridge& bridge, bool preopener, std::uint32_t frontier,
                             const std::array<std::uint64_t, 2>& digest,
                             const qwen3_6::detail::PrefixShortlistDigests& prefix_digests);
+    // Cross-request state isolation assertion: every decode/fold batch's slot
+    // table must give each row a destination no other row reads or writes. A
+    // violation means two live sequences share a GDN state image, which
+    // silently blends their recurrent contexts (observed as one request
+    // narrating another request's prompt tail); it is fatal, not tolerable.
+    void assert_state_batch(const char* kind, std::size_t count,
+                            const std::uint32_t* lanes, const std::int32_t* sources,
+                            const std::int32_t* destinations) const;
     struct HostPrewriteCandidate {
         std::uint32_t owner=0, page=0;
         std::uint64_t generation=0, epoch=0;

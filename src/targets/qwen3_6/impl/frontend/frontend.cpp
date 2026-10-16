@@ -14,6 +14,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <array>
 #include <chrono>
 #include <cctype>
@@ -1034,6 +1037,11 @@ PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
     };
 }
 
+const std::string& PreparedPrompt::diagnostic_passcodes() const noexcept {
+    static const std::string empty;
+    return data_ != nullptr ? data_->diagnostic_passcodes : empty;
+}
+
 PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
 
 PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
@@ -1469,6 +1477,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options, rendered_markers));
         fi::trace_prompt_keywords(rendered.text);
+        fi::trace_prompt_tail(rendered.text);
+        result.diagnostic_passcodes = fi::extract_prompt_passcodes(rendered.text);
         const auto tokenize_started = Clock::now();
         fi::EncodedChat encoded     = fi::encode_rendered_chat(
             *impl_->tokenizer, rendered, static_cast<std::size_t>(impl_->max_context) + 1U);
@@ -1477,6 +1487,18 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         fi::check_preparation_control(control, "tokenization");
         if (encoded.input_ids.size() > impl_->max_context) {
             throw_context_length_exceeded(impl_->max_context);
+        }
+        if (const char* tfp = std::getenv("NINFER_TOKEN_FP"); tfp != nullptr && tfp[0] != '\0') {
+            static std::atomic<unsigned> seq{0};
+            std::uint64_t h = 1469598103934665603ULL;
+            for (int v : encoded.input_ids) {
+                h ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(v));
+                h *= 1099511628211ULL;
+            }
+            std::fprintf(stderr, "[token-fp] phase=prepare seq=%u n=%zu h=%016llx last=%d\n",
+                         seq.fetch_add(1), encoded.input_ids.size(),
+                         static_cast<unsigned long long>(h),
+                         encoded.input_ids.empty() ? 0 : encoded.input_ids.back());
         }
         result.token_ids                   = std::move(encoded.input_ids);
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
