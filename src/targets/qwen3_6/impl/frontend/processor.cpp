@@ -803,8 +803,11 @@ std::string extract_prompt_passcodes(const std::string& text) {
 
 // Tail fingerprint of the rendered prompt: the final 240 bytes contain the per-request
 // canary line in leakage investigations, so logging it per prepared request makes a
-// prompt-content swap visible from the engine's own view.
+// prompt-content swap visible from the engine's own view. Investigation tracing: quiet
+// unless the NINFER_TOKEN_FP diagnostics gate is set.
 void trace_prompt_tail(const std::string& text) {
+    const char* gate = std::getenv("NINFER_TOKEN_FP");
+    if (gate == nullptr || gate[0] == '\0') { return; }
     const std::size_t n = text.size() > 240 ? 240 : text.size();
     std::string tail = text.substr(text.size() - n);
     for (char& ch : tail) { if (ch == '\n') { ch = '\\'; } }
