@@ -80,6 +80,37 @@ static void retry_flush(const std::string& p) {
     fs::remove(p+".idx.tmp"); s.flush_index(); REQUIRE(content(p+".idx")!=old);
     DiskKVStore r(o); REQUIRE(r.contains(id(1)));
 }
+// Default pool (4%): a 128-slot store refills to target=16 in one pass when a
+// write hits an exhausted pool. Sequential inserts make LRU order
+// deterministic: the coldest ids go first.
+static void free_pool_refill(const std::string& p) {
+    DiskKVStore s(options(p,128));
+    for(unsigned n=0;n<128;++n) REQUIRE(s.upsert_page(id(n),page(n)));   // exactly full
+    std::vector<std::uint32_t> evicted;
+    REQUIRE(s.upsert_page(id(200),page(200),&evicted));                  // hits the empty pool
+    REQUIRE(evicted.size()==16);                                         // one pass: refill to 16, pop 1
+    REQUIRE(s.live_slots()==128+1-evicted.size());
+    std::vector<std::byte> dst(256,std::byte{77});
+    for(unsigned n=0;n<16;++n) { REQUIRE(!s.read_page(id(n),dst)); REQUIRE(dst==page(77)); }
+    for(unsigned n=16;n<128;++n) { REQUIRE(s.read_page(id(n),dst)); REQUIRE(dst==page(n)); }
+    REQUIRE(s.read_page(id(200),dst)); REQUIRE(dst==page(200));
+    // The refilled pool serves the next 15 writes without any eviction.
+    for(unsigned n=201;n<216;++n) { REQUIRE(s.upsert_page(id(n),page(n))); }
+    REQUIRE(s.live_slots()==128+1-evicted.size()+15);
+}
+// pct=0 restores the old exactly-one-eviction-per-write path: every overflow
+// upsert evicts exactly one page.
+static void free_pool_disabled(const std::string& p) {
+    struct EnvGuard { ~EnvGuard() { unsetenv("NINFER_L3_FREE_POOL_PCT"); } } guard;
+    REQUIRE(setenv("NINFER_L3_FREE_POOL_PCT","0",1)==0);
+    DiskKVStore s(options(p,8));
+    for(unsigned n=0;n<8;++n) REQUIRE(s.upsert_page(id(n),page(n)));
+    std::vector<std::uint32_t> evicted;
+    for(unsigned n=8;n<11;++n) REQUIRE(s.upsert_page(id(n),page(n),&evicted));
+    REQUIRE(evicted.size()==3);
+    REQUIRE(s.live_slots()==8);
+    unsetenv("NINFER_L3_FREE_POOL_PCT");
+}
 static void concurrent(const std::string& p) {
     DiskKVStore s(options(p,32,true)); std::atomic<bool> done=false; std::atomic<unsigned> reads=0;
     std::thread reader([&] { do { REQUIRE(s.live_slots()<=32); REQUIRE(s.used_bytes()<=32*4096);
@@ -103,6 +134,8 @@ static void bench(const std::string& p,bool defer) {
 int main() {
     char dir[]="/tmp/dks-audit-XXXXXX"; REQUIRE(mkdtemp(dir)); std::string root=dir;
     try { evictions(root+"/evict"); std::puts("PASS eviction boundaries/LRU/restart");
+      free_pool_refill(root+"/pool"); std::puts("PASS free-pool watermark refill");
+      free_pool_disabled(root+"/pool0"); std::puts("PASS free-pool opt-out");
       publication(root+"/publish"); std::puts("PASS deferred publication/clean flush/eager deletion");
       crashes(root); std::puts("PASS process-exit/stale identity/orphan reuse/scan/CRC");
       retry_flush(root+"/retry"); std::puts("PASS failed publication retry");

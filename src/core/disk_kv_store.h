@@ -257,6 +257,13 @@ private:
     // slot must not be recycled under a copy, so eviction skips readers_ != 0.
     std::vector<std::uint32_t> readers_;
     std::vector<std::uint32_t> free_slots_;
+    // Free-pool watermark (see upsert_page): when the pool runs dry, the write
+    // that hit the empty pool refills it to free_pool_target_ in one LRU pass
+    // instead of evicting exactly one page per write. 0 disables (old
+    // one-eviction-per-page path). From NINFER_L3_FREE_POOL_PCT, default 4%
+    // of capacity (target = 2x).
+    std::uint32_t free_pool_low_    = 0;
+    std::uint32_t free_pool_target_ = 0;
 };
 
 } // namespace ninfer

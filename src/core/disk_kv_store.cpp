@@ -143,6 +143,32 @@ DiskKVStore::DiskKVStore(Options opts) : opts_(std::move(opts)) {
     slot_pitch_ = slot_bytes();
     file_bytes_ = trailer_off() + kTrailerSize;
 
+    // Free-pool watermark (see upsert_page). NINFER_L3_FREE_POOL_PCT=0 opts out
+    // entirely; the default keeps ~4% of slots as a refill-able free pool so
+    // spill writes batch their evictions instead of paying one inline
+    // eviction (and one read/write interleave on the NVMe) per page.
+    {
+        unsigned pct = 4;
+        if (const char* e = std::getenv("NINFER_L3_FREE_POOL_PCT")) {
+            const unsigned long v = ::strtoul(e, nullptr, 10);
+            if (v != 0 || e[0] == '0') { pct = static_cast<unsigned>(v > 25 ? 25 : v); }
+        }
+        // Clamp to the geometry: the pool must stay a minority of the store on
+        // small-capacity fixtures (a 4-slot test store has no 8-slot pool).
+        const std::uint32_t low_raw =
+            std::max<std::uint32_t>(8, max_slots_ / 100 * pct);
+        const std::uint32_t target_raw = low_raw * 2;
+        free_pool_low_ = pct == 0 ? 0 : std::min(low_raw, std::max<std::uint32_t>(1, max_slots_ / 4));
+        free_pool_target_ = pct == 0 ? 0
+                                     : std::min(std::max(target_raw, free_pool_low_ + 1),
+                                                std::max<std::uint32_t>(2, max_slots_ / 2));
+        if (free_pool_low_ != 0) {
+            disk_kv_logf('I', "l3-store",
+                         "free pool | low=%u target=%u slots=%u pct=%u",
+                         free_pool_low_, free_pool_target_, max_slots_, pct);
+        }
+    }
+
     struct stat st{};
     const bool data_exists = (::stat(opts_.path.c_str(), &st) == 0 && st.st_size > 0);
     if (!data_exists) {
@@ -509,17 +535,37 @@ bool DiskKVStore::upsert_page(const DiskKVIdentity& id, std::span<const std::byt
             slot = free_slots_.back();
             free_slots_.pop_back();
         } else {
-            // Full: LRU-evict the coldest page.
-            auto victim = evict_one_lru();
-            if (!victim.has_value()) {
+            // Pool exhausted (store at capacity): refill it in one LRU pass so
+            // this write and the following free_pool_target_-1 writes take
+            // pre-made slots instead of each paying an inline eviction (and a
+            // read/write interleave on the NVMe). Filling a fresh store never
+            // enters here — it only runs once the store is genuinely full.
+            // evict_one_lru keeps the eviction discipline: protected identities
+            // and mid-read slots are skipped; no candidates at all is the same
+            // EVICT-FAIL as before. free_pool_target_ == 0 restores the old
+            // exactly-one-eviction-per-page path.
+            const std::size_t before = free_slots_.size();
+            while (free_slots_.empty() || free_slots_.size() < free_pool_target_) {
+                auto victim = evict_one_lru();
+                if (!victim.has_value()) { break; }
+                if (evicted != nullptr) {
+                    evicted->push_back(victim->slot);
+                }
+            }
+            if (free_slots_.size() != before) { index_dirty_ = true; }
+            if (!free_slots_.empty()) {
+                const std::size_t refilled = free_slots_.size() - before;
+                if (refilled > 1) {
+                    disk_kv_logf('I', "l3-store",
+                                 "free pool refill | evicted=%zu pool=%zu/%u",
+                                 refilled, free_slots_.size(), max_slots_);
+                }
+            }
+            if (free_slots_.empty()) {
                 disk_kv_logf('E', "l3-store", "upsert EVICT-FAIL no-victim | id=%llu/%llu",
                              static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi));
                 return false;
             }
-            if (evicted != nullptr) {
-                evicted->push_back(victim->slot);
-            }
-            // evict_one_lru() already released the victim slot into free_slots_.
             slot = free_slots_.back();
             free_slots_.pop_back();
         }
