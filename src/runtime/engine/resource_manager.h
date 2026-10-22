@@ -412,12 +412,21 @@ public:
                             if (entry.state!=CatalogState::Catalogued || !entry.handle ||
                                 private_has_active_edge(i) || entry.summary.active_references!=0 ||
                                 !entry.summary.endpoint) continue;
+                            // Write-side layering: contexts below the persistence floor
+                            // recompute faster than their disk round-trip; never persist.
+                            if (entry.summary.endpoint->ref.frontier < program.min_persist_tokens()) continue;
                             if (entry.summary.endpoint->ref.frontier<=entry.disk_checkpoint_frontier) continue;
                             const std::uint64_t delta =
                                 entry.summary.endpoint->ref.frontier - entry.disk_checkpoint_frontier;
                             if (!best || delta>best_delta) { best=&entry; best_slot=i; best_delta=delta; }
                         }
-                        if (best && program.proactive_begin_checkpoint(*best->handle)) {
+                        // Host-tier watermark: while resident device/host copies have
+                        // room, restores never touch the disk, so deferring the
+                        // checkpoint costs nothing and saves the write churn. The
+                        // selection above stays current; crossing the watermark
+                        // starts the spill on the next 250ms scan without data loss.
+                        const bool checkpoint_allowed = program.host_kv_checkpoint_allowed();
+                        if (best && checkpoint_allowed && program.proactive_begin_checkpoint(*best->handle)) {
                             checkpoint_victim_=private_capability(best_slot);
                         }
                         if (!checkpoint_victim_) checkpoint_retry_=now+std::chrono::milliseconds(250);
@@ -657,13 +666,14 @@ public:
     }
 
     [[nodiscard]] ContextTransactionOutcome
-    progress_context_transaction(Program& program, CancellationFlagView cancellation) {
+    progress_context_transaction(Program& program, CancellationFlagView cancellation,
+                                 std::uint32_t decode_ready) {
         if (std::holds_alternative<std::monostate>(transaction_) ||
             !program.has_context_transaction()) {
             throw std::logic_error("ResourceManager has no progressable resource transaction");
         }
         ProgramContextTransactionProgress progress =
-            program.progress_context_transaction(cancellation);
+            program.progress_context_transaction(cancellation, decode_ready);
         return std::visit(
             [&](auto&& result) -> ContextTransactionOutcome {
                 using Result = std::decay_t<decltype(result)>;

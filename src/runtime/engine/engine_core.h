@@ -1682,7 +1682,38 @@ private:
         return AdmissionProgress::ControlProgress;
     }
 
-    [[nodiscard]] AdmissionProgress progress_context_transaction(bool yield_requested) {
+    [[nodiscard]] std::uint32_t decode_ready_count() const noexcept {
+        std::uint32_t count = 0;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] != nullptr && slots_[lane]->is_decode_ready()) { ++count; }
+        }
+        return count;
+    }
+
+    // Read-only admission preparation: while a context transaction holds the
+    // admission gate, pre-run the pending head's base plan and L3 restore probe
+    // so the boundary after the transaction's terminal state can admit it
+    // without paying planning latency. Strictly read-only (no Choice, no
+    // reserve, no scheduler state); failures degrade to the normal path.
+    void prime_admission_preparation() {
+        if (!resources_.context_transaction_kind()) { return; }
+        const FifoSnapshot queued = pending_snapshot();
+        if (queued.empty()) { return; }
+        const std::shared_ptr<Request>& head = queued.head();
+        if (head->base_plan) { return; }
+        if (primed_head_id_ && *primed_head_id_ == head->id) { return; }
+        primed_head_id_ = head->id;
+        try {
+            ensure_base_plan(head);
+            instance_.program->prime_disk_probe(*head->base_plan);
+        } catch (...) {
+            (void)remove_pending_error(head, std::current_exception());
+            primed_head_id_.reset();
+        }
+    }
+
+    [[nodiscard]] AdmissionProgress
+    progress_context_transaction(bool yield_requested, std::uint32_t decode_ready = 0) {
         const std::optional<ContextTransactionKind> kind = resources_.context_transaction_kind();
         if (kind.has_value() != instance_.program->has_context_transaction()) {
             throw std::logic_error("Engine and Program disagree on context-transaction ownership");
@@ -1720,7 +1751,8 @@ private:
             break;
         }
 
-        auto outcome = resources_.progress_context_transaction(*instance_.program, cancellation);
+        auto outcome =
+            resources_.progress_context_transaction(*instance_.program, cancellation, decode_ready);
         return std::visit(
             [&](auto&& terminal) -> AdmissionProgress {
                 using Outcome = std::decay_t<decltype(terminal)>;
@@ -1885,6 +1917,11 @@ private:
         }
         request->model_state = EngineRequestState::Materializing;
         materializing_.emplace(std::move(control));
+        if (const char* tfp = std::getenv("NINFER_TOKEN_FP"); tfp != nullptr && tfp[0] != '\0') {
+            std::fprintf(stderr, "[materialize-begin] id=%llu prompt=%u\n",
+                         static_cast<unsigned long long>(request->id),
+                         request->prompt_summary.prompt_tokens);
+        }
         scheduler_.commit_admission(std::move(grant));
         publish_generation_start(
             request, BeginSummary{.prompt_tokens        = summary.prompt_tokens,
@@ -2309,7 +2346,8 @@ private:
                 set_host_work_class(HostWorkClass::Control);
                 HostPhaseMeasurement boundary = begin_host_phase();
                 const bool have_pending       = expire_pending_requests();
-                (void)progress_context_transaction(have_pending);
+                (void)progress_context_transaction(have_pending, decode_ready_count());
+                prime_admission_preparation();
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
@@ -2469,6 +2507,10 @@ private:
     std::optional<MaterializingRequest> materializing_;
     Scheduling scheduler_;
     std::atomic<bool> admission_check_pending_{false};
+    // Read-only admission preparation: the pending head whose base plan and L3
+    // probe were primed during the current context transaction (cleared when no
+    // transaction is running so a fresh head is primed per transaction).
+    std::optional<std::uint64_t> primed_head_id_;
     std::uint64_t worker_accounted_elapsed_ns_ = 0;
     HostWorkClass current_host_work_class_     = HostWorkClass::Control;
     std::array<std::uint32_t, kMaximumConcurrency> current_decode_lanes_{};

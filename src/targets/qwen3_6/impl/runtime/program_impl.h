@@ -2990,6 +2990,8 @@ void ProgramImplCore::spill_dying_checkpoint_pages(SequenceState& sequence,
                                                    std::uint32_t retained_main_frontier,
                                                    std::uint32_t retained_backend_frontier) {
     if (disk_kv == nullptr || !sequence.kv || !host_kv_extents) { return; }
+    // Write-side layering: same persistence floor as spill_dying_owner_pages.
+    if (checkpoint.frontier < context_cache.min_persist_tokens) { return; }
     const std::uint32_t dropped_main_pages = kv_pages_for_frontier(checkpoint.frontier);
     const std::uint32_t retained_main_pages = kv_pages_for_frontier(retained_main_frontier);
     // Bounded work: a single drop may cover a whole large checkpoint; spilling
@@ -3483,6 +3485,10 @@ void ProgramImplCore::spill_dying_owner_pages(SequenceState& sequence) {
         !text_kv_pages) {
         return;
     }
+    // Write-side layering: a dying context below the persistence floor recomputes
+    // faster than its disk round-trip (the fixed-size state image dominates);
+    // skip the spill entirely.
+    if (sequence.execution_frontier < context_cache.min_persist_tokens) { return; }
     try {
         const std::uint32_t tag = static_cast<std::uint32_t>(speculative_backend) |
                                   (static_cast<std::uint32_t>(proposal_head) << 8U) |
@@ -3801,7 +3807,8 @@ void ProgramImplCore::poll_seed_batch(
 }
 
 bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
-                                         MaterializationTransaction& transaction) {
+                                         MaterializationTransaction& transaction,
+                                         std::uint32_t decode_ready) {
     auto& progress = transaction.seed;
     auto& staged = *transaction.staged_prefill;
     if (progress.done) { return true; }
@@ -4030,64 +4037,77 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
             fill_batch();
             if (!close_batch()) { ++progress.topup_visits; return false; }
         }
-        // One batch per visit, deliberately. Draining several batches here was tried
-        // and measured NO gain (4591-4917ms over 27-30 batches against 4597-5277ms
-        // over 25-27 for the single-batch version): a batch's reads take ~66ms while
-        // the copy needs ~21ms, so the immediate re-poll comes back Pending and the
-        // visit ends anyway. Buying more would mean either spinning on the engine
-        // thread for the read latency or doubling the pinned scratch for a second
-        // buffer, and 300MB of the 6GiB host arena buys a large amount of session
-        // cache that this tier exists to protect. The restore is therefore bounded
-        // by the schedule cadence (~160ms per batch, ~4.6s for a 93K prompt) which
-        // still beats the 19-26s recompute by 4-5x.
-        poll_seed_batch(progress, std::chrono::steady_clock::now());
-        auto result = progress.read ? progress.read->result.load(std::memory_order_acquire)
-                                    : DiskReadResult::Success;
-        // Optional in-visit wait (NINFER_SEED_SPIN_MS, default 0 = return at once).
-        // A restore advances one batch per SCHEDULING STEP, and a step under load is
-        // ~170ms while a batch only needs ~66ms of store reads plus ~21ms of H2D, so
-        // most of each step is spent waiting for the next step. Spending a bounded
-        // slice of that idle IN the visit finishes more batches per step and shortens
-        // the window every other admission waits through - paid for by holding the
-        // engine thread that would otherwise be decoding. Sweep it, do not assume.
-        const auto spin_ms = l3_seed_spin_ms();
-        if (result == DiskReadResult::Pending && spin_ms > 0) {
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(spin_ms);
-            while (result == DiskReadResult::Pending && std::chrono::steady_clock::now() < deadline) {
-                std::this_thread::yield();
-                poll_seed_batch(progress, std::chrono::steady_clock::now());
-                result = progress.read ? progress.read->result.load(std::memory_order_acquire)
-                                       : DiskReadResult::Success;
+        // Budget-limited self-drain. A batch's store reads take ~66ms plus ~21ms
+        // of H2D while a loaded scheduling step is ~170ms, so one-batch-per-visit
+        // left the disk idle for most of every step and stretched a 27-batch
+        // restore to ~4.6s regardless of I/O speed. When no decode lane is
+        // runnable (the adaptive gate: decode_ready == 0, passed down from the
+        // engine boundary), this visit keeps submitting and draining batches
+        // until the NINFER_SEED_SPIN_MS budget is spent, so the wall time lands
+        // on the I/O floor and the admission gate reopens sooner. With decode
+        // runnable the budget is zero and the pacing is exactly the historical
+        // one-batch-per-visit. Batches still respect the queue-full break and
+        // the short-batch top-up bound; the queue deadline is enforced inside
+        // every poll_seed_batch, so a wedged volume cannot outlive it.
+        const auto spin_budget = decode_ready == 0
+                                     ? std::chrono::milliseconds(l3_seed_spin_ms())
+                                     : std::chrono::milliseconds{0};
+        const auto visit_started = std::chrono::steady_clock::now();
+        const auto budget_left = [&]() {
+            // spin_budget == 0 (decode runnable) = the historical one-batch-per-visit
+            // pacing; a positive budget authorizes in-visit draining up to the cap.
+            return spin_budget.count() > 0 &&
+                   std::chrono::steady_clock::now() - visit_started < spin_budget;
+        };
+        for (;;) {
+            if (!progress.batch_open) {
+                fill_batch();
+                if (!close_batch()) {
+                    ++progress.topup_visits;
+                    if (!budget_left()) { return false; }
+                    continue;   // queue headroom returned mid-visit: top up in place
+                }
             }
+            poll_seed_batch(progress, std::chrono::steady_clock::now());
+            auto result = progress.read ? progress.read->result.load(std::memory_order_acquire)
+                                        : DiskReadResult::Success;
+            if (result == DiskReadResult::Pending) {
+                if (!budget_left()) { return false; }   // batch stays open; state recoverable
+                std::this_thread::yield();
+                continue;
+            }
+            if (result != DiskReadResult::Success) {
+                if (progress.reason == nullptr) { progress.reason = "kv-read"; }
+                progress.batch_pages = 0; return fail();
+            }
+            progress.batch_destinations.clear();
+            for (std::uint32_t i = 0; i < progress.batch_pages; ++i) {
+                progress.batch_destinations.push_back(
+                    pages->physical(addresses->logical_page(address, progress.page + i)));
+            }
+            // Batched H2D on the compute stream: mapping and ordered_reset precede these
+            // copies on the SAME stream. No transfer pipeline event/wait is introduced.
+            pages->physical_pool().copy_from_host(
+                host_kv_arena->view(*scratch).subview(0, progress.batch_pages),
+                std::span<const DeviceKVPageHandle>(progress.batch_destinations.data(),
+                                                    progress.batch_destinations.size()),
+                device.stream);
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
+            progress.pages_read += progress.batch_pages;
+            progress.page += progress.batch_pages;
+            progress.batch_pages = 0;
+            progress.batch.clear();   // this batch's tickets must not join the next poll
+            progress.batch_open = false;
+            progress.read.reset();
+            if (progress.page >= total) { return false; }   // family done: switch phase next visit
+            if (!budget_left()) {
+                // Pre-submit the next batch's reads so the store never idles for a
+                // whole scheduling step between visits (historical tail behavior).
+                fill_batch(); close_batch();
+                return false;
+            }
+            // Budget remains: loop and keep draining within this visit.
         }
-        if (result == DiskReadResult::Pending) { return false; }
-        if (result != DiskReadResult::Success) {
-            if (progress.reason == nullptr) { progress.reason = "kv-read"; }
-            progress.batch_pages = 0; return fail();
-        }
-        progress.batch_destinations.clear();
-        for (std::uint32_t i = 0; i < progress.batch_pages; ++i) {
-            progress.batch_destinations.push_back(
-                pages->physical(addresses->logical_page(address, progress.page + i)));
-        }
-        // Batched H2D on the compute stream: mapping and ordered_reset precede these
-        // copies on the SAME stream. No transfer pipeline event/wait is introduced.
-        pages->physical_pool().copy_from_host(
-            host_kv_arena->view(*scratch).subview(0, progress.batch_pages),
-            std::span<const DeviceKVPageHandle>(progress.batch_destinations.data(),
-                                                progress.batch_destinations.size()),
-            device.stream);
-        CUDA_CHECK(cudaStreamSynchronize(device.stream));
-        progress.pages_read += progress.batch_pages;
-        progress.page += progress.batch_pages;
-        progress.batch_pages = 0;
-        progress.batch.clear();   // this batch's tickets must not join the next poll
-        progress.batch_open = false;
-        progress.read.reset();
-        // Immediately start the next batch's reads so the store never idles for a
-        // whole scheduling step between batches.
-        if (progress.page < total) { fill_batch(); close_batch(); }
-        return false;
     }
     if (progress.phase == 3) {
         const bool complete = state_images->copy_from_host_chunk(
@@ -7542,7 +7562,8 @@ ProgramImplCore::release_materialization_victim(MaterializationTransaction& tran
 }
 
 MaterializationResult
-ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagView cancellation) {
+ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagView cancellation,
+                                                      std::uint32_t decode_ready) {
     MaterializationResult out;
     MaterializationTransaction* transaction_ptr =
         std::get_if<MaterializationTransaction>(&context_transaction_);
@@ -8194,7 +8215,7 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
             out.status = runtime::ContextTransactionStatus::InProgress;
             return out;
         }
-        if (!progress_disk_seed(sequence, transaction)) {
+        if (!progress_disk_seed(sequence, transaction, decode_ready)) {
             out.status = runtime::ContextTransactionStatus::InProgress;
             return out;
         }
@@ -8237,7 +8258,8 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
 }
 
 ContextTransactionProgress<Variant>
-ProgramImplCore::progress_context_transaction(runtime::CancellationFlagView cancellation) {
+ProgramImplCore::progress_context_transaction(runtime::CancellationFlagView cancellation,
+                                              std::uint32_t decode_ready) {
     const auto terminal_or_pending =
         []<class Result>(Result&& result) -> ContextTransactionProgress<Variant> {
         if (result.status == runtime::ContextTransactionStatus::InProgress) {
@@ -8256,7 +8278,8 @@ ProgramImplCore::progress_context_transaction(runtime::CancellationFlagView canc
             if constexpr (std::is_same_v<Transaction, std::monostate>) {
                 throw std::logic_error("Program has no progressable context transaction");
             } else if constexpr (std::is_same_v<Transaction, MaterializationTransaction>) {
-                return terminal_or_pending(progress_materialization_transaction(cancellation));
+                return terminal_or_pending(
+                    progress_materialization_transaction(cancellation, decode_ready));
             } else {
                 return terminal_or_pending(progress_active_capture_transaction(cancellation));
             }
@@ -8282,6 +8305,18 @@ void ProgramImplCore::finalize_context_transaction() noexcept {
 
 bool ProgramImplCore::has_context_transaction() const noexcept {
     return !std::holds_alternative<std::monostate>(context_transaction_);
+}
+
+bool ProgramImplCore::host_kv_checkpoint_allowed() const noexcept {
+    const double watermark = context_cache.checkpoint_host_watermark;
+    if (watermark <= 0.0 || host_kv_arena == nullptr) { return true; }
+    const auto capacity = static_cast<double>(host_kv_arena->capacity_bytes());
+    return capacity == 0.0 ||
+           static_cast<double>(host_kv_arena->occupied_bytes()) / capacity >= watermark;
+}
+
+std::uint32_t ProgramImplCore::min_persist_tokens() const noexcept {
+    return context_cache.min_persist_tokens;
 }
 
 bool ProgramImplCore::valid_sequence(SequenceHandle handle) const noexcept {
@@ -13795,7 +13830,16 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 const bool probe_seam =
                     staged.probe_anchor_frontier != 0 &&
                     staged.cursor == staged.probe_anchor_frontier;
+                // Write-side layering: contexts below the persistence floor recompute
+                // faster than their disk round-trip (the state image alone is a fixed
+                // ~146 MiB), so they never touch the disk tier - no page chain, no
+                // state image, no sweep. An anchor without its page chain would only
+                // deepen a probe walk to a hole; skipping all three keeps restores
+                // for small contexts as honest full recomputes.
+                const bool persist_context =
+                    staged.cursor >= context_cache.min_persist_tokens;
                 if ((preopener_seam || probe_seam) &&
+                    persist_context &&
                     disk_kv != nullptr &&
                     l3_state_scratch && host_state_images && text_kv_pages && !staged.vision &&
                     !staged.prompt.has_media() && speculative_backend != SpeculativeBackend::DFlash &&

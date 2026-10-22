@@ -452,6 +452,18 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
 // chain. The scan is hash lookups only: one state gate per live frontier, and the page walk
 // runs only for candidates whose digests already agree. Shared by the Root admission probe and
 // by the shallow-candidate rejection below.
+// Read-only admission preparation (see program.h): cache the L3 restore probe
+// on the base plan so a pending head does not re-run it behind the current
+// transaction. Pure function of the prompt digests and the disk index.
+void ProgramImplCore::prime_disk_probe(
+    detail::RequestBasePlanImpl<NINFER_QWEN36_VARIANT>& base) {
+    if (base.disk_probe_primed) { return; }
+    base.disk_probe_primed = true;
+    static const bool l3_trace = std::getenv("NINFER_L3_TRACE") != nullptr;
+    base.disk_probe_frontier =
+        l3_disk_restore_frontier(base.prefix_digests, base.summary.prompt_tokens, l3_trace);
+}
+
 std::optional<std::uint32_t> ProgramImplCore::l3_disk_restore_frontier(
     const qwen3_6::detail::PrefixShortlistDigests& digests, std::uint32_t prompt_tokens,
     bool trace) const {
@@ -705,8 +717,10 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         base.prefix_digests.size() >= plan->summary.prompt_tokens) {
         static const bool l3_trace_shallow = std::getenv("NINFER_L3_TRACE") != nullptr;
         const std::optional<std::uint32_t> disk_best =
-            l3_disk_restore_frontier(base.prefix_digests, plan->summary.prompt_tokens,
-                                     l3_trace_shallow);
+            base.disk_probe_primed
+                ? base.disk_probe_frontier
+                : l3_disk_restore_frontier(base.prefix_digests, plan->summary.prompt_tokens,
+                                           l3_trace_shallow);
         if (disk_best && *disk_best > plan->reuse_base) {
             if (l3_trace_shallow) {
                 disk_kv_logf('D', "l3-probe",
@@ -948,7 +962,10 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         // per-candidate lines flood the log at one entry per frontier.
         static const bool l3_trace = std::getenv("NINFER_L3_TRACE") != nullptr;
         const std::optional<std::uint32_t> best_E =
-            l3_disk_restore_frontier(base.prefix_digests, plan->summary.prompt_tokens, l3_trace);
+            base.disk_probe_primed
+                ? base.disk_probe_frontier
+                : l3_disk_restore_frontier(base.prefix_digests, plan->summary.prompt_tokens,
+                                           l3_trace);
         if (best_E) {
             disk_kv_logf('I', "l3-probe", "best_E=%u", *best_E);
             const std::uint32_t E = *best_E;

@@ -873,7 +873,17 @@ public:
                               const ResourcePlan<Variant>& candidate,
                               std::span<const SequenceHandle<Variant>> persistent_borrowers) const;
     [[nodiscard]] ContextTransactionProgress<Variant>
-    progress_context_transaction(runtime::CancellationFlagView cancellation);
+    progress_context_transaction(runtime::CancellationFlagView cancellation,
+                                 std::uint32_t decode_ready);
+    // Read-only admission preparation: run the L3 restore probe once for the
+    // base plan and cache the frontier, so the pending head does not re-run it
+    // behind the current transaction. Pure function of the prompt digests and
+    // the disk index; safe to call concurrently with any transaction.
+    void prime_disk_probe(RequestBasePlan<Variant>& base);
+    // Write-side layering: whether turn-end L3 checkpoints may run (host-tier
+    // watermark), and the context size below which nothing is persisted.
+    [[nodiscard]] bool host_kv_checkpoint_allowed() const noexcept;
+    [[nodiscard]] std::uint32_t min_persist_tokens() const noexcept;
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
     // Called only by the engine at its serialized worker boundary.

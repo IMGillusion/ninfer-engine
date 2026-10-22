@@ -113,6 +113,10 @@ std::string serve_usage_text(const char* argv0) {
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
            "--host-kv-mib uses MiB\n"
+           "       --checkpoint-watermark-pct runs turn-end L3 checkpoints only while the host "
+           "KV tier is at or above this occupancy (0 = every turn, default)\n"
+           "       --min-persist-tokens skips all L3 persistence for contexts smaller than N "
+           "tokens (0 = persist everything, default)\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
@@ -241,6 +245,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib << 20);
             context_capacity_explicit                    = true;
+        } else if (arg == "--checkpoint-watermark-pct") {
+            const std::uint64_t pct =
+                parse_u64(require_value("--checkpoint-watermark-pct"), "checkpoint-watermark-pct");
+            if (pct > 100) {
+                throw std::invalid_argument("--checkpoint-watermark-pct is out of range");
+            }
+            options.context_cache.checkpoint_host_watermark = static_cast<double>(pct) / 100.0;
+        } else if (arg == "--min-persist-tokens") {
+            options.context_cache.min_persist_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--min-persist-tokens"), "min-persist-tokens"));
         } else if (arg == "--max-private-continuations") {
             options.context_cache.max_private_continuations =
                 static_cast<std::uint32_t>(parse_nonnegative_int(

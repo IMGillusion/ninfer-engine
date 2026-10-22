@@ -160,6 +160,18 @@ struct ContextCacheOptions {
     // byte-identical to two-tier. Any restore failure falls back to full
     // recompute (never worse than today).
     bool disk_kv_restore = false;
+    // Write-side layering (both default off = eager disk writes, historical behavior).
+    // checkpoint_host_watermark: turn-end incremental checkpoints run only while the
+    // host KV tier's occupancy is at or above this fraction of capacity (0.80 = write
+    // to disk once the host tier is ~80% full). Below the watermark the resident
+    // device/host tiers serve restores without any disk traffic; chains whose
+    // resident copies are lost before the watermark is crossed recompute from scratch.
+    // min_persist_tokens: contexts smaller than this never touch the disk tier at
+    // all (no page chain, no state image, no seam anchors) - their prefill is
+    // cheaper than the disk round-trip and the fixed-size state image dominates
+    // the transfer. Restores for such chains are full recomputes by design.
+    double checkpoint_host_watermark = 0.0;
+    std::uint32_t min_persist_tokens = 0;
 };
 
 struct ContextCostOptions {

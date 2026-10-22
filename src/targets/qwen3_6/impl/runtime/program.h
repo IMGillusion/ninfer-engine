@@ -203,6 +203,13 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     qwen3_6::detail::PrefixShortlistDigests prefix_digests;
     std::uint32_t prefix_identity_tag = 0;
     bool allow_prefix_reuse           = false;
+    // Read-only admission preparation (prime_disk_probe): the L3 restore probe
+    // is a pure function of (prefix_digests, prompt_tokens, disk state), so it
+    // can run while another request's context transaction holds the admission
+    // gate. The cached value is advisory - a stale-deep frontier degrades to the
+    // supported honest-recompute path, a stale-shallow one only forgoes reuse.
+    bool disk_probe_primed                    = false;
+    std::optional<std::uint32_t> disk_probe_frontier;
 };
 
 // Program-owned physical planning state shared by request materialization and active capture.
@@ -584,9 +591,15 @@ public:
                              const AdmissionCandidate& candidate,
                              std::span<const SequenceHandle> persistent_borrowers) const;
     [[nodiscard]] ContextTransactionProgress<Variant>
-    progress_context_transaction(runtime::CancellationFlagView cancellation);
+    progress_context_transaction(runtime::CancellationFlagView cancellation,
+                                 std::uint32_t decode_ready);
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
+    // Write-side layering (see ContextCacheOptions): turn-end checkpoints run
+    // only while the host KV tier sits at/above the configured watermark, and
+    // contexts below min_persist_tokens never touch the disk tier.
+    [[nodiscard]] bool host_kv_checkpoint_allowed() const noexcept;
+    [[nodiscard]] std::uint32_t min_persist_tokens() const noexcept;
     void background_host_kv_tick() noexcept;
     bool proactive_pressure() noexcept;
     bool proactive_begin(const ContinuationHandle& owner);
@@ -1221,7 +1234,8 @@ private:
     ContextTransaction context_transaction_;
 
     [[nodiscard]] MaterializationResult
-    progress_materialization_transaction(runtime::CancellationFlagView cancellation);
+    progress_materialization_transaction(runtime::CancellationFlagView cancellation,
+                                         std::uint32_t decode_ready);
     [[nodiscard]] ActiveCaptureResult
     progress_active_capture_transaction(runtime::CancellationFlagView cancellation);
     [[nodiscard]] runtime::ContextTransactionReserveStatus
@@ -1269,7 +1283,8 @@ private:
                           MaterializationTransaction& transaction);
     void finalize_sequence(std::uint32_t lane, SequenceState& sequence,
                            MaterializationTransaction& transaction);
-    bool progress_disk_seed(SequenceState& sequence, MaterializationTransaction& transaction);
+    bool progress_disk_seed(SequenceState& sequence, MaterializationTransaction& transaction,
+                            std::uint32_t decode_ready);
     // Aggregate the KV batch's part tickets into the single ticket the rest of the
     // seed contract polls. MUST run before ANY poll of transaction.seed.read: the
     // aggregate is only advanced here, so a cancellation that polls the aggregate
@@ -1324,6 +1339,14 @@ private:
     [[nodiscard]] std::optional<std::uint32_t>
     l3_disk_restore_frontier(const qwen3_6::detail::PrefixShortlistDigests& digests,
                              std::uint32_t prompt_tokens, bool trace) const;
+
+public:
+    // Read-only admission preparation: run the L3 restore probe once for a
+    // pending head while a context transaction holds the admission gate, and
+    // cache the frontier on the base plan for inspect_lane to consume.
+    void prime_disk_probe(detail::RequestBasePlanImpl<NINFER_QWEN36_VARIANT>& base);
+
+private:
     [[nodiscard]] std::uint32_t device_kv_prefix_pages(const KVAddressSpaceStore& addresses,
                                                        KVAddressSpaceHandle address,
                                                        std::uint32_t frontier) const;

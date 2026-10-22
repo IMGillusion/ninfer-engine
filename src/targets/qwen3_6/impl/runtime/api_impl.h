@@ -389,13 +389,29 @@ std::optional<PersistentBackfillProof<Variant>> Program<Variant>::prove_persiste
 
 template <>
 ContextTransactionProgress<Variant>
-Program<Variant>::progress_context_transaction(runtime::CancellationFlagView cancellation) {
-    return impl_->progress_context_transaction(cancellation);
+Program<Variant>::progress_context_transaction(runtime::CancellationFlagView cancellation,
+                                               std::uint32_t decode_ready) {
+    return impl_->progress_context_transaction(cancellation, decode_ready);
+}
+
+template <>
+void Program<Variant>::prime_disk_probe(RequestBasePlan<Variant>& base) {
+    impl_->prime_disk_probe(*base.impl_);
 }
 
 template <>
 void Program<Variant>::finalize_context_transaction() noexcept {
     impl_->finalize_context_transaction();
+}
+
+template <>
+bool Program<Variant>::host_kv_checkpoint_allowed() const noexcept {
+    return impl_->host_kv_checkpoint_allowed();
+}
+
+template <>
+std::uint32_t Program<Variant>::min_persist_tokens() const noexcept {
+    return impl_->min_persist_tokens();
 }
 
 template <>

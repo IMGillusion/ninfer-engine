@@ -787,7 +787,8 @@ public:
     }
 
     [[nodiscard]] FakeContextTransactionProgress
-    progress_context_transaction(CancellationFlagView cancellation) {
+    progress_context_transaction(CancellationFlagView cancellation, std::uint32_t decode_ready = 0) {
+        (void)decode_ready;
         require(transaction_kind_ != TransactionKind::None,
                 "fake Program has no context transaction");
         if (progress_in_progress_once) {
@@ -1782,11 +1783,11 @@ ActiveRequest start_active(FakeManager& manager, FakeProgram& program, std::uint
     require(reserved == FakeManager::MaterializationReserveResult::Reserved,
             "request materialization was not reserved");
     auto outcome = [&]() -> FakeManager::MaterializationOutcome {
-        auto progress = manager.progress_context_transaction(program, {});
+        auto progress = manager.progress_context_transaction(program, {}, 0);
         if (!std::holds_alternative<ContextTransactionInProgress>(progress)) {
             return std::get<FakeManager::MaterializationOutcome>(std::move(progress));
         }
-        auto completed = manager.progress_context_transaction(program, {});
+        auto completed = manager.progress_context_transaction(program, {}, 0);
         return std::get<FakeManager::MaterializationOutcome>(std::move(completed));
     }();
     require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
@@ -2391,7 +2392,7 @@ void test_materialization_abort_preserves_source() {
         require(manager.reserve_materialization(program, std::move(*inspection.choice),
                     FakePreparedPrompt{51}, {}) == FakeManager::MaterializationReserveResult::Reserved,
                 "retryable spill test could not reserve");
-        auto progress = manager.progress_context_transaction(program, {});
+        auto progress = manager.progress_context_transaction(program, {}, 0);
         auto outcome = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
         require(outcome.status == ContextTransactionStatus::RetryableFailure && !outcome.activation,
                 "spill failure was disguised as cancellation/publication");
@@ -2427,7 +2428,7 @@ void test_materialization_abort_preserves_source() {
                                             FakePreparedPrompt{5}, {}) ==
                 FakeManager::MaterializationReserveResult::Reserved,
             "abort test could not reserve materialization");
-    auto progress = manager.progress_context_transaction(program, {});
+    auto progress = manager.progress_context_transaction(program, {}, 0);
     auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
     require(outcome.status == ContextTransactionStatus::Aborted && !outcome.activation,
             "cancelled materialization did not abort before publication");
@@ -2460,7 +2461,7 @@ void test_committed_victim_survives_transaction_abort() {
                                             FakePreparedPrompt{30}, {}) ==
                 FakeManager::MaterializationReserveResult::Reserved,
             "evicting materialization was not reserved");
-    auto progress = manager.progress_context_transaction(program, {});
+    auto progress = manager.progress_context_transaction(program, {}, 0);
     auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
     require(outcome.status == ContextTransactionStatus::Aborted,
             "pressure transaction did not take the abort path");
@@ -2490,7 +2491,7 @@ void test_uncommitted_pressure_acknowledgement_is_not_degradation() {
                 program.started_action_ids.front() == 1000U + seed.sequence.id,
             "pressure-abort test selected an eviction instead of preserving pressure");
 
-    auto progress = manager.progress_context_transaction(program, {});
+    auto progress = manager.progress_context_transaction(program, {}, 0);
     auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
     RuntimeStats stats;
     manager.populate_runtime_stats(program, stats);
@@ -2521,7 +2522,7 @@ void test_aborted_source_selection_does_not_create_hit_history() {
                                             FakePreparedPrompt{61}, {}) ==
                 FakeManager::MaterializationReserveResult::Reserved,
             "cancelled-hit test could not reserve exact reuse");
-    auto progress = manager.progress_context_transaction(program, {});
+    auto progress = manager.progress_context_transaction(program, {}, 0);
     auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
     require(outcome.status == ContextTransactionStatus::Aborted,
             "cancelled-hit test unexpectedly published its request");
@@ -2710,7 +2711,7 @@ void test_materialization_result_is_validated_before_any_adoption() {
 
     bool rejected = false;
     try {
-        (void)manager.progress_context_transaction(program, {});
+        (void)manager.progress_context_transaction(program, {}, 0);
     } catch (const std::logic_error&) { rejected = true; }
     require(rejected, "malformed materialization result was accepted");
     require(manager.catalog_state(0) == FakeManager::CatalogState::Claimed &&
@@ -2738,7 +2739,7 @@ void test_materialization_result_binds_exact_checkpoint_identity() {
 
     bool rejected = false;
     try {
-        (void)manager.progress_context_transaction(program, {});
+        (void)manager.progress_context_transaction(program, {}, 0);
     } catch (const std::logic_error&) { rejected = true; }
     require(rejected, "same-count checkpoint substitution was accepted");
     require(manager.catalog_state(0) == FakeManager::CatalogState::Claimed,
@@ -2849,7 +2850,7 @@ void test_in_progress_adoption_and_private_capture() {
         manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 1}, true, {});
     require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
             "private capture was not reserved");
-    auto progress = manager.progress_context_transaction(program, {});
+    auto progress = manager.progress_context_transaction(program, {}, 0);
     auto outcome  = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
     require(outcome.status == ContextTransactionStatus::Published &&
                 !manager.context_transaction_kind(),
@@ -2962,7 +2963,7 @@ void test_shared_fanout_keeps_owner_edges_live_across_summary_refresh() {
     require(manager.reserve_active_capture(program, seed.lane, FakeCaptureOffer{.id = 31}, 0, {}) ==
                 FakeManager::ActiveCaptureReserveResult::Reserved,
             "shared-fanout fixture could not publish its source");
-    auto capture_progress = manager.progress_context_transaction(program, {});
+    auto capture_progress = manager.progress_context_transaction(program, {}, 0);
     const auto capture = std::get<FakeManager::ActiveCaptureOutcome>(std::move(capture_progress));
     require(capture.status == ContextTransactionStatus::Published,
             "shared-fanout fixture did not publish its source");
@@ -3017,7 +3018,7 @@ void test_shared_capture_combines_two_pressure_owners() {
         manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 7}, 0, {});
     require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
             "shared capture did not reserve a multi-owner pressure target");
-    auto progress      = manager.progress_context_transaction(program, {});
+    auto progress      = manager.progress_context_transaction(program, {}, 0);
     const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
     require(outcome.status == ContextTransactionStatus::Published &&
                 program.started_action_ids.size() == 2,
@@ -3070,7 +3071,7 @@ void test_aborted_shared_capture_start_rolls_back_logical_claims() {
         manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 14}, 0, {});
     require(retried == FakeManager::ActiveCaptureReserveResult::Reserved,
             "aborted shared capture start leaked the shared publication slot");
-    auto progress      = manager.progress_context_transaction(program, {});
+    auto progress      = manager.progress_context_transaction(program, {}, 0);
     const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
     require(outcome.status == ContextTransactionStatus::Published,
             "shared capture retry did not publish after rollback");
@@ -3114,7 +3115,7 @@ void test_capture_result_is_validated_before_any_adoption() {
 
     bool rejected = false;
     try {
-        (void)manager.progress_context_transaction(program, {});
+        (void)manager.progress_context_transaction(program, {}, 0);
     } catch (const std::logic_error&) { rejected = true; }
     require(rejected, "malformed capture result was accepted");
     require(manager.catalog_state(0) == FakeManager::CatalogState::Claimed &&
@@ -3151,7 +3152,7 @@ void test_capture_result_is_adopted_by_owner_identity() {
     require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 27}, 0,
                                            {}) == FakeManager::ActiveCaptureReserveResult::Reserved,
             "reordered capture fixture could not reserve pressure");
-    auto progress      = manager.progress_context_transaction(program, {});
+    auto progress      = manager.progress_context_transaction(program, {}, 0);
     const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
     require(outcome.status == ContextTransactionStatus::Published &&
                 manager.catalog_state(0) == FakeManager::CatalogState::Catalogued &&
