@@ -4049,14 +4049,18 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
         // idled the disk for the copy plus sync; strace showed the bridge
         // workers ~97% idle across those windows. A failed or expired read
         // stops the prefix (the aggregate failure path owns the rollback; a
-        // garbage copy landing before it is harmless).
+        // garbage copy landing before it is harmless). MUST run before
+        // poll_seed_batch: the aggregate poll clears the ticket vector once
+        // every read is terminal, and the prefix walk indexes that vector.
         const auto copy_ready_prefix = [&]() {
             if (!progress.batch_open) { return; }
             const auto now = std::chrono::steady_clock::now();
-            std::uint32_t prefix = progress.copied_pages;
-            while (prefix < progress.batch_pages) {
+            const std::uint32_t limit =
+                std::min<std::uint32_t>(progress.batch_pages,
+                                        static_cast<std::uint32_t>(progress.batch.size()));
+            std::uint32_t prefix = std::min(progress.copied_pages, limit);
+            while (prefix < limit) {
                 const auto result = DiskKVBridge::poll(progress.batch[prefix], now, l3_queue_deadline());
-                if (result == DiskReadResult::Pending) { break; }
                 if (result != DiskReadResult::Success) { break; }
                 ++prefix;
             }
@@ -4104,8 +4108,8 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
                     continue;   // queue headroom returned mid-visit: top up in place
                 }
             }
-            poll_seed_batch(progress, std::chrono::steady_clock::now());
             copy_ready_prefix();
+            poll_seed_batch(progress, std::chrono::steady_clock::now());
             auto result = progress.read ? progress.read->result.load(std::memory_order_acquire)
                                         : DiskReadResult::Success;
             if (result == DiskReadResult::Pending) {
@@ -4119,8 +4123,19 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
                 progress.copied_pages = 0;
                 return fail();
             }
-            // The prefix copy covered every completed read; the final sync only
-            // drains copies still in flight and re-arms the scratch for reuse.
+            // The aggregate poll may have cleared the tickets; every read of a
+            // Success aggregate has landed, so any prefix not yet copied (last
+            // completions racing this poll) copies directly from the scratch now.
+            if (progress.copied_pages < progress.batch_pages) {
+                const std::uint32_t count = progress.batch_pages - progress.copied_pages;
+                pages->physical_pool().copy_from_host(
+                    host_kv_arena->view(*scratch).subview(progress.copied_pages, count),
+                    std::span<const DeviceKVPageHandle>(progress.batch_destinations.data() + progress.copied_pages,
+                                                        count),
+                    device.stream);
+                progress.copied_pages = progress.batch_pages;
+            }
+            // Drains copies still in flight and re-arms the scratch for reuse.
             CUDA_CHECK(cudaStreamSynchronize(device.stream));
             progress.pages_read += progress.batch_pages;
             progress.page += progress.batch_pages;
