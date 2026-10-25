@@ -13898,6 +13898,23 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                         // recompute. Already-present pages dedup to a touch. The write uses
                         // the dedicated seam scratch, so it never contends with a proactive
                         // owner spill holding the shared seed/spill scratch.
+                        // Chain pages queue through the bridge instead of paying an
+                        // inline synchronous write per page. A saturated store (free-pool
+                        // refills + writeback stalls) measured ~0.3s per page inside
+                        // advance_prefill: one 1.3K-token preopener increment = 42 pages
+                        // = 11.6s of first-token latency with the GPU idle. The failure
+                        // model is unchanged: the old bounded_sync_write already degraded
+                        // silently on timeout, and a dropped page just stops the next
+                        // probe at that hole (shallower restore or honest recompute).
+                        // Owned submission swaps the buffer, so the seam scratch stays
+                        // free immediately and no ticket lifetime outlives this block.
+                        const auto seam_queue_write =
+                            [&](const DiskKVIdentity& page_id, DiskKVKind page_kind,
+                                const void* data, std::size_t bytes) {
+                                std::vector<std::byte> owned(bytes);
+                                std::memcpy(owned.data(), data, bytes);
+                                (void)disk_kv->try_submit_owned(page_id, page_kind, owned);
+                            };
                         const auto spill_one_seam_page =
                             [&](auto* addresses, auto address, auto* pages, std::size_t stride,
                                 DiskKVKind kind, std::uint32_t frontier, const auto& digest,
@@ -13934,8 +13951,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                     const auto view = host_kv_extents->view(replica.extent)
                                                           .subview(replica.page_offset, 1);
                                     if (view.data() == nullptr) { return; }
-                                    (void)disk_kv->spill_page_sync(
-                                        id, kind, std::span<const std::byte>(view.data(), stride));
+                                    seam_queue_write(id, kind, view.data(), stride);
                                     return;
                                 }
                                 if (!pages->device_resident(logical)) { return; }
@@ -13958,9 +13974,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                            : cudaErrorUnknown;
                                 pages->unpin_source(logical);
                                 if (status != cudaSuccess) { return; }
-                                (void)disk_kv->spill_page_sync(
-                                    id, kind,
-                                    std::span<const std::byte>(destination.data(), stride));
+                                seam_queue_write(id, kind, destination.data(), stride);
                             };
                         if ((preopener_seam || probe_seam) && sequence.kv) {
                             const std::uint32_t page_size =

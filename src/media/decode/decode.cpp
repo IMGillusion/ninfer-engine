@@ -397,7 +397,8 @@ int rotation_of(const AVStream* stream) {
     }
     int size = 0;
     const std::uint8_t* side_data = nullptr;
-#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(60, 0, 100)
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(59, 0, 100)
+    // libavformat 59 changed the side-data size parameter from int* to size_t*.
     size_t side_data_size = 0;
     side_data = av_stream_get_side_data(stream, AV_PKT_DATA_DISPLAYMATRIX, &side_data_size);
     size = static_cast<int>(side_data_size);

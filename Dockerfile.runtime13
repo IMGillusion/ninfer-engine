@@ -1,0 +1,34 @@
+# Runtime image for binaries prebuilt in the nb-build container (gcc:13 +
+# NVIDIA apt cuda-nvcc/cudart-dev 13.1). Same bookworm userland as the build
+# side, so ffmpeg/curl sonames match; libcudart.so.13 ships with the image.
+# libcuda.so.1 comes from the host driver via --gpus at run time.
+FROM docker.m.daocloud.io/library/gcc:13
+
+RUN cat > /etc/apt/sources.list.d/debian.sources <<'EOF'
+Types: deb
+URIs: https://mirrors.aliyun.com/debian
+Suites: bookworm bookworm-updates
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+RUN apt-get update -qq \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+        ca-certificates libavcodec59 libavformat59 libavutil57 libswscale6 libcurl4 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY artifacts/libcudart.so.13.1.80 /usr/local/cuda/lib64/libcudart.so.13.1.80
+# Replace the distro libstdc++ in place: the loader keeps resolving the
+# /usr/lib path, and gcc-13.2's 6.0.32 is backward compatible with 6.0.30.
+COPY artifacts/libstdc++.so.6.0.32 /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.32
+RUN ln -sf /usr/local/cuda/lib64/libcudart.so.13.1.80 /usr/local/cuda/lib64/libcudart.so.13 \
+    && ln -sf libstdc++.so.6.0.32 /usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
+    && echo /usr/local/cuda/lib64 > /etc/ld.so.conf.d/cuda.conf && ldconfig
+COPY artifacts/ninfer /usr/local/bin/ninfer
+COPY artifacts/ninfer-serve /usr/local/bin/ninfer-serve
+COPY artifacts/ninfer-perplexity /usr/local/bin/ninfer-perplexity
+
+WORKDIR /workspace
+EXPOSE 8080
+STOPSIGNAL SIGTERM
+ENTRYPOINT []
+CMD ["ninfer-serve", "--help"]
