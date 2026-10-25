@@ -1135,6 +1135,13 @@ private:
             std::vector<ReadTicket> batch;
             std::vector<DeviceKVPageHandle> batch_destinations;
             std::uint32_t batch_pages = 0;
+            // Pipelined H2D: pages [0, copied_pages) of the open batch already have
+            // their copy issued on the device stream, issued as soon as each read
+            // completed instead of after the whole batch drains. The batch barrier
+            // used to serialize the H2D behind the slowest of ~128 reads (p90-p99
+            // of a cold QLC volume, 10-100ms) and idled the disk for the copy; the
+            // prefix copy keeps reads in flight continuously.
+            std::uint32_t copied_pages = 0;
             // A batch stays open while it is being topped up to a full scratch: the
             // shared bridge queue usually cannot accept all 128 reads at once, and
             // closing short batches there measured ~700MB/s instead of the path's

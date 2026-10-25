@@ -3982,18 +3982,19 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
         const auto address = backend ? *sequence.kv->backend : sequence.kv->text;
         const auto* layout = host_kv_arena->layout_for(pages->physical_pool().geometry());
         if (!layout || progress.page >= addresses->mapped_pages(address)) { progress.reason = "mapping"; return fail(); }
-        // Read a whole scratch-full of pages per visit and copy them back with ONE
-        // H2D. One page per visit throttled the restore to the scheduler cadence
-        // (~1461 visits, ~52s for a 93K-token prompt) - slower than recomputing it.
-        //
-        // The submit of the NEXT batch happens at the end of this visit, right
-        // after the copy is issued and synchronized, instead of after a trip back
-        // to the scheduler. Without that, each batch's store reads only start one
-        // scheduling step (~30-60ms under load) after the previous batch drained,
-        // which halved the achievable rate: 5164 pages measured 7.4s against a
-        // ~2.6s I/O floor. The copy itself costs ~6ms for a full batch, so doing it
-        // inline is cheaper than the bubble it removes, and no second buffer or
-        // event is needed because the sync already protects the scratch.
+        // Read a whole scratch-full of pages per visit and copy each completed
+        // prefix back as it lands (copy_ready_prefix below). One page per visit
+        // throttled the restore to the scheduler cadence (~1461 visits, ~52s for
+        // a 93K-token prompt) - slower than recomputing it; one whole-batch H2D
+        // after the batch drained then became the next ceiling: the copy
+        // serialized behind the slowest read of ~128 (a cold volume's p90-p99 is
+        // 10-100ms, paid once per batch) and idled both the disk and the bridge
+        // workers for the copy plus sync (strace: workers ~97% idle across those
+        // windows; a warm restore spent ~20ms per batch copying and ~0.05ms
+        // reading). The prefix pipeline keeps reads in flight continuously and
+        // overlaps the H2D with them; the batch-end sync only re-arms the
+        // scratch, and the submit of the NEXT batch still happens before
+        // returning to the scheduler.
         const auto total = kv_pages_for_frontier(frontier);
         const auto kind = backend ? DiskKVKind::BackendKV : DiskKVKind::MainKV;
         // Top up the scratch, then CLOSE the batch only once it is full or the
@@ -4030,8 +4031,43 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
             progress.batch_open = true;
             progress.batches += 1;
             progress.max_batch = std::max(progress.max_batch, progress.batch_pages);
+            progress.copied_pages = 0;
+            // Destinations are resolvable at submit time; building them here lets
+            // the pipelined copy below fire without a second resolution pass.
+            progress.batch_destinations.clear();
+            for (std::uint32_t i = 0; i < progress.batch_pages; ++i) {
+                progress.batch_destinations.push_back(
+                    pages->physical(addresses->logical_page(address, progress.page + i)));
+            }
             progress.read = std::make_shared<ReadCompletion>();
             return true;
+        };
+        // Pipelined H2D: issue the device copy for every prefix of completed
+        // reads the moment it extends, instead of after the whole batch drains.
+        // The old whole-batch copy serialized behind the slowest read of the
+        // batch (a cold volume's p90-p99 is 10-100ms, paid ~8 waves deep) and
+        // idled the disk for the copy plus sync; strace showed the bridge
+        // workers ~97% idle across those windows. A failed or expired read
+        // stops the prefix (the aggregate failure path owns the rollback; a
+        // garbage copy landing before it is harmless).
+        const auto copy_ready_prefix = [&]() {
+            if (!progress.batch_open) { return; }
+            const auto now = std::chrono::steady_clock::now();
+            std::uint32_t prefix = progress.copied_pages;
+            while (prefix < progress.batch_pages) {
+                const auto result = DiskKVBridge::poll(progress.batch[prefix], now, l3_queue_deadline());
+                if (result == DiskReadResult::Pending) { break; }
+                if (result != DiskReadResult::Success) { break; }
+                ++prefix;
+            }
+            if (prefix == progress.copied_pages) { return; }
+            const std::uint32_t count = prefix - progress.copied_pages;
+            pages->physical_pool().copy_from_host(
+                host_kv_arena->view(*scratch).subview(progress.copied_pages, count),
+                std::span<const DeviceKVPageHandle>(progress.batch_destinations.data() + progress.copied_pages,
+                                                    count),
+                device.stream);
+            progress.copied_pages = prefix;
         };
         if (!progress.batch_open) {
             fill_batch();
@@ -4069,6 +4105,7 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
                 }
             }
             poll_seed_batch(progress, std::chrono::steady_clock::now());
+            copy_ready_prefix();
             auto result = progress.read ? progress.read->result.load(std::memory_order_acquire)
                                         : DiskReadResult::Success;
             if (result == DiskReadResult::Pending) {
@@ -4078,24 +4115,17 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
             }
             if (result != DiskReadResult::Success) {
                 if (progress.reason == nullptr) { progress.reason = "kv-read"; }
-                progress.batch_pages = 0; return fail();
+                progress.batch_pages = 0;
+                progress.copied_pages = 0;
+                return fail();
             }
-            progress.batch_destinations.clear();
-            for (std::uint32_t i = 0; i < progress.batch_pages; ++i) {
-                progress.batch_destinations.push_back(
-                    pages->physical(addresses->logical_page(address, progress.page + i)));
-            }
-            // Batched H2D on the compute stream: mapping and ordered_reset precede these
-            // copies on the SAME stream. No transfer pipeline event/wait is introduced.
-            pages->physical_pool().copy_from_host(
-                host_kv_arena->view(*scratch).subview(0, progress.batch_pages),
-                std::span<const DeviceKVPageHandle>(progress.batch_destinations.data(),
-                                                    progress.batch_destinations.size()),
-                device.stream);
+            // The prefix copy covered every completed read; the final sync only
+            // drains copies still in flight and re-arms the scratch for reuse.
             CUDA_CHECK(cudaStreamSynchronize(device.stream));
             progress.pages_read += progress.batch_pages;
             progress.page += progress.batch_pages;
             progress.batch_pages = 0;
+            progress.copied_pages = 0;
             progress.batch.clear();   // this batch's tickets must not join the next poll
             progress.batch_open = false;
             progress.read.reset();
@@ -5914,7 +5944,20 @@ void ProgramImplCore::release_materialization_staging(
     // Queue-side deadline expiry folds a not-yet-run read into a terminal result
     // while its worker still borrows the shared KV scratch. Like the seed-failure
     // path, block until every accepted job is truly idle so the next request's
-    // fill_batch cannot race a stale pread into its own device KV.
+    // fill_batch cannot race a stale pread into its own device KV. The pipelined
+    // prefix copies issued by the seed loop also read the scratch on the device
+    // stream: drain them before the lease releases. A stream that will not
+    // synchronize breaks the scratch handover contract exactly like the seed
+    // failure drain - hard exit, restart recovers.
+    {
+        const cudaError_t drained = cudaStreamSynchronize(device.stream);
+        if (drained != cudaSuccess) {
+            disk_kv_logf('E', "l3-seed-yield", "staging drain failed: %s | restart required",
+                         cudaGetErrorString(drained));
+            fflush(stderr);
+            std::_Exit(70);
+        }
+    }
     if (disk_kv) { disk_kv->wait_idle(); }
     transaction.seed.state_scratch_lease.reset();
     transaction.staged_prefill.reset();
