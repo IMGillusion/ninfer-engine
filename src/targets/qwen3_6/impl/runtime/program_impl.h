@@ -4058,7 +4058,15 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
             const std::uint32_t limit =
                 std::min<std::uint32_t>(progress.batch_pages,
                                         static_cast<std::uint32_t>(progress.batch.size()));
-            std::uint32_t prefix = std::min(progress.copied_pages, limit);
+            // Tickets cleared under us (an aggregate poll folded the batch while
+            // copied_pages lags, e.g. deadline-folded reads under queue
+            // saturation): the terminal branch owns the tail - a Success
+            // aggregate guarantees every read landed, a failure resets the
+            // batch. Clamping prefix down to limit here would make
+            // count = prefix - copied_pages underflow (63 production seed
+            // failures), so step aside instead.
+            if (limit <= progress.copied_pages) { return; }
+            std::uint32_t prefix = progress.copied_pages;
             while (prefix < limit) {
                 const auto result = DiskKVBridge::poll(progress.batch[prefix], now, l3_queue_deadline());
                 if (result != DiskReadResult::Success) { break; }
@@ -4184,7 +4192,10 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
             static_cast<unsigned long long>(disk_stats_at_yield.restore_misses));
     return true;
     } catch (const std::exception& error) {
-        disk_kv_logf('E', "l3-seed-yield", "seed threw | what=%s", error.what());
+        disk_kv_logf('E', "l3-seed-yield",
+                     "seed threw | what=%s | phase=%u page=%u batch_pages=%u copied=%zu tickets=%zu",
+                     error.what(), progress.phase, progress.page, progress.batch_pages,
+                     static_cast<std::size_t>(progress.copied_pages), progress.batch.size());
         return fail();
     } catch (...) {
         disk_kv_logf('E', "l3-seed-yield", "seed threw | unknown CPU exception");

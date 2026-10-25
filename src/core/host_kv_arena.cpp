@@ -1,5 +1,6 @@
 #include "core/host_kv_arena.h"
 
+#include "core/disk_kv_log.h"
 #include "core/dtype.h"
 
 #include <algorithm>
@@ -143,6 +144,8 @@ const HostKVPageLayout& HostKVAllocationView::layout() const {
 
 HostKVAllocationView HostKVAllocationView::subview(std::uint32_t begin, std::uint32_t count) const {
     if (!valid() || count == 0 || begin > page_count_ || count > page_count_ - begin) {
+        disk_kv_logf('E', "l3-arena", "subview reject | begin=%u count=%u pages=%u valid=%d",
+                     begin, count, page_count_, static_cast<int>(valid()));
         throw std::out_of_range("Host KV subview is outside its allocation");
     }
     return HostKVAllocationView(
@@ -161,6 +164,8 @@ const HostKVPageLayout& HostKVAllocationConstView::layout() const {
 HostKVAllocationConstView HostKVAllocationConstView::subview(std::uint32_t begin,
                                                              std::uint32_t count) const {
     if (!valid() || count == 0 || begin > page_count_ || count > page_count_ - begin) {
+        disk_kv_logf('E', "l3-arena", "const subview reject | begin=%u count=%u pages=%u valid=%d",
+                     begin, count, page_count_, static_cast<int>(valid()));
         throw std::out_of_range("Host KV subview is outside its allocation");
     }
     return HostKVAllocationConstView(
