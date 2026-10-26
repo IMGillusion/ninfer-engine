@@ -327,6 +327,16 @@ private:
     std::deque<SpillJob> queue_;
     // Maintenance lane drained before the general queue; same capacity budget.
     std::deque<SpillJob> priority_queue_;
+    // Request-path lane (seed restore reads) drained before maintenance: a
+    // checkpoint/eviction flood used to park in front of the priority lane and
+    // stretch every admission's seed to 2.5-5s under load - the single
+    // materialization transaction gates admission, so that latency multiplies
+    // across every queued request. Same capacity budget.
+    std::deque<SpillJob> seed_queue_;
+    // Sum of all three lanes; only meaningful under qmu_.
+    [[nodiscard]] std::size_t queued_jobs() const noexcept {
+        return queue_.size() + priority_queue_.size() + seed_queue_.size();
+    }
     std::vector<std::thread> workers_;
     bool quit_ = false;
     std::size_t in_flight_ = 0;  // jobs pulled from the queue, not yet applied

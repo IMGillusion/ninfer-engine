@@ -230,10 +230,19 @@ public:
         request.remaining_service_work -= work;
     }
 
+    // A staged prefill owning the pipe no longer blocks admission by itself:
+    // the admitted request spends its materialization (which needs no pipe)
+    // while the owner keeps running, and the pipe changes hands at adoption
+    // time through yield_pipe_for_adoption. That preemption only exists when
+    // prefill yielding is enabled, so callers pass prefill_pipe_preemptible
+    // = prefill_yield_max_ms != 0; without it the historical exclusive-pipe
+    // gate stays (set_prefill_lane would throw on a conflict).
     [[nodiscard]] bool should_attempt_admission(bool have_pending, bool admission_check_pending,
                                                 bool have_decode, bool previous_unit_was_decode,
-                                                bool context_transaction) const noexcept {
-        return have_pending && admission_check_pending && !context_transaction && !prefill_lane_ &&
+                                                bool context_transaction,
+                                                bool prefill_pipe_preemptible) const noexcept {
+        return have_pending && admission_check_pending && !context_transaction &&
+               (!prefill_lane_ || prefill_pipe_preemptible) &&
                (!have_decode || previous_unit_was_decode);
     }
 

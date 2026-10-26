@@ -2362,7 +2362,8 @@ private:
                     admission_check_pending_.load(std::memory_order_acquire);
                 if (scheduler_.should_attempt_admission(
                         have_pending, admission_check_pending, !membership.empty(),
-                        previous_unit_was_decode, instance_.program->has_context_transaction()) &&
+                        previous_unit_was_decode, instance_.program->has_context_transaction(),
+                        prefill_yield_max_ms_ != 0) &&
                     consume_admission_check()) {
                     (void)try_admit_one();
                     membership = scheduler_.build_round_membership(slots_, max_concurrency_);
