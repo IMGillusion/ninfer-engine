@@ -1932,6 +1932,109 @@ private:
         return progress_context_transaction(false);
     }
 
+    // Rescues the FIFO head out of the pending queue while a materialization
+    // gates admission. The waiter carries no lane, grant, or reservation: it
+    // only stops the request's queue deadline from expiring behind a gate it
+    // cannot control. Readiness is checked here so a permanently infeasible
+    // head fails through the ordinary path instead of squatting on the slot;
+    // everything else (grant, reserve, prepare) happens at promotion through
+    // the untouched admission machinery, after the transaction slot frees.
+    void try_create_materialization_waiter() {
+        if (materialization_waiters_.size() >= kMaterializationWaiters ||
+            !instance_.program->has_context_transaction()) {
+            return;
+        }
+        const FifoSnapshot queued = pending_snapshot();
+        if (queued.empty()) { return; }
+        const std::shared_ptr<Request>& head = queued.head();
+        if (head->cancelled.load(std::memory_order_acquire) ||
+            Clock::now() >= head->deadline) {
+            return;   // ordinary expiry/cancel paths own these
+        }
+        try {
+            ensure_base_plan(head);
+        } catch (...) {
+            (void)remove_pending_error(head, std::current_exception());
+            return;
+        }
+        std::optional<ResourceInspection> inspection;
+        try {
+            inspection.emplace(inspect_admission(head));
+        } catch (...) {
+            (void)remove_pending_error(head, std::current_exception());
+            return;
+        }
+        if (inspection->readiness == Readiness::PermanentlyInfeasible) {
+            (void)remove_pending_error(
+                head, std::make_exception_ptr(RequestError(
+                          RequestErrorKind::ContextLengthExceeded,
+                          "request reservation exceeds Engine shared KV capacity")));
+            return;
+        }
+        // TemporarilyBlocked is the state this rescue exists for: with
+        // lanes full behind the open transaction the head inspects as
+        // pressure-blocked, and refusing it here would rescue only the
+        // heads that never needed rescuing. A blocked waiter re-enters
+        // the full ordinary path (inspect/backfill/protect) at promotion.
+        if (!erase_pending(head)) { return; }
+        scheduler_.on_waiting_removed(head->id);
+        materialization_waiters_.push_back(head);
+        if (const char* tfp = std::getenv("NINFER_TOKEN_FP");
+            tfp != nullptr && tfp[0] != '\0') {
+            std::fprintf(stderr, "[waiter] rescued id=%llu prompt=%u depth=%zu\n",
+                         static_cast<unsigned long long>(head->id),
+                         head->prompt_summary.prompt_tokens, materialization_waiters_.size());
+            std::fflush(stderr);
+        }
+    }
+
+    // Hands waiters back to the ordinary admission path once the context
+    // transaction slot is free. Expiry and cancellation still apply while a
+    // request waits for the slot - only the FIFO deadline behind the OPEN
+    // gate is paused. The request re-enters the FRONT of the pending queue
+    // and is admitted by the boundary's normal gate (fresh inspection, grant,
+    // reserve, prepare - all strictly after the previous transaction closed,
+    // so the shared prepare tables never overlap a live seed).
+    void promote_materialization_waiters() {
+        while (!materialization_waiters_.empty()) {
+            auto& request = materialization_waiters_.front();
+            if (request->cancelled.load(std::memory_order_acquire)) {
+                materialization_waiters_.pop_front();
+                complete_detached_cancelled(request);
+                publish_runtime_stats();
+                continue;
+            }
+            // No deadline check here: the waiter slot intentionally carries no
+            // deadline (the pause is the mechanism - the head was trapped
+            // behind the open transaction through no fault of its own).
+            // Promotion re-arms the standard admission window below, so a
+            // promoted head still cannot hang admission forever.
+            break;
+        }
+        if (materialization_waiters_.empty() || materializing_ ||
+            instance_.program->has_context_transaction()) {
+            return;
+        }
+        const std::shared_ptr<Request> request = materialization_waiters_.front();
+        materialization_waiters_.pop_front();
+        // The waiter slot carried no deadline (the pause is the point).
+        // Re-arm the standard admission window: promotion must still make
+        // real progress, it just is not charged for the transaction chain
+        // it waited behind.
+        request->deadline = Clock::now() + pending_timeout_;
+        {
+            std::lock_guard lock(queue_mutex_);
+            pending_.push_front(request);
+        }
+        if (const char* tfp = std::getenv("NINFER_TOKEN_FP");
+            tfp != nullptr && tfp[0] != '\0') {
+            std::fprintf(stderr, "[waiter] promoted id=%llu\n",
+                         static_cast<unsigned long long>(request->id));
+            std::fflush(stderr);
+        }
+        request_admission_check();
+    }
+
     AdmissionProgress try_admit_one() {
         DetailScope detail(*this, &RuntimeHostWorkStats::admission_policy_ns,
                            &RuntimeHostWorkStats::admission_policy_invocations,
@@ -2270,6 +2373,12 @@ private:
                 slots_[lane].reset();
             }
         }
+        // Waiters live outside pending_ and slots_; without this they would
+        // never observe the teardown and their clients would hang.
+        while (!materialization_waiters_.empty()) {
+            complete_error(materialization_waiters_.front(), error);
+            materialization_waiters_.pop_front();
+        }
         if (materializing_request != nullptr) { complete_error(materializing_request, error); }
         for (const auto& request : pending) { complete_error(request, error); }
         publish_runtime_stats();
@@ -2347,6 +2456,7 @@ private:
                 HostPhaseMeasurement boundary = begin_host_phase();
                 const bool have_pending       = expire_pending_requests();
                 (void)progress_context_transaction(have_pending, decode_ready_count());
+                promote_materialization_waiters();
                 prime_admission_preparation();
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
@@ -2360,13 +2470,27 @@ private:
                     scheduler_.build_round_membership(slots_, max_concurrency_);
                 const bool admission_check_pending =
                     admission_check_pending_.load(std::memory_order_acquire);
-                if (scheduler_.should_attempt_admission(
-                        have_pending, admission_check_pending, !membership.empty(),
-                        previous_unit_was_decode, instance_.program->has_context_transaction(),
-                        prefill_yield_max_ms_ != 0) &&
-                    consume_admission_check()) {
+                const bool gate_open = scheduler_.should_attempt_admission(
+                    have_pending, admission_check_pending, !membership.empty(),
+                    previous_unit_was_decode, instance_.program->has_context_transaction(),
+                    prefill_yield_max_ms_ != 0);
+                // When the ONLY blocker is the open context transaction, rescue the
+                // FIFO head into the waiter slot: its queue deadline stops running,
+                // and it re-enters admission the moment the slot frees.
+                // Rescue needs no decode/prefill throttling: a rescued
+                // request holds zero resources and never disputes a round.
+                // Evaluated EVERY boundary while the transaction gate is
+                // shut - not keyed to the one-shot admission flag: a head
+                // inspected in a microsecond gap between two transactions
+                // (lanes full, protected) consumed that flag and then sat out
+                // the whole chain with its deadline running (observed: 25
+                // timeouts, zero rescues). Rescuing is idempotent, resource-
+                // free, and capped, so the per-boundary evaluation is cheap.
+                if (gate_open && consume_admission_check()) {
                     (void)try_admit_one();
                     membership = scheduler_.build_round_membership(slots_, max_concurrency_);
+                } else if (!gate_open && materialization_waiters_.size() < kMaterializationWaiters) {
+                    try_create_materialization_waiter();
                 }
 
                 // Cancellation is sampled once for the execution unit. A request arriving while
@@ -2506,6 +2630,18 @@ private:
     std::uint64_t next_publication_order_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<MaterializingRequest> materializing_;
+    // Requests rescued out of the FIFO while a materialization gates the
+    // admission gate. The single context transaction serializes
+    // materializations, so under a burst every request behind the open one
+    // kept its queue deadline running and expired as 503 while lanes sat
+    // idle (observed: 103 queue timeouts in one peak hour with running 2-4
+    // and materializing 1 throughout). A waiter holds NO lane, reservation,
+    // or Program state: it is re-inspected and granted through the ordinary
+    // admission path the moment the transaction slot frees
+    // (promote_materialization_waiters), so the shared prepare tables and
+    // the transaction slot stay strictly single-owner.
+    static constexpr std::size_t kMaterializationWaiters = 4;
+    std::deque<std::shared_ptr<Request>> materialization_waiters_;
     Scheduling scheduler_;
     std::atomic<bool> admission_check_pending_{false};
     // Read-only admission preparation: the pending head whose base plan and L3
