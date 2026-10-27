@@ -595,6 +595,11 @@ public:
                                  std::uint32_t decode_ready);
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
+    // True when a materialization slot is free (captures are not counted).
+    [[nodiscard]] bool materialization_slot_free() const noexcept;
+    [[nodiscard]] std::uint32_t free_materialization_slot() const noexcept;
+    // Destination lane of the slot the next progress call advances.
+    [[nodiscard]] std::uint32_t next_materialization_destination() const noexcept;
     // Write-side layering (see ContextCacheOptions): turn-end checkpoints run
     // only while the host KV tier sits at/above the configured watermark, and
     // contexts below min_persist_tokens never touch the disk tier.
@@ -726,6 +731,14 @@ public:
     // state slots / KV arena) can neither fail nor block a restore.
     std::optional<HostKVAllocation> l3_kv_scratch;
     std::optional<HostKVAllocation> l3_backend_scratch;
+    // Second scratch set for the second materialization slot: two concurrent
+    // seeds each borrow their own buffers, so neither serializes on the other.
+    // Proactive/owner spills and slot-0 seeds share the first set (lease
+    // arbitrated, as before); slot-1 seeds use the second set exclusively.
+    std::optional<HostKVAllocation> l3_kv_scratch_b;
+    std::optional<HostKVAllocation> l3_backend_scratch_b;
+    std::optional<qwen3_6::HostStateSlotHandle> l3_state_scratch_b;
+    StateScratchLease l3_state_scratch_lease_b;
     // Dedicated seam-write scratch (two pages each): independent of the shared seed/spill
     // scratch so a proactive owner spill never blocks the prefill seam write.
     std::optional<HostKVAllocation> l3_seam_scratch;
@@ -1021,6 +1034,8 @@ private:
     void abandon_owner_spill(OwnerSpillProgress& progress) noexcept;
 
     struct MaterializationTransaction {
+        // Which of the two materialization slots owns this transaction.
+        std::uint32_t slot = 0;
         struct KVRestorePage {
             LogicalKVPageHandle logical;
             HostKVExtentCapability extent;
@@ -1168,6 +1183,13 @@ private:
             bool failing = false; // stop admission, retain scratch until all borrows drain
         } seed;
         SeedLifecycle seed_lifecycle;
+        // Per-transaction prepare state. These used to be single class members;
+        // with more than one materialization slot a concurrent reserve would
+        // clobber a live seed's digest chain mid-restore - the silent
+        // crossing shape - so the tables travel with the transaction.
+        std::vector<TokenId> ledger;
+        qwen3_6::detail::ResidentPrefixIdentity identity;
+        qwen3_6::detail::PrefixShortlistDigests prefix_digests;
         bool state_restored                 = false;
         bool transfer_submitted             = false;
         std::uint8_t transfer_timer_mask    = 0;
@@ -1183,9 +1205,6 @@ private:
     std::uint64_t next_materialization_id_ = 1;
     CudaCompletionEvent context_source_ready_;
     CudaCompletionEvent context_completion_;
-    std::vector<TokenId> materialization_ledger_;
-    qwen3_6::detail::ResidentPrefixIdentity materialization_identity_;
-    qwen3_6::detail::PrefixShortlistDigests materialization_prefix_digests_;
 
     struct ActiveCaptureTransaction {
         std::uint64_t id         = 0;
@@ -1236,13 +1255,24 @@ private:
 
     std::uint64_t next_capture_offer_id_ = 1;
 
+    // Materializations live in a fixed two-slot array (materializations_):
+    // two seeds may restore concurrently and each owns its prepare tables.
+    // The variant keeps only the capture path, which stays exclusive -
+    // capture versus capture serialization is what its state-fork
+    // machinery is audited for.
     using ContextTransaction =
-        std::variant<std::monostate, MaterializationTransaction, ActiveCaptureTransaction>;
+        std::variant<std::monostate, ActiveCaptureTransaction>;
     ContextTransaction context_transaction_;
+    std::array<std::optional<MaterializationTransaction>, 2> materializations_;
+    std::array<bool, 2> materialization_open_{{false, false}};
+    std::uint32_t materialization_cursor_ = 0;
+
 
     [[nodiscard]] MaterializationResult
     progress_materialization_transaction(runtime::CancellationFlagView cancellation,
-                                         std::uint32_t decode_ready);
+                                         std::uint32_t decode_ready,
+                                         MaterializationTransaction& transaction,
+                                         std::uint32_t slot);
     [[nodiscard]] ActiveCaptureResult
     progress_active_capture_transaction(runtime::CancellationFlagView cancellation);
     [[nodiscard]] runtime::ContextTransactionReserveStatus

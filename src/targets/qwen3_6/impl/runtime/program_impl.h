@@ -1025,6 +1025,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             host_kv_arena->layout_for(text_kv_pages->physical_pool().geometry());
         if (main_scratch_layout != nullptr) {
             l3_kv_scratch = host_kv_arena->allocate(*main_scratch_layout, kL3ScratchPages);
+            l3_kv_scratch_b = host_kv_arena->allocate(*main_scratch_layout, kL3ScratchPages);
             // Dedicated two-page scratch for the prefill seam write: it must never contend
             // with the shared seed/spill scratch a proactive owner spill may hold mid-batch
             // while the next round's prefill runs.
@@ -1036,11 +1037,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             if (backend_scratch_layout != nullptr) {
                 l3_backend_scratch =
                     host_kv_arena->allocate(*backend_scratch_layout, kL3ScratchPages);
+                l3_backend_scratch_b =
+                    host_kv_arena->allocate(*backend_scratch_layout, kL3ScratchPages);
                 l3_seam_backend_scratch =
                     host_kv_arena->allocate(*backend_scratch_layout, 2U);
             }
         }
         l3_state_scratch = host_state_images->allocate();
+        l3_state_scratch_b = host_state_images->allocate();
         disk_kv_logf('I', "l3-restore", "scratch reserved | kv=%d backend=%d state=%d",
                      static_cast<int>(l3_kv_scratch.has_value()),
                      static_cast<int>(l3_backend_scratch.has_value()),
@@ -1080,9 +1084,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         // One retained shared resume source can coexist with every fixed per-request candidate.
         sequence.shared_prefix_references.reserve(8U);
     }
-    materialization_ledger_.reserve(static_cast<std::size_t>(capacity) + 1ULL);
-    materialization_identity_.reserve(static_cast<std::size_t>(capacity) + 1ULL);
-    materialization_prefix_digests_.reserve(static_cast<std::size_t>(capacity) + 1ULL);
 
     set_device_i32(io.text_kv_table_row, 0);
     set_device_i32(io.backend_kv_table_row, 0);
@@ -3913,8 +3914,10 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
     NINFER_SEED_STAGE("progress");
     const auto E = transaction.l3_restore_frontier.value_or(0);
     if (!disk_kv || !disk_kv_restore || !sequence.kv || !host_state_images ||
-        !l3_state_scratch || !l3_kv_scratch || !state_images || !host_kv_arena ||
-        E == 0 || E > staged.prompt_tokens || E > materialization_prefix_digests_.size() ||
+        !l3_state_scratch || !l3_kv_scratch ||
+        (transaction.slot != 0 && (!l3_state_scratch_b || !l3_kv_scratch_b)) ||
+        !state_images || !host_kv_arena ||
+        E == 0 || E > staged.prompt_tokens || E > transaction.prefix_digests.size() ||
         staged.prompt.has_media() || staged.vision ||
         (speculative_backend != SpeculativeBackend::None &&
          speculative_backend != SpeculativeBackend::Mtp)) { return fail(); }
@@ -3925,7 +3928,7 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
         (static_cast<std::uint32_t>(proposal_head) << 8U) |
         (static_cast<std::uint32_t>(kv_storage) << 16U);
     const auto identity = [&](std::uint32_t frontier) {
-        const auto digest = materialization_prefix_digests_.at(frontier);
+        const auto digest = transaction.prefix_digests.at(frontier);
         return DiskKVIdentity{.lo=digest[0], .hi=digest[1], .tag=tag, .frontier=frontier};
     };
     const auto read = [&](const DiskKVIdentity& id, DiskKVKind kind, std::span<std::byte> dst) {
@@ -3937,12 +3940,16 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
     // scheduler. Scratch ownership is the single context transaction's lifetime.
     if (progress.phase == 0) {
         if (!progress.state_scratch_lease) {
-            progress.state_scratch_lease = l3_state_scratch_lease.try_acquire();
+            auto& state_lease = transaction.slot != 0 ? l3_state_scratch_lease_b
+                                              : l3_state_scratch_lease;
+            progress.state_scratch_lease = state_lease.try_acquire();
             if (!progress.state_scratch_lease) { return false; }
         }
         if (!progress.read) {
             read(identity(E), DiskKVKind::StateImage,
-                {host_state_images->writable_view(*l3_state_scratch).data,
+                {host_state_images->writable_view(transaction.slot != 0
+                                                     ? *l3_state_scratch_b
+                                                     : *l3_state_scratch).data,
                  state_images->host_layout().image_bytes});
             return false;
         }
@@ -3958,7 +3965,8 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
         }
         const auto sid = identity(E);
         NINFER_SEED_SNAPSHOT(sid.lo, sid.hi, sid.tag, sid.frontier,
-            host_state_images->view(*l3_state_scratch).data,
+            host_state_images->view(transaction.slot != 0 ? *l3_state_scratch_b
+                                   : *l3_state_scratch).data,
             state_images->host_layout().image_bytes);
         progress.phase = 1;
         return false;
@@ -3974,7 +3982,10 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
         }
         auto* pages = backend ? backend_kv_pages.get() : text_kv_pages.get();
         auto* addresses = backend ? backend_kv_addresses.get() : text_kv_addresses.get();
-        auto& scratch = backend ? l3_backend_scratch : l3_kv_scratch;
+        auto& scratch = backend ? (transaction.slot != 0 ? l3_backend_scratch_b
+                                                         : l3_backend_scratch)
+                                : (transaction.slot != 0 ? l3_kv_scratch_b
+                                                         : l3_kv_scratch);
         if (!pages || !addresses || !scratch || (backend && !sequence.kv->backend)) {
             progress.reason = "kv-scratch-missing";
             return fail();
@@ -4164,7 +4175,9 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
     }
     if (progress.phase == 3) {
         const bool complete = state_images->copy_from_host_chunk(
-            host_state_images->view(*l3_state_scratch), state_selectors(sequence).destination,
+            host_state_images->view(transaction.slot != 0 ? *l3_state_scratch_b
+                                   : *l3_state_scratch),
+            state_selectors(sequence).destination,
             progress.state_cursor, 4U * 1024U * 1024U, device.stream);
         CUDA_CHECK(cudaStreamSynchronize(device.stream));
         if (complete) { ++progress.phase; }
@@ -5517,9 +5530,13 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
     if (preflight != runtime::PreflightStatus::Ready) {
         throw std::logic_error("materialization changed after successful preflight");
     }
-    if (has_context_transaction() || pending_transaction_) {
+    if (!std::holds_alternative<std::monostate>(context_transaction_) || pending_transaction_ ||
+        (materialization_open_[0] && materialization_open_[1])) {
         throw std::logic_error("Program already owns a physical transaction");
     }
+    // Claim the free slot up front: the transaction and its prepare tables
+    // live in materializations_[slot] from here to publication.
+    const std::uint32_t slot = materialization_open_[0] ? 1U : 0U;
     if (plan.impl_ == nullptr) {
         throw std::invalid_argument("materialization reservation is invalid");
     }
@@ -5537,6 +5554,7 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
     const SharedPrefixState* shared_state =
         details.has_shared_source ? &shared_prefix_states[details.shared_source_index] : nullptr;
     MaterializationTransaction transaction;
+    transaction.slot                = slot;
     transaction.id                  = next_materialization_id_++;
     transaction.destination         = details.destination;
     transaction.has_source          = details.has_source;
@@ -5803,9 +5821,9 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
         }
         if (prompt.has_media() && !request_plan.vision) { prompt.release_all_media_payloads(); }
 
-        materialization_ledger_.assign(prompt.token_ids.begin(), prompt.token_ids.end());
-        materialization_identity_.assign(prompt);
-        materialization_prefix_digests_.assign(prompt);
+        transaction.ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
+        transaction.identity.assign(prompt);
+        transaction.prefix_digests.assign(prompt);
 
         // L3 (disk) tier — the admission probe already selected the restorable
         // frontier E (inspect_lane, before the scheduler grant) and recorded it
@@ -5831,8 +5849,8 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
                 // at prompt_tokens. (All prompt pages are committed at admission.)
                 const std::uint32_t page_end    = (p + 1) * static_cast<std::uint32_t>(kPagedKVPageSize);
                 const std::uint32_t frontier = std::min(page_end, prompt_tokens);
-                if (frontier == 0 || frontier >= materialization_prefix_digests_.size()) { break; }
-                const auto digest = materialization_prefix_digests_.at(frontier);
+                if (frontier == 0 || frontier >= transaction.prefix_digests.size()) { break; }
+                const auto digest = transaction.prefix_digests.at(frontier);
                 probe_ids.push_back(DiskKVIdentity{.lo     = digest[0],
                                                    .hi     = digest[1],
                                                    .tag    = static_cast<std::uint32_t>(speculative_backend) |
@@ -5938,7 +5956,8 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
                          "cancelled in-flight proactive spill at transaction begin "
                          "| scratch handover to seed");
         }
-        context_transaction_.emplace<MaterializationTransaction>(std::move(transaction));
+        materializations_[slot].emplace(std::move(transaction));
+        materialization_open_[slot] = true;
         return runtime::ContextTransactionReserveStatus::Reserved;
     } catch (...) {
         release_materialization_staging(transaction);
@@ -6054,9 +6073,9 @@ void ProgramImplCore::release_materialization_staging(
     transaction.prefix_tail_submitted          = false;
     transaction.retained_tail_backup_submitted = false;
     transaction.prefix_forks_ready             = false;
-    materialization_ledger_.clear();
-    materialization_identity_.clear();
-    materialization_prefix_digests_.clear();
+    transaction.ledger.clear();
+    transaction.identity.clear();
+    transaction.prefix_digests.clear();
 }
 
 void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transaction) {
@@ -7632,14 +7651,14 @@ ProgramImplCore::release_materialization_victim(MaterializationTransaction& tran
 
 MaterializationResult
 ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagView cancellation,
-                                                      std::uint32_t decode_ready) {
+                                                      std::uint32_t decode_ready,
+                                                      MaterializationTransaction& transaction,
+                                                      std::uint32_t slot) {
     MaterializationResult out;
-    MaterializationTransaction* transaction_ptr =
-        std::get_if<MaterializationTransaction>(&context_transaction_);
-    if (transaction_ptr == nullptr || transaction_ptr->terminal) {
+    out.slot = slot;
+    if (!materialization_open_[slot] || transaction.terminal) {
         throw std::logic_error("Program has no progressable context transaction");
     }
-    MaterializationTransaction& transaction = *transaction_ptr;
     PressureTransition& pressure_transition = transaction.pressure_transition;
     const auto collect_pressure_operations  = [&](MaterializationTransaction::PressureWork& work) {
         if (work.spill_pages > std::numeric_limits<std::uint64_t>::max() -
@@ -8294,9 +8313,9 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
     // catalog capabilities and adopts them only after validating this terminal result.
     try {
         out.published.emplace(start_request(transaction));
-        materialization_ledger_.clear();
-        materialization_identity_.clear();
-        materialization_prefix_digests_.clear();
+        transaction.ledger.clear();
+        transaction.identity.clear();
+        transaction.prefix_digests.clear();
     } catch (const std::logic_error& error) {
         if (activation_contention(error)) {
             // The atomic start lost a Device page (or its reservation raced) to pressure that
@@ -8341,14 +8360,25 @@ ProgramImplCore::progress_context_transaction(runtime::CancellationFlagView canc
         }
         return ContextTransactionProgress<Variant>(std::forward<Result>(result));
     };
+    // Materialization slots: advance one open slot per call (round-robin).
+    // A terminal result frees its slot here - Published and Aborted end the
+    // transaction; RetryableFailure keeps it open for the manager's retry.
+    if (std::holds_alternative<std::monostate>(context_transaction_) &&
+        (materialization_open_[0] || materialization_open_[1])) {
+        for (std::uint32_t attempt = 0; attempt < 2; ++attempt) {
+            const std::uint32_t slot = materialization_cursor_;
+            materialization_cursor_ = (materialization_cursor_ + 1U) % 2U;
+            if (!materialization_open_[slot]) { continue; }
+            auto result = progress_materialization_transaction(
+                cancellation, decode_ready, *materializations_[slot], slot);
+            return terminal_or_pending(std::move(result));
+        }
+    }
     return std::visit(
         [&](auto& transaction) -> ContextTransactionProgress<Variant> {
             using Transaction = std::decay_t<decltype(transaction)>;
             if constexpr (std::is_same_v<Transaction, std::monostate>) {
                 throw std::logic_error("Program has no progressable context transaction");
-            } else if constexpr (std::is_same_v<Transaction, MaterializationTransaction>) {
-                return terminal_or_pending(
-                    progress_materialization_transaction(cancellation, decode_ready));
             } else {
                 return terminal_or_pending(progress_active_capture_transaction(cancellation));
             }
@@ -8362,18 +8392,45 @@ void ProgramImplCore::finalize_context_transaction() noexcept {
             using T = std::decay_t<decltype(transaction)>;
             if constexpr (std::is_same_v<T, std::monostate>) {
                 return false;
-            } else if constexpr (std::is_same_v<T, ActiveCaptureTransaction>) {
-                return transaction.published;
             } else {
-                return transaction.terminal;
+                return transaction.published;
             }
         },
         context_transaction_);
     if (terminal) { context_transaction_.emplace<std::monostate>(); }
+    // Free materialization slots whose transaction reached a terminal state:
+    // the manager's terminal adoption always calls this finalize, and until
+    // it does, the manager's invariant requires has_context_transaction()
+    // to stay true (do not free early in the progress wrapper).
+    for (std::uint32_t slot = 0; slot < materializations_.size(); ++slot) {
+        if (materialization_open_[slot] && materializations_[slot]->terminal) {
+            materialization_open_[slot] = false;
+            materializations_[slot].reset();
+        }
+    }
 }
 
 bool ProgramImplCore::has_context_transaction() const noexcept {
-    return !std::holds_alternative<std::monostate>(context_transaction_);
+    return !std::holds_alternative<std::monostate>(context_transaction_) ||
+           materialization_open_[0] || materialization_open_[1];
+}
+
+bool ProgramImplCore::materialization_slot_free() const noexcept {
+    return !materialization_open_[0] || !materialization_open_[1];
+}
+
+std::uint32_t ProgramImplCore::free_materialization_slot() const noexcept {
+    return materialization_open_[0] ? 1U : 0U;
+}
+
+std::uint32_t ProgramImplCore::next_materialization_destination() const noexcept {
+    const std::uint32_t slot = materialization_cursor_;
+    if (!materialization_open_[slot]) {
+        return materialization_open_[materialization_cursor_ ^ 1U]
+                   ? materializations_[materialization_cursor_ ^ 1U]->destination.value
+                   : std::numeric_limits<std::uint32_t>::max();
+    }
+    return materializations_[slot]->destination.value;
 }
 
 bool ProgramImplCore::host_kv_checkpoint_allowed() const noexcept {
@@ -8437,18 +8494,19 @@ bool ProgramImplCore::valid_capture_offer(const CaptureOffer& offer) const noexc
 
 bool ProgramImplCore::materialization_pins(std::uint32_t index,
                                            std::uint64_t generation) const noexcept {
-    const MaterializationTransaction* transaction_ptr =
-        std::get_if<MaterializationTransaction>(&context_transaction_);
-    if (transaction_ptr == nullptr) { return false; }
-    const MaterializationTransaction& transaction = *transaction_ptr;
-    if (transaction.has_source && transaction.source_index == index &&
-        transaction.source_generation == generation) {
-        return true;
-    }
-    for (std::size_t victim = 0; victim < transaction.victim_count; ++victim) {
-        if (!transaction.victim_released[victim] && transaction.victim_indices[victim] == index &&
-            transaction.victim_generations[victim] == generation) {
+    for (std::uint32_t slot = 0; slot < materializations_.size(); ++slot) {
+        if (!materialization_open_[slot]) { continue; }
+        const MaterializationTransaction& transaction = *materializations_[slot];
+        if (transaction.has_source && transaction.source_index == index &&
+            transaction.source_generation == generation) {
             return true;
+        }
+        for (std::size_t victim = 0; victim < transaction.victim_count; ++victim) {
+            if (!transaction.victim_released[victim] &&
+                transaction.victim_indices[victim] == index &&
+                transaction.victim_generations[victim] == generation) {
+                return true;
+            }
         }
     }
     return false;
@@ -11450,11 +11508,15 @@ void ProgramImplCore::fail_all_cleanup() noexcept {
         }
         abort_active_capture(*transaction);
     }
-    if (auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_)) {
-        if (transaction->transfer_submitted && device.transfer_stream != nullptr) {
+    for (std::uint32_t slot = 0; slot < materializations_.size(); ++slot) {
+        if (!materialization_open_[slot]) { continue; }
+        MaterializationTransaction& transaction = *materializations_[slot];
+        if (transaction.transfer_submitted && device.transfer_stream != nullptr) {
             (void)cudaStreamSynchronize(device.transfer_stream);
         }
-        release_materialization_staging(*transaction);
+        release_materialization_staging(transaction);
+        materialization_open_[slot] = false;
+        materializations_[slot].reset();
     }
     context_transaction_.emplace<std::monostate>();
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
@@ -12034,9 +12096,9 @@ void ProgramImplCore::finalize_sequence(std::uint32_t lane, SequenceState& seque
         request.publish_continuation = request_plan.summary.publish_continuation;
         sequence.mtp_draft_count     = 0;
         sequence.tail_hidden_valid   = base == prompt_tokens && sequence.tail_hidden_valid;
-        sequence.ledger.swap(materialization_ledger_);
-        sequence.prefix_identity.swap(materialization_identity_);
-        sequence.prefix_digests.swap(materialization_prefix_digests_);
+        sequence.ledger.swap(transaction.ledger);
+        sequence.prefix_identity.swap(transaction.identity);
+        sequence.prefix_digests.swap(transaction.prefix_digests);
         sequence.rebuild_work       = request_plan.root_rebuild_work;
         sequence.rebuild_tail_begin = request_plan.root_rebuild_tail_begin;
 

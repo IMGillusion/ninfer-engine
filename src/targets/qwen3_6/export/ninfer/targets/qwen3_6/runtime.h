@@ -771,6 +771,9 @@ struct MaterializationSharedSourceResult {
 template <class Variant>
 struct MaterializationResult {
     runtime::ContextTransactionStatus status = runtime::ContextTransactionStatus::Aborted;
+    // Which materialization slot produced this result (RM/engine route
+    // their per-slot bookkeeping by it).
+    std::uint32_t slot = 0;
     std::optional<StartResult<Variant>> published;
     std::optional<MaterializationSourceResult> source;
     std::optional<MaterializationSharedSourceResult> shared_source;
@@ -886,6 +889,11 @@ public:
     [[nodiscard]] std::uint32_t min_persist_tokens() const noexcept;
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
+    // Two materialization slots: true when one is free (captures aside).
+    [[nodiscard]] bool materialization_slot_free() const noexcept;
+    [[nodiscard]] std::uint32_t free_materialization_slot() const noexcept;
+    // Destination lane of the slot the next progress call advances.
+    [[nodiscard]] std::uint32_t next_materialization_destination() const noexcept;
     // Called only by the engine at its serialized worker boundary.
     void background_host_kv_tick() noexcept;
     [[nodiscard]] bool has_background_host_kv_work() const noexcept;

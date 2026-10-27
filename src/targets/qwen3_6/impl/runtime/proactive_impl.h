@@ -126,18 +126,25 @@ int ProgramImplCore::proactive_tick(const ContinuationHandle& owner) noexcept {
         // truncation ("consumed source KV is not destructively truncatable").
         // Drop the pinned batch and back off instead: the persisted chain is
         // content-addressed, so a later re-spill dedups down to the increment.
-        if (auto* transaction =
-                std::get_if<MaterializationTransaction>(&context_transaction_)) {
-            const bool blocked =
-                (transaction->has_source && transaction->source_index == work.index) ||
-                std::find(transaction->victim_indices.begin(),
-                          transaction->victim_indices.end(),
-                          work.index) != transaction->victim_indices.end();
-            if (blocked) {
-                proactive_begin_fail_ = "owner-in-open-transaction";
-                proactive_cancel();
-                return -1;
+        // With two materialization slots the paused-spill guard scans both: an
+        // open seed whose source (or a victim) is THIS owner still pins its
+        // pages, so the spill backs off exactly as the single-slot version did.
+        bool owner_pinned_by_seed = false;
+        for (std::uint32_t slot = 0; slot < materializations_.size(); ++slot) {
+            if (!materialization_open_[slot]) { continue; }
+            const MaterializationTransaction& transaction = *materializations_[slot];
+            if ((transaction.has_source && transaction.source_index == work.index) ||
+                std::find(transaction.victim_indices.begin(),
+                          transaction.victim_indices.end(),
+                          work.index) != transaction.victim_indices.end()) {
+                owner_pinned_by_seed = true;
+                break;
             }
+        }
+        if (owner_pinned_by_seed) {
+            proactive_begin_fail_ = "owner-in-open-transaction";
+            proactive_cancel();
+            return -1;
         }
         return 0;
     }

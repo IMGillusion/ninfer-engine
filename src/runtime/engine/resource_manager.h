@@ -220,6 +220,10 @@ public:
         ContextTransactionStatus status = ContextTransactionStatus::Aborted;
         std::optional<PublishedActivation> activation;
         MaterializationDiagnostics diagnostics;
+        // Destination lane of the finishing materialization: the engine
+        // routes its per-slot control record by it (two seeds may finish
+        // interleaved).
+        LaneId destination{};
     };
 
     enum class MaterializationReserveResult : std::uint8_t {
@@ -467,7 +471,7 @@ public:
     [[nodiscard]] Inspection inspect(Program& program, const PreparedPrompt& prompt,
                                      const RequestBasePlan& base, std::uint64_t publication_order) {
         if (!std::holds_alternative<std::monostate>(transaction_) ||
-            program.has_context_transaction()) {
+            !program.materialization_slot_free()) {
             return {.readiness = Readiness::TemporarilyBlocked};
         }
         if (publication_order == 0) {
@@ -626,9 +630,10 @@ public:
     reserve_materialization(Program& program, Choice&& choice, PreparedPrompt&& prompt,
                             CancellationFlagView cancellation) {
         if (!std::holds_alternative<std::monostate>(transaction_) ||
-            program.has_context_transaction()) {
+            !program.materialization_slot_free()) {
             throw std::logic_error("ResourceManager already owns a resource transaction");
         }
+        const std::uint32_t mat_slot = program.free_materialization_slot();
         const ProgramResourceRevision resource_revision = program.resource_revision();
         if (!choice.plan_ || resource_revision.value == 0) {
             throw std::logic_error("resource choice is malformed");
@@ -638,8 +643,8 @@ public:
         }
         validate_choice(choice, resource_revision);
         MaterializationRecord record = take_materialization_record(choice);
-        transaction_.template emplace<MaterializationRecord>(std::move(record));
-        MaterializationRecord& open = std::get<MaterializationRecord>(transaction_);
+        mat_records_[mat_slot].emplace(std::move(record));
+        MaterializationRecord& open = *mat_records_[mat_slot];
         reserve_logical_materialization(open);
 
         const ContextTransactionReserveStatus status = program.start_resource_transaction(
@@ -647,7 +652,7 @@ public:
         choice.plan_.reset();
         if (status == ContextTransactionReserveStatus::Aborted) {
             rollback_logical_materialization(open);
-            transaction_.template emplace<std::monostate>();
+            mat_records_[mat_slot].reset();
             return cancellation.requested() ? MaterializationReserveResult::Aborted
                                             : MaterializationReserveResult::Stale;
         }
@@ -656,7 +661,7 @@ public:
     }
 
     [[nodiscard]] std::optional<ContextTransactionKind> context_transaction_kind() const noexcept {
-        if (std::holds_alternative<MaterializationRecord>(transaction_)) {
+        if (mat_records_[0].has_value() || mat_records_[1].has_value()) {
             return ContextTransactionKind::Materialization;
         }
         if (std::holds_alternative<ActiveCaptureRecord>(transaction_)) {
@@ -668,8 +673,10 @@ public:
     [[nodiscard]] ContextTransactionOutcome
     progress_context_transaction(Program& program, CancellationFlagView cancellation,
                                  std::uint32_t decode_ready) {
-        if (std::holds_alternative<std::monostate>(transaction_) ||
-            !program.has_context_transaction()) {
+        const bool manager_progressable = !std::holds_alternative<std::monostate>(transaction_) ||
+                                          mat_records_[0].has_value() ||
+                                          mat_records_[1].has_value();
+        if (!manager_progressable || !program.has_context_transaction()) {
             throw std::logic_error("ResourceManager has no progressable resource transaction");
         }
         ProgramContextTransactionProgress progress =
@@ -691,18 +698,33 @@ public:
     }
 
     void adopt(Program& program, PublishedActivation&& activation) noexcept {
+        // Route to the materialization record that owns this lane (two seeds
+        // may publish interleaved).
+        MaterializationRecord* record = nullptr;
+        for (auto& slot_record : mat_records_) {
+            if (slot_record.has_value() &&
+                slot_record->destination.value == activation.destination_.value) {
+                record = &*slot_record;
+                break;
+            }
+        }
         if (activation.owner_ != this || !activation.result_ ||
             activation.destination_.value >= lane_count_ ||
             lanes_[activation.destination_.value] != LogicalLaneState::Materializing ||
             !active_[activation.destination_.value].occupied ||
-            !std::holds_alternative<MaterializationRecord>(transaction_) ||
+            record == nullptr ||
             !program.has_context_transaction()) {
             std::terminate();
         }
         lanes_[activation.destination_.value] = LogicalLaneState::Active;
         activation.result_.reset();
         activation.owner_ = nullptr;
-        transaction_.template emplace<std::monostate>();
+        for (auto& slot_record : mat_records_) {
+            if (slot_record.has_value() &&
+                slot_record->destination.value == activation.destination_.value) {
+                slot_record.reset();
+            }
+        }
         program.finalize_context_transaction();
     }
 
@@ -711,7 +733,9 @@ public:
                            std::uint32_t blocked_runnable_requests,
                            CancellationFlagView cancellation) {
         require_lane(lane, LogicalLaneState::Active);
-        const bool manager_transaction = !std::holds_alternative<std::monostate>(transaction_);
+        const bool manager_transaction = !std::holds_alternative<std::monostate>(transaction_) ||
+                                         mat_records_[0].has_value() ||
+                                         mat_records_[1].has_value();
         const bool program_transaction = program.has_context_transaction();
         if (manager_transaction != program_transaction) {
             throw std::logic_error("capture observes inconsistent transaction ownership");
@@ -1137,6 +1161,7 @@ public:
     [[nodiscard]] FinishResult finish(Program& program, LaneId lane, SequenceHandle sequence) {
         require_lane(lane, LogicalLaneState::TerminalPending);
         if (!std::holds_alternative<std::monostate>(transaction_) ||
+            mat_records_[0].has_value() || mat_records_[1].has_value() ||
             program.has_context_transaction()) {
             throw std::logic_error("terminal finish overlaps an open resource transaction");
         }
@@ -1205,6 +1230,7 @@ public:
 
     [[nodiscard]] AbortResult abort(Program& program, LaneId lane, SequenceHandle sequence) {
         if (!std::holds_alternative<std::monostate>(transaction_) ||
+            mat_records_[0].has_value() || mat_records_[1].has_value() ||
             program.has_context_transaction()) {
             throw std::logic_error("terminal abort overlaps an open resource transaction");
         }
@@ -1357,6 +1383,8 @@ public:
 
     void clear_after_program_cleanup() noexcept {
         transaction_.template emplace<std::monostate>();
+        mat_records_[0].reset();
+        mat_records_[1].reset();
         for (CatalogEntry& entry : catalog_) {
             entry.handle.reset();
             clear_catalog_entry(entry);
@@ -2907,7 +2935,11 @@ private:
 
     [[nodiscard]] MaterializationOutcome
     adopt_materialization_progress(Program& program, ProgramMaterializationResult&& result) {
-        MaterializationRecord* record = std::get_if<MaterializationRecord>(&transaction_);
+        // Route by the slot the program stamped on the result; two material-
+        // izations may finish interleaved.
+        std::optional<MaterializationRecord>& slot_record =
+            mat_records_[result.slot < mat_records_.size() ? result.slot : 0];
+        MaterializationRecord* record = slot_record.has_value() ? &*slot_record : nullptr;
         if (record == nullptr || !program.has_context_transaction()) {
             throw std::logic_error("materialization result has no logical transaction");
         }
@@ -3147,9 +3179,11 @@ private:
         if (!published) {
             restore_unreported_materialization(*record);
             lanes_[record->destination.value] = LogicalLaneState::Free;
+            const LaneId failed_destination = record->destination;
+            slot_record.reset();
             transaction_.template emplace<std::monostate>();
             program.finalize_context_transaction();
-            return {.status = result.status};
+            return {.status = result.status, .destination = failed_destination};
         }
 
         CatalogEntry& publication = catalog_[record->publication_slot];
@@ -3179,10 +3213,13 @@ private:
         StartResult start = std::move(*result.published);
         result.published.reset();
         commit_demand(std::move(record->demand));
+        // The record stays until RM.adopt consumes the activation token:
+        // clearing it here made adopt() terminate on the missing record.
         return MaterializationOutcome{
             .status      = ContextTransactionStatus::Published,
             .activation  = PublishedActivation(*this, std::move(start), record->destination),
             .diagnostics = record->diagnostics,
+            .destination = record->destination,
         };
     }
 
@@ -3646,6 +3683,9 @@ private:
     using ContextTransaction =
         std::variant<std::monostate, MaterializationRecord, ActiveCaptureRecord>;
     ContextTransaction transaction_;
+    // Per-slot bookkeeping for the two materialization slots. The capture
+    // path keeps the single variant above (captures stay exclusive).
+    std::array<std::optional<MaterializationRecord>, 2> mat_records_;
     ContextMachineCostModel cost_model_;
     Planner planner_;
     CapturePlanner capture_planner_;

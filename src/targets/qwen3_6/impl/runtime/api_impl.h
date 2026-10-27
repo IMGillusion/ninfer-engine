@@ -420,6 +420,19 @@ bool Program<Variant>::has_context_transaction() const noexcept {
 }
 
 template <>
+bool Program<Variant>::materialization_slot_free() const noexcept {
+    return impl_->materialization_slot_free();
+}
+template <>
+std::uint32_t Program<Variant>::free_materialization_slot() const noexcept {
+    return impl_->free_materialization_slot();
+}
+template <>
+std::uint32_t Program<Variant>::next_materialization_destination() const noexcept {
+    return impl_->next_materialization_destination();
+}
+
+template <>
 void Program<Variant>::background_host_kv_tick() noexcept {
     impl_->background_host_kv_tick();
 }

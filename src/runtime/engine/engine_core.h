@@ -562,7 +562,9 @@ private:
             snapshot.prefilling_requests = 1;
         }
         snapshot.prefill_yield_paused = prefill_yield_paused_.load(std::memory_order_acquire);
-        snapshot.materializing_requests = materializing_.has_value() ? 1U : 0U;
+        snapshot.materializing_requests =
+            static_cast<std::uint32_t>(materializing_[0].has_value()) +
+            static_cast<std::uint32_t>(materializing_[1].has_value());
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
@@ -1729,10 +1731,25 @@ private:
         CancellationFlagView cancellation{&yield};
         switch (*kind) {
         case ContextTransactionKind::Materialization: {
-            if (!materializing_ || capture) {
+            if (capture) {
                 throw std::logic_error("materialization has conflicting Engine ownership");
             }
-            const MaterializingRequest& control = *materializing_;
+            // Two slots: the program advances the cursored one; wire its
+            // request cancellation flag. The other slot observes its flag
+            // when the cursor rotates to it (<= one boundary later).
+            const std::uint32_t progress_lane =
+                instance_.program->next_materialization_destination();
+            MaterializingRequest* control_ptr = nullptr;
+            for (auto& record : materializing_) {
+                if (record && record->destination.value == progress_lane) {
+                    control_ptr = &*record;
+                    break;
+                }
+            }
+            if (control_ptr == nullptr) {
+                throw std::logic_error("materialization has conflicting Engine ownership");
+            }
+            const MaterializingRequest& control = *control_ptr;
             const std::uint32_t lane            = control.destination.value;
             const auto& request                 = control.request;
             if (request == nullptr || !request->is_materializing() || request->lane ||
@@ -1744,7 +1761,7 @@ private:
             break;
         }
         case ContextTransactionKind::ActiveCapture:
-            if (materializing_ || !capture) {
+            if (materializing_[0].has_value() || materializing_[1].has_value() || !capture) {
                 throw std::logic_error("active capture has conflicting Engine ownership");
             }
             cancellation = CancellationFlagView{&capture->cancelled};
@@ -1761,11 +1778,25 @@ private:
                 } else if constexpr (std::is_same_v<
                                          Outcome,
                                          typename ResourceManagement::MaterializationOutcome>) {
-                    if (*kind != ContextTransactionKind::Materialization || !materializing_) {
+                    if (*kind != ContextTransactionKind::Materialization) {
                         throw std::logic_error(
                             "materialization outcome has no Engine control record");
                     }
-                    MaterializingRequest& control = *materializing_;
+                    // Route by the outcome's destination lane: two seeds may
+                    // finish interleaved, so the control record is whichever
+                    // slot owns this lane.
+                    MaterializingRequest* control_ptr = nullptr;
+                    for (auto& record : materializing_) {
+                        if (record && record->destination.value == terminal.destination.value) {
+                            control_ptr = &*record;
+                            break;
+                        }
+                    }
+                    if (control_ptr == nullptr) {
+                        throw std::logic_error(
+                            "materialization outcome has no Engine control record");
+                    }
+                    MaterializingRequest& control = *control_ptr;
                     const std::uint32_t lane      = control.destination.value;
                     const auto request            = control.request;
                     if (terminal.status == ContextTransactionStatus::Aborted ||
@@ -1774,7 +1805,12 @@ private:
                             throw std::logic_error(
                                 "aborted materialization retained an activation");
                         }
-                        materializing_.reset();
+                        for (auto& record : materializing_) {
+                            if (record && record->destination.value == terminal.destination.value) {
+                                record.reset();
+                                break;
+                            }
+                        }
                         if (terminal.status == ContextTransactionStatus::RetryableFailure) {
                             complete_error(request, std::make_exception_ptr(RequestError(
                                 RequestErrorKind::Unavailable,
@@ -1813,7 +1849,12 @@ private:
                                      request->prompt_summary.prompt_tokens);
                     }
                     record_prefix_selection(control.summary);
-                    materializing_.reset();
+                    for (auto& record : materializing_) {
+                        if (record && record->destination.value == lane) {
+                            record.reset();
+                            break;
+                        }
+                    }
                     yield_pipe_for_adoption(lane);
                     scheduler_.set_prefill_lane(lane);
                     request_admission_check();
@@ -1912,11 +1953,12 @@ private:
             throw std::logic_error("admitted request disappeared from the FIFO queue");
         }
         release_planning_state(request);
-        if (materializing_ || slots_[lane] != nullptr) {
+        const std::uint32_t mslot = !materializing_[0].has_value() ? 0U : 1U;
+        if (slots_[lane] != nullptr || materializing_[mslot].has_value()) {
             throw std::logic_error("reserved materialization destination is not empty");
         }
         request->model_state = EngineRequestState::Materializing;
-        materializing_.emplace(std::move(control));
+        materializing_[mslot].emplace(std::move(control));
         if (const char* tfp = std::getenv("NINFER_TOKEN_FP"); tfp != nullptr && tfp[0] != '\0') {
             std::fprintf(stderr, "[materialize-begin] id=%llu prompt=%u\n",
                          static_cast<unsigned long long>(request->id),
@@ -2011,7 +2053,8 @@ private:
             // promoted head still cannot hang admission forever.
             break;
         }
-        if (materialization_waiters_.empty() || materializing_ ||
+        if (materialization_waiters_.empty() ||
+            (materializing_[0].has_value() && materializing_[1].has_value()) ||
             instance_.program->has_context_transaction()) {
             return;
         }
@@ -2362,9 +2405,11 @@ private:
         yielded_pending_head_.reset();
         prefill_ran_since_resume_ = true;
         prefill_yield_paused_.store(false, std::memory_order_release);
-        const std::shared_ptr<Request> materializing_request =
-            materializing_ ? materializing_->request : nullptr;
-        materializing_.reset();
+        std::array<std::shared_ptr<Request>, 2> materializing_requests = {};
+        for (std::uint32_t slot = 0; slot < materializing_.size(); ++slot) {
+            if (materializing_[slot]) { materializing_requests[slot] = materializing_[slot]->request; }
+            materializing_[slot].reset();
+        }
         instance_.program->fail_all_cleanup();
         resources_.clear_after_program_cleanup();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -2379,7 +2424,9 @@ private:
             complete_error(materialization_waiters_.front(), error);
             materialization_waiters_.pop_front();
         }
-        if (materializing_request != nullptr) { complete_error(materializing_request, error); }
+        for (const auto& request : materializing_requests) {
+            if (request != nullptr) { complete_error(request, error); }
+        }
         for (const auto& request : pending) { complete_error(request, error); }
         publish_runtime_stats();
         // The cleanup above is the same teardown a fresh process performs at startup
@@ -2410,7 +2457,8 @@ private:
             {
                 std::unique_lock lock(queue_mutex_);
                 if (!stopping_ && pending_.empty()) {
-                    bool active = materializing_.has_value();
+                    bool active = materializing_[0].has_value() ||
+                                  materializing_[1].has_value();
                     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                         active = active || slots_[lane] != nullptr;
                     }
@@ -2629,7 +2677,7 @@ private:
     std::uint64_t next_request_id_        = 1;
     std::uint64_t next_publication_order_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
-    std::optional<MaterializingRequest> materializing_;
+    std::array<std::optional<MaterializingRequest>, 2> materializing_;
     // Requests rescued out of the FIFO while a materialization gates the
     // admission gate. The single context transaction serializes
     // materializations, so under a burst every request behind the open one
