@@ -8365,13 +8365,30 @@ ProgramImplCore::progress_context_transaction(runtime::CancellationFlagView canc
     // transaction; RetryableFailure keeps it open for the manager's retry.
     if (std::holds_alternative<std::monostate>(context_transaction_) &&
         (materialization_open_[0] || materialization_open_[1])) {
+        // Advance EVERY open slot this boundary (they are independent work):
+        // a round-robin single-step here halved each seed's effective pace
+        // with two slots open and its wall-clock submit deadline then fired
+        // spuriously (observed: seed-submit-deadline at 31s, volume breaker,
+        // cascading cache 0% full recomputes). The first terminal result is
+        // returned; the other slot continues next boundary.
+        std::optional<ContextTransactionProgress<Variant>> pending_progress;
         for (std::uint32_t attempt = 0; attempt < 2; ++attempt) {
             const std::uint32_t slot = materialization_cursor_;
             materialization_cursor_ = (materialization_cursor_ + 1U) % 2U;
             if (!materialization_open_[slot]) { continue; }
             auto result = progress_materialization_transaction(
                 cancellation, decode_ready, *materializations_[slot], slot);
+            if (result.status == runtime::ContextTransactionStatus::InProgress) {
+                if (!pending_progress.has_value()) {
+                    pending_progress.emplace(
+                        runtime::ContextTransactionInProgress{});
+                }
+                continue;
+            }
             return terminal_or_pending(std::move(result));
+        }
+        if (pending_progress.has_value()) {
+            return std::move(*pending_progress);
         }
     }
     return std::visit(
