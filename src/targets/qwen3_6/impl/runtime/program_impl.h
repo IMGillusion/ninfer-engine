@@ -3097,6 +3097,23 @@ void ProgramImplCore::cleanup_owner_spill(OwnerSpillProgress& p) noexcept {
         p.batch_device_pins.clear();
         p.batch_physical.clear();
         p.batch_logical.clear();
+        // Drain THIS spill's own write tickets before the batch reset: the
+        // batch borrows its payload bytes for in-flight writes, so dropping
+        // early is a use-after-free. Global wait_idle no longer covers
+        // writes (read/write worker split - a checkpoint backlog must not
+        // stall this teardown), so poll the spill's own tickets here.
+        for (std::uint32_t wait_ms = 0;;) {
+            bool settled = true;
+            for (const auto& t : p.batch_tickets) {
+                if (t && DiskKVBridge::poll(t) == SpillStatus::Pending) { settled = false; break; }
+            }
+            if (settled && (!p.ticket || DiskKVBridge::poll(p.ticket) != SpillStatus::Pending)) { break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            wait_ms += 2;
+            if (wait_ms % 10000 == 0) {
+                disk_kv_logf('W', "l3-spill", "cleanup drain | own tickets pending %ums | QLC GC?", wait_ms);
+            }
+        }
         p.OwnerSpillBatch::reset();
         p.pinned_store = nullptr;
         p.copy_done.reset();

@@ -290,7 +290,7 @@ private:
         std::string path;
     };
 
-    void worker_loop();
+    void worker_loop(bool read_worker);
     /** Apply one queued job to the store (worker thread / destructor drain). */
     void spill_queued(SpillJob& job);
     /** Deadline-bounded large read (state images): runs the store read into
@@ -349,6 +349,21 @@ private:
     // store lock only briefly: four concurrent streams already reach ~880MB/s on
     // this volume against 421MB/s single-stream. Reads and writes share these.
     static constexpr std::size_t kWorkerCount = 8;
+    // Read/write worker partition: request-path reads (seed page + state
+    // reads) execute on dedicated read workers and can never be stuck
+    // behind an in-flight checkpoint/spill write that a QLC GC stall is
+    // stretching to tens of seconds. Queue priority alone cannot give
+    // that isolation - a queued read still waits for every busy write
+    // worker to finish its current job. Tunable via NINFER_L3_READ_WORKERS.
+    static std::size_t read_worker_count() noexcept {
+        static const std::size_t value = [] {
+            const char* s = std::getenv("NINFER_L3_READ_WORKERS");
+            std::size_t v = s != nullptr ? std::strtoul(s, nullptr, 10) : 5;
+            return v < kWorkerCount ? v : kWorkerCount - 1;
+        }();
+        return value;
+    }
+    std::size_t in_flight_reads_ = 0;  // read jobs popped, not yet applied
     // Bounded large IO. The mounted volume has wedged single large preads and
     // pwrites indefinitely (twice in production, freezing the engine's single
     // context transaction past recovery). Large reads (state images) run on a

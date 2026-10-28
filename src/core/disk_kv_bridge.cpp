@@ -83,8 +83,10 @@ DiskKVBridge::DiskKVBridge(Options opts) : opts_(std::move(opts)) {
         throw std::invalid_argument("disk kv bridge budget too small for one main page");
     }
     workers_.reserve(kWorkerCount);
+    const std::size_t read_workers = read_worker_count();
     for (std::size_t i = 0; i < kWorkerCount; ++i) {
-        workers_.emplace_back([this] { worker_loop(); });
+        const bool read_worker = i < read_workers;
+        workers_.emplace_back([this, read_worker] { worker_loop(read_worker); });
     }
 }
 
@@ -150,7 +152,22 @@ bool DiskKVBridge::volume_breaker_tripped() const noexcept {
 void DiskKVBridge::wait_idle() {
     {
         std::unique_lock<std::mutex> lock(qmu_);
-        qcv_.wait(lock, [this] { return queued_jobs() == 0 && in_flight_ == 0; });
+        // Scoped to READ jobs: wait_idle exists so the next seed's
+        // fill_batch cannot race a stale pread into the shared seed
+        // scratch. WRITE jobs never touch that scratch - waiting for
+        // them let a checkpoint backlog stall the failure/teardown path
+        // behind minutes of background writes (the isolation this pool
+        // split exists for).
+        qcv_.wait(lock, [this] {
+            if (in_flight_reads_ != 0 || !seed_queue_.empty()) { return false; }
+            for (const auto& job : priority_queue_) {
+                if (job.read) { return false; }
+            }
+            for (const auto& job : queue_) {
+                if (job.read) { return false; }
+            }
+            return true;
+        });
     }
     // Worker keeps in_flight nonzero through its idle flush.
 }
@@ -179,32 +196,40 @@ std::chrono::milliseconds write_deadline() {
 }
 } // namespace
 
-void DiskKVBridge::worker_loop() {
+void DiskKVBridge::worker_loop(bool read_worker) {
     while (true) {
         SpillJob job;
         bool have = false;
         try {
         {
             std::unique_lock<std::mutex> lock(qmu_);
-            qcv_.wait(lock, [this] {
-                return quit_ || !seed_queue_.empty() || !queue_.empty() || !priority_queue_.empty();
-            });
-            if (quit_ && queued_jobs() == 0) { return; }
-            if (queued_jobs() == 0) { continue; }
-            // Request-path seed reads drain before maintenance: both share the
-            // priority tier, and a checkpoint/eviction flood parking in front
-            // of a seed multiplies into every queued request's admission wait.
-            if (!seed_queue_.empty()) {
+            if (read_worker) {
+                // Read workers serve ONLY request-path reads: strict isolation
+                // from write jobs, whose store latency can be stretched to tens
+                // of seconds by QLC GC stalls. Queue priority alone cannot give
+                // that isolation - a queued read still waits for every busy
+                // write worker to finish its current job.
+                qcv_.wait(lock, [this] { return quit_ || !seed_queue_.empty(); });
+                if (seed_queue_.empty()) { return; }   // quit_ and drained
                 job = std::move(seed_queue_.front());
                 seed_queue_.pop_front();
-            } else if (!priority_queue_.empty()) {
-                job = std::move(priority_queue_.front());
-                priority_queue_.pop_front();
+                in_flight_reads_ += 1;
             } else {
-                job = std::move(queue_.front());
-                queue_.pop_front();
+                // Write workers drain maintenance/checkpoint writes. They stop
+                // consuming once quit_ is set; seed reads belong to the read
+                // pool even during shutdown.
+                qcv_.wait(lock, [this] {
+                    return quit_ || !queue_.empty() || !priority_queue_.empty();
+                });
+                if (quit_ && queue_.empty() && priority_queue_.empty()) { return; }
+                if (queue_.empty() && priority_queue_.empty()) { continue; }
+                job = std::move(priority_queue_.empty() ? queue_.front()
+                                                        : priority_queue_.front());
+                if (priority_queue_.empty()) { queue_.pop_front(); }
+                else { priority_queue_.pop_front(); }
+                if (job.read) { in_flight_reads_ += 1; }
+                else { in_flight_ += 1; }
             }
-            in_flight_ += 1;
             have = true;
             if (bridge_trace()) {
                 disk_kv_logf('D', "l3-bridge",
@@ -242,7 +267,8 @@ void DiskKVBridge::worker_loop() {
         }
         {
             std::lock_guard<std::mutex> lock(qmu_);
-            in_flight_ -= 1;
+            if (job.read) { in_flight_reads_ -= (in_flight_reads_ > 0 ? 1U : 0U); }
+            else { in_flight_ -= (in_flight_ > 0 ? 1U : 0U); }
         }
         qcv_.notify_all();  // wait_idle includes flush; enqueue never holds a disk lock
         } catch (const std::exception& e) {
@@ -257,7 +283,8 @@ void DiskKVBridge::worker_loop() {
                 if (job.probe_batch) { job.probe_batch->ready.store(true, std::memory_order_release); }
             }
             std::lock_guard<std::mutex> lock(qmu_);
-            in_flight_ -= (in_flight_ > 0 ? 1 : 0);
+            if (read_worker) { in_flight_reads_ -= (in_flight_reads_ > 0 ? 1 : 0); }
+            else { in_flight_ -= (in_flight_ > 0 ? 1 : 0); }
             qcv_.notify_all();
         } catch (...) {
             if (have) {
@@ -266,7 +293,8 @@ void DiskKVBridge::worker_loop() {
                 if (job.probe_batch) { job.probe_batch->ready.store(true, std::memory_order_release); }
             }
             std::lock_guard<std::mutex> lock(qmu_);
-            in_flight_ -= (in_flight_ > 0 ? 1 : 0);
+            if (job.read) { in_flight_reads_ -= (in_flight_reads_ > 0 ? 1U : 0U); }
+            else { in_flight_ -= (in_flight_ > 0 ? 1U : 0U); }
             qcv_.notify_all();
         }
     }
@@ -292,7 +320,7 @@ bool DiskKVBridge::spill_page(const DiskKVIdentity& id, DiskKVKind kind,
     std::lock_guard<std::mutex> lock(qmu_);
     // kQueueCap bounds TOTAL in-flight work: queued general, queued maintenance,
     // and jobs already dequeued into a worker.
-    if (queued_jobs() + in_flight_ >= kQueueCap) {
+    if (queued_jobs() + in_flight_ + in_flight_reads_ >= kQueueCap) {
         std::lock_guard<std::mutex> stats_lock(mu_);
         stats_.queue_drops += 1;
         return false;  // backpressure: page won't be restorable (recompute later)
@@ -337,7 +365,7 @@ ReadTicket DiskKVBridge::try_read(const DiskKVIdentity& id, DiskKVKind kind,
     if (volume_breaker_tripped()) { return {}; }   // volume wedged: reject submission
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
     if (!lock || quit_ ||
-        queued_jobs() + in_flight_ >= kQueueCap) {
+        queued_jobs() + in_flight_ + in_flight_reads_ >= kQueueCap) {
         return {};
     }
     auto ticket = std::make_shared<ReadCompletion>();
@@ -353,7 +381,7 @@ ReadTicket DiskKVBridge::try_read(const DiskKVIdentity& id, DiskKVKind kind,
     job.id = id; job.kind = kind; job.read = ticket; job.read_dst = dst;
     queue_.push_back(std::move(job));
     lock.unlock();
-    qcv_.notify_one();
+    qcv_.notify_all();
     return ticket;
 }
 
@@ -484,7 +512,7 @@ ProbeBatchTicket DiskKVBridge::try_probe_batch(std::span<const DiskKVIdentity> i
     }
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
     if (!lock || quit_ ||
-        queued_jobs() + in_flight_ >= kQueueCap) {
+        queued_jobs() + in_flight_ + in_flight_reads_ >= kQueueCap) {
         return {};
     }
     auto ticket = std::make_shared<ProbeBatchCompletion>();
@@ -500,7 +528,7 @@ ProbeBatchTicket DiskKVBridge::try_probe_batch(std::span<const DiskKVIdentity> i
     job.probe_batch = ticket;
     queue_.push_back(std::move(job));
     lock.unlock();
-    qcv_.notify_one();
+    qcv_.notify_all();
     return ticket;
 }
 
@@ -508,13 +536,13 @@ SpillTicket DiskKVBridge::try_probe(const DiskKVIdentity& id, DiskKVKind kind) {
     if (kind_index(kind) >= std::size(families_)) { return {}; }
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
     if (!lock || quit_ ||
-        queued_jobs() + in_flight_ >= kQueueCap) {
+        queued_jobs() + in_flight_ + in_flight_reads_ >= kQueueCap) {
         return {};
     }
     auto ticket = std::make_shared<SpillCompletion>();
     SpillJob job{}; job.id = id; job.kind = kind; job.completion = ticket; job.probe = true;
     queue_.push_back(std::move(job));
-    qcv_.notify_one();
+    qcv_.notify_all();
     return ticket;
 }
 
@@ -523,7 +551,7 @@ SpillTicket DiskKVBridge::try_submit(const DiskKVIdentity& id, DiskKVKind kind,
     if (kind_index(kind) >= std::size(families_)) { return {}; }
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
     if (!lock || quit_ ||
-        queued_jobs() + in_flight_ >= kQueueCap) {
+        queued_jobs() + in_flight_ + in_flight_reads_ >= kQueueCap) {
         return {};
     }
     auto ticket = std::make_shared<SpillCompletion>();
@@ -534,7 +562,7 @@ SpillTicket DiskKVBridge::try_submit(const DiskKVIdentity& id, DiskKVKind kind,
                      static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi),
                      static_cast<unsigned>(kind), queue_.size(), in_flight_);
     }
-    qcv_.notify_one();
+    qcv_.notify_all();
     return ticket;
 }
 
@@ -543,7 +571,7 @@ SpillTicket DiskKVBridge::try_submit_owned(const DiskKVIdentity& id, DiskKVKind 
     if (kind_index(kind) >= std::size(families_)) { return {}; }
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
     if (!lock || quit_ ||
-        queued_jobs() + in_flight_ >= kQueueCap) {
+        queued_jobs() + in_flight_ + in_flight_reads_ >= kQueueCap) {
         return {};
     }
     auto ticket = std::make_shared<SpillCompletion>();
@@ -552,21 +580,21 @@ SpillTicket DiskKVBridge::try_submit_owned(const DiskKVIdentity& id, DiskKVKind 
     auto& job = queue_.back();
     job.id = id; job.kind = kind; job.completion = ticket;
     job.bytes.swap(bytes);
-    qcv_.notify_one();
+    qcv_.notify_all();
     return ticket;
 }
 
 SpillTicket DiskKVBridge::try_submit_owned_priority(const DiskKVIdentity& id, DiskKVKind kind,
                                                    std::vector<std::byte>& bytes) {
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
-    if (!lock || quit_ || queued_jobs() + in_flight_ >= kQueueCap) return {};
+    if (!lock || quit_ || queued_jobs() + in_flight_ + in_flight_reads_ >= kQueueCap) return {};
     auto ticket = std::make_shared<SpillCompletion>();
     // Allocate queue storage BEFORE transferring ownership (exception-safe retry).
     priority_queue_.emplace_back();
     auto& job = priority_queue_.back();
     job.id = id; job.kind = kind; job.completion = ticket; job.priority = true;
     job.bytes.swap(bytes);
-    qcv_.notify_one();
+    qcv_.notify_all();
     return ticket;
 }
 
@@ -574,7 +602,7 @@ ReadTicket DiskKVBridge::try_read_priority(const DiskKVIdentity& id, DiskKVKind 
                                            std::span<std::byte> dst) {
     if (volume_breaker_tripped()) { return {}; }   // volume wedged: reject submission
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
-    if (!lock || quit_ || queued_jobs() + in_flight_ >= kQueueCap) { return {}; }
+    if (!lock || quit_ || queued_jobs() + in_flight_ + in_flight_reads_ >= kQueueCap) { return {}; }
     auto ticket = std::make_shared<ReadCompletion>();
     if (!enabled_ || kind_index(kind) >= std::size(families_) || !family(kind).store) {
         ticket->result.store(DiskReadResult::Disabled, std::memory_order_release);
@@ -589,7 +617,7 @@ ReadTicket DiskKVBridge::try_read_priority(const DiskKVIdentity& id, DiskKVKind 
     // Request-path lane: ahead of maintenance even inside the priority tier.
     seed_queue_.push_back(std::move(job));
     lock.unlock();
-    qcv_.notify_one();
+    qcv_.notify_all();
     return ticket;
 }
 
