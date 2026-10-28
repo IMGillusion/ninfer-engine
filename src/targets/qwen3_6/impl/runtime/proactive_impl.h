@@ -35,9 +35,10 @@ bool ProgramImplCore::proactive_begin(const ContinuationHandle& owner) {
     if (proactive_) return fail("busy");
     if (!proactive_pressure()) return fail("no-pressure");
     if (!disk_kv) return fail("no-disk-tier");
-    // The shared seed/KV scratch is single-user: a live context transaction may
-    // hold borrowed scratch bytes with tickets still in flight.
-    if (has_context_transaction() || pending_transaction_) return fail("transaction");
+    // No transaction refusal: spills stage through dedicated buffers and the
+    // bridge's read isolation keeps them off the seed's critical path. The
+    // 500-race exclusion lives in the tick's owner-pin check; the manager's
+    // candidate guards keep inactive owners only.
     if (!valid_continuation(owner)) return fail("invalid-owner");
     if (has_unsettled_state_fork()) return fail("state-fork");
     const auto index=ContractAccess::index(owner);
@@ -71,9 +72,11 @@ bool ProgramImplCore::proactive_begin_checkpoint(const ContinuationHandle& owner
     if (!checkpoint_enabled_) return fail("checkpoint-disabled");
     if (proactive_) return fail("busy");
     if (!disk_kv) return fail("no-disk-tier");
-    // The shared seed/KV scratch is single-user: a live context transaction may
-    // hold borrowed scratch bytes with tickets still in flight.
-    if (has_context_transaction() || pending_transaction_) return fail("transaction");
+    // No transaction refusal here: the tick progresses during transactions
+    // (dedicated staging + read isolation), and refusing the BEGIN while an
+    // engine is saturated starved the checkpoint writer entirely - chains
+    // never persisted and every restore degraded to a full recompute. The
+    // 500-race exclusion lives in the tick's owner-pin check.
     if (!valid_continuation(owner)) return fail("invalid-owner");
     if (has_unsettled_state_fork()) return fail("state-fork");
     const auto index=ContractAccess::index(owner);
@@ -99,13 +102,39 @@ bool ProgramImplCore::proactive_begin_checkpoint(const ContinuationHandle& owner
     return true;
 }
 
+void ProgramImplCore::pump_retired_proactive() noexcept {
+    // Background drain for cancelled proactive works. cleanup_owner_spill
+    // waits for every accepted write ticket to settle; under a QLC GC stall a
+    // single entry parks for 15-30s, so cancellation must never call it
+    // inline on the boundary thread. Settled entries clean up instantly.
+    for (std::size_t i = 0; i < retired_proactive_.size();) {
+        auto& spill = retired_proactive_[i]->spill;
+        bool settled = !spill.probe || DiskKVBridge::poll(spill.probe);
+        for (const auto& t : spill.batch_tickets) {
+            if (t && DiskKVBridge::poll(t) == SpillStatus::Pending) { settled = false; break; }
+        }
+        if (settled && spill.ticket &&
+            DiskKVBridge::poll(spill.ticket) == SpillStatus::Pending) { settled = false; }
+        if (!settled) { ++i; continue; }
+        try {
+            cleanup_owner_spill(spill);
+        } catch (...) { std::terminate(); }
+        retired_proactive_.erase(retired_proactive_.begin() +
+                                 static_cast<std::ptrdiff_t>(i));
+    }
+}
+
 void ProgramImplCore::proactive_cancel() noexcept {
     if (!proactive_) return;
-    cleanup_owner_spill(proactive_->spill);
+    // Retire - never drain inline. The transaction-begin and victim-conflict
+    // cancels used to sit in cleanup_owner_spill's ticket drain while a QLC
+    // write stall held the whole engine boundary.
+    retired_proactive_.push_back(std::move(proactive_));
     proactive_.reset();
 }
 
 int ProgramImplCore::proactive_tick(const ContinuationHandle& owner) noexcept {
+    pump_retired_proactive();
     if (!proactive_) return -1;
     auto& work=*proactive_;
     if (!valid_continuation(owner) || ContractAccess::index(owner)!=work.index ||
@@ -114,19 +143,25 @@ int ProgramImplCore::proactive_tick(const ContinuationHandle& owner) noexcept {
         continuation_states[work.index].ledger_frontier!=work.ledger) {
         proactive_begin_fail_="tick-stale"; proactive_cancel(); return -1;
     }
-    // PAUSE (do not discard) while a context transaction is live: it may hold
-    // borrowed seed/KV scratch bytes with tickets in flight, and the spill path
-    // uses that same single-user scratch. The cursor and the already written chain
-    // survive; the next tick resumes after re-validating this fingerprint.
-    if (has_context_transaction() || pending_transaction_) {
+    // The tick PROGRESSES while a context transaction is live. The old
+    // blanket pause existed because the spill shared the seed's staging
+    // scratch; spills now stage through dedicated buffers, and the bridge's
+    // dedicated read workers + read budget keep checkpoint writes from
+    // starving a concurrent seed restore. Starving the checkpoint writer
+    // instead is fatal: with the engine saturated a transaction is almost
+    // always open, a paused tick never resumes, chains never persist, and
+    // every restore degrades to a full recompute (observed: hit rate
+    // 82% -> 7% across three deploys). Only the correctness exclusion below
+    // still backs off.
+    {
         // Layer 1 of the 500-race fix (mutual exclusion): an owner that an open
         // materialization transaction needs as its source or as a victim must
-        // not keep its pages pinned by a paused in-flight proactive spill —
+        // not keep its pages pinned by an in-flight proactive spill —
         // those pins used to span the transaction's destructive source
         // truncation ("consumed source KV is not destructively truncatable").
         // Drop the pinned batch and back off instead: the persisted chain is
         // content-addressed, so a later re-spill dedups down to the increment.
-        // With two materialization slots the paused-spill guard scans both: an
+        // With two materialization slots the guard scans both: an
         // open seed whose source (or a victim) is THIS owner still pins its
         // pages, so the spill backs off exactly as the single-slot version did.
         bool owner_pinned_by_seed = false;
@@ -146,7 +181,6 @@ int ProgramImplCore::proactive_tick(const ContinuationHandle& owner) noexcept {
             proactive_cancel();
             return -1;
         }
-        return 0;
     }
     try {
         if (progress_owner_spill(continuation_states[work.index], work.spill)) { return 1; }

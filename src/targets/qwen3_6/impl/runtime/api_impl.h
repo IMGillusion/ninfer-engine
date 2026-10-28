@@ -473,6 +473,11 @@ void Program<Variant>::proactive_cancel() noexcept {
 }
 
 template <>
+void Program<Variant>::pump_retired_proactive() noexcept {
+    impl_->pump_retired_proactive();
+}
+
+template <>
 bool Program<Variant>::proactive_pending() const noexcept {
     return impl_->proactive_pending();
 }

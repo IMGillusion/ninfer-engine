@@ -910,6 +910,10 @@ public:
     int proactive_tick(const ContinuationHandle<Variant>& owner) noexcept;
     bool proactive_commit(ContinuationHandle<Variant>& owner) noexcept;
     void proactive_cancel() noexcept;
+    // Drain cancelled proactive works whose accepted write tickets have
+    // settled. Never blocks: an unsettled entry keeps draining in the
+    // background and is retried on the next call.
+    void pump_retired_proactive() noexcept;
     [[nodiscard]] bool proactive_pending() const noexcept;
     [[nodiscard]] std::size_t proactive_entries() const noexcept;
     [[nodiscard]] std::size_t proactive_done_entries() const noexcept;

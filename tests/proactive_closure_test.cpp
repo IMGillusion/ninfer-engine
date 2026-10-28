@@ -1,3 +1,4 @@
+#include "test_spill_sync.h"
 #include "core/proactive_closure.h"
 #include <cassert>
 #include <filesystem>
@@ -5,9 +6,9 @@
 using namespace ninfer;
 int main() {
     ProactiveWatermarks water;
-    std::array<std::pair<std::uint64_t,std::uint64_t>,1> usage{{{89,100}}};
-    assert(!water.update(usage)); usage[0].first=90; assert(water.update(usage));
-    usage[0].first=80; assert(water.update(usage)); usage[0].first=75; assert(!water.update(usage));
+    std::array<std::pair<std::uint64_t,std::uint64_t>,1> usage{{{79,100}}};
+    assert(!water.update(usage)); usage[0].first=80; assert(water.update(usage));
+    usage[0].first=70; assert(water.update(usage)); usage[0].first=65; assert(!water.update(usage));
     const auto root=std::filesystem::temp_directory_path()/"proactive-closure-test";
     std::filesystem::remove_all(root);
     std::filesystem::create_directories(root);
@@ -35,7 +36,7 @@ int main() {
             assert(!bridge.drop_page(e.id,e.kind));
             std::vector<std::byte> payload(e.bytes,std::byte(99));
             // Force the store well past capacity while closure lease is held.
-            for(unsigned n=0;n<300;++n) assert(bridge.spill_page_sync({n+1000,0,0,64},e.kind,payload));
+            for(unsigned n=0;n<300;++n) assert(test_spill_wait(bridge, {n+1000,0,0,64},e.kind,payload, std::chrono::milliseconds(30000)));
             assert(bridge.restore_page(e.id,e.kind,payload));
             for(auto b:payload) assert(b==std::byte(i+17));
         }

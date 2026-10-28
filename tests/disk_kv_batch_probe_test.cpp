@@ -3,6 +3,7 @@
 #include <bits/stdc++.h>
 #define private public
 #include "core/disk_kv_bridge.h"
+#include "test_spill_sync.h"
 #undef private
 using namespace ninfer;
 using Clock = std::chrono::steady_clock;
@@ -36,7 +37,7 @@ int main() {
     {
         DiskKVBridge b(opts);
         for (auto kind : {DiskKVKind::MainKV, DiskKVKind::BackendKV, DiskKVKind::StateImage}) {
-            assert(b.spill_page_sync(present, kind, bytes));
+            assert(test_spill_wait(b, present, kind, bytes, std::chrono::milliseconds(30000)));
             std::array input{present, missing, present};
             auto t = submit(b, input, kind);
             input.fill(missing); // queued identities must not borrow caller storage

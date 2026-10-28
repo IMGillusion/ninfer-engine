@@ -32,6 +32,21 @@ std::size_t family_budget(std::size_t total, std::size_t stride, std::uint32_t s
     return (bytes / stride) * stride;
 }
 
+// Deadlines for the bounded large-IO paths (0 keeps the bound at the default).
+std::uint64_t env_ms(const char* name, std::uint64_t fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') { return fallback; }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value) { return fallback; }
+    return static_cast<std::uint64_t>(parsed);
+}
+std::chrono::milliseconds read_deadline() {
+    return std::chrono::milliseconds(env_ms("NINFER_L3_READ_TIMEOUT_MS", 60000));
+}
+std::chrono::milliseconds write_deadline() {
+    return std::chrono::milliseconds(env_ms("NINFER_L3_WRITE_TIMEOUT_MS", 30000));
+}
 } // namespace
 
 DiskKVBridge::DiskKVBridge(Options opts) : opts_(std::move(opts)) {
@@ -99,6 +114,18 @@ DiskKVBridge::~DiskKVBridge() {
     for (std::thread& w : workers_) {
         if (w.joinable()) { w.join(); }
     }
+    // Give in-flight fire-and-forget writes a bounded window to land before
+    // the stores go away. A write still running past the deadline matches the
+    // established abandoned-IO residual (its thread touches nothing but the
+    // ring slot and the doomed store; best effort by contract).
+    {
+        const auto deadline = std::chrono::steady_clock::now() + write_deadline();
+        while (async_live_.load(std::memory_order_acquire) != 0) {
+            if (std::chrono::steady_clock::now() >= deadline) { break; }
+            std::unique_lock<std::mutex> lock(qmu_);
+            qcv_.wait_for(lock, std::chrono::milliseconds(5));
+        }
+    }
     // Drain whatever the worker already pulled off the queue so no page is
     // lost between join and destruction (best effort; store is still alive).
     while (true) {
@@ -116,6 +143,7 @@ DiskKVBridge::~DiskKVBridge() {
                 job = std::move(queue_.front());
                 queue_.pop_front();
             }
+            if (job.read) { queued_reads_ -= (queued_reads_ > 0 ? 1U : 0U); }
         }
         spill_queued(job);
     }
@@ -159,14 +187,9 @@ void DiskKVBridge::wait_idle() {
         // behind minutes of background writes (the isolation this pool
         // split exists for).
         qcv_.wait(lock, [this] {
-            if (in_flight_reads_ != 0 || !seed_queue_.empty()) { return false; }
-            for (const auto& job : priority_queue_) {
-                if (job.read) { return false; }
-            }
-            for (const auto& job : queue_) {
-                if (job.read) { return false; }
-            }
-            return true;
+            // queued_reads_ covers every queued read job (any lane), so no
+            // scan of the write lanes is needed.
+            return queued_reads_ == 0 && in_flight_reads_ == 0;
         });
     }
     // Worker keeps in_flight nonzero through its idle flush.
@@ -177,22 +200,6 @@ namespace {
 inline bool bridge_trace() {
     static const bool on = std::getenv("NINFER_BRIDGE_TRACE") != nullptr;
     return on;
-}
-
-// Deadlines for the bounded large-IO paths (0 keeps the bound at the default).
-std::uint64_t env_ms(const char* name, std::uint64_t fallback) {
-    const char* value = std::getenv(name);
-    if (value == nullptr || *value == '\0') { return fallback; }
-    char* end = nullptr;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (end == value) { return fallback; }
-    return static_cast<std::uint64_t>(parsed);
-}
-std::chrono::milliseconds read_deadline() {
-    return std::chrono::milliseconds(env_ms("NINFER_L3_READ_TIMEOUT_MS", 60000));
-}
-std::chrono::milliseconds write_deadline() {
-    return std::chrono::milliseconds(env_ms("NINFER_L3_WRITE_TIMEOUT_MS", 30000));
 }
 } // namespace
 
@@ -213,6 +220,7 @@ void DiskKVBridge::worker_loop(bool read_worker) {
                 if (seed_queue_.empty()) { return; }   // quit_ and drained
                 job = std::move(seed_queue_.front());
                 seed_queue_.pop_front();
+                queued_reads_ -= (queued_reads_ > 0 ? 1U : 0U);
                 in_flight_reads_ += 1;
             } else {
                 // Write workers drain maintenance/checkpoint writes. They stop
@@ -227,7 +235,10 @@ void DiskKVBridge::worker_loop(bool read_worker) {
                                                         : priority_queue_.front());
                 if (priority_queue_.empty()) { queue_.pop_front(); }
                 else { priority_queue_.pop_front(); }
-                if (job.read) { in_flight_reads_ += 1; }
+                if (job.read) {
+                    queued_reads_ -= (queued_reads_ > 0 ? 1U : 0U);
+                    in_flight_reads_ += 1;
+                }
                 else { in_flight_ += 1; }
             }
             have = true;
@@ -281,6 +292,7 @@ void DiskKVBridge::worker_loop(bool read_worker) {
                 if (job.completion) { job.completion->status.store(SpillStatus::Failed, std::memory_order_release); }
                 if (job.read) { job.read->result.store(DiskReadResult::IOFailure, std::memory_order_release); }
                 if (job.probe_batch) { job.probe_batch->ready.store(true, std::memory_order_release); }
+                if (!job.read && !job.probe_batch) { promise_done(job.id); }
             }
             std::lock_guard<std::mutex> lock(qmu_);
             if (read_worker) { in_flight_reads_ -= (in_flight_reads_ > 0 ? 1 : 0); }
@@ -291,6 +303,7 @@ void DiskKVBridge::worker_loop(bool read_worker) {
                 if (job.completion) { job.completion->status.store(SpillStatus::Failed, std::memory_order_release); }
                 if (job.read) { job.read->result.store(DiskReadResult::IOFailure, std::memory_order_release); }
                 if (job.probe_batch) { job.probe_batch->ready.store(true, std::memory_order_release); }
+                if (!job.read && !job.probe_batch) { promise_done(job.id); }
             }
             std::lock_guard<std::mutex> lock(qmu_);
             if (job.read) { in_flight_reads_ -= (in_flight_reads_ > 0 ? 1U : 0U); }
@@ -325,6 +338,7 @@ bool DiskKVBridge::spill_page(const DiskKVIdentity& id, DiskKVKind kind,
         stats_.queue_drops += 1;
         return false;  // backpressure: page won't be restorable (recompute later)
     }
+    promise_add(id);
     queue_.emplace_back(SpillJob{id, kind, {bytes.begin(), bytes.end()}, {}, {}, false, {}, {}});
     qcv_.notify_all();
     return true;
@@ -355,6 +369,7 @@ bool DiskKVBridge::spill_page_wait(const DiskKVIdentity& id, DiskKVKind kind,
         return false;
     }
     if (quit_) { return false; }
+    promise_add(id);
     queue_.emplace_back(SpillJob{id, kind, {bytes.begin(), bytes.end()}, {}, {}, false, {}, {}});
     qcv_.notify_all();
     return true;
@@ -364,8 +379,9 @@ ReadTicket DiskKVBridge::try_read(const DiskKVIdentity& id, DiskKVKind kind,
                                   std::span<std::byte> dst) {
     if (volume_breaker_tripped()) { return {}; }   // volume wedged: reject submission
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
-    if (!lock || quit_ ||
-        queued_jobs() + in_flight_ + in_flight_reads_ >= kQueueCap) {
+    // Read admission is judged against the READ budget alone: a write backlog
+    // parked on QLC-stalled workers must never refuse a seed page read.
+    if (!lock || quit_ || read_outstanding() >= kReadBudget) {
         return {};
     }
     auto ticket = std::make_shared<ReadCompletion>();
@@ -380,6 +396,7 @@ ReadTicket DiskKVBridge::try_read(const DiskKVIdentity& id, DiskKVKind kind,
     SpillJob job{};
     job.id = id; job.kind = kind; job.read = ticket; job.read_dst = dst;
     queue_.push_back(std::move(job));
+    queued_reads_ += 1;
     lock.unlock();
     qcv_.notify_all();
     return ticket;
@@ -389,6 +406,10 @@ void DiskKVBridge::spill_queued(SpillJob& job) {
     if (job.read) {
         DiskReadResult result = DiskReadResult::IOFailure;
         try {
+            // The probe may have selected this page while its write was still
+            // promised (a chain racing its own checkpoint). Wait for the write
+            // to land; a bounded wait, paid only by reads of promised pages.
+            wait_promise_clear(job.id);
             if (job.read_dst.size() >= kLargeIOBytes) {
                 result = bounded_large_read(job);
             } else {
@@ -430,6 +451,9 @@ void DiskKVBridge::spill_queued(SpillJob& job) {
     }
     Family& f = family(job.kind);
     const auto finish = [&](SpillStatus status) {
+        // The write left the promised set (landed, dropped or failed) before
+        // the ack: a waiter's read must never block on a settled job.
+        promise_done(job.id);
         // Release owned capacity BEFORE ack permits the producer's next buffer.
         // Borrowed owner-spill jobs have an empty vector and are unchanged.
         std::vector<std::byte>().swap(job.bytes);
@@ -557,6 +581,7 @@ SpillTicket DiskKVBridge::try_submit(const DiskKVIdentity& id, DiskKVKind kind,
     auto ticket = std::make_shared<SpillCompletion>();
     SpillJob job{}; job.id = id; job.kind = kind; job.completion = ticket; job.borrowed = bytes;
     queue_.push_back(std::move(job));
+    promise_add(id);
     if (bridge_trace()) {
         disk_kv_logf('D', "l3-bridge", "submit | id=%llu/%llu kind=%u queued=%zu in_flight=%zu",
                      static_cast<unsigned long long>(id.lo), static_cast<unsigned long long>(id.hi),
@@ -580,6 +605,7 @@ SpillTicket DiskKVBridge::try_submit_owned(const DiskKVIdentity& id, DiskKVKind 
     auto& job = queue_.back();
     job.id = id; job.kind = kind; job.completion = ticket;
     job.bytes.swap(bytes);
+    promise_add(id);
     qcv_.notify_all();
     return ticket;
 }
@@ -594,6 +620,7 @@ SpillTicket DiskKVBridge::try_submit_owned_priority(const DiskKVIdentity& id, Di
     auto& job = priority_queue_.back();
     job.id = id; job.kind = kind; job.completion = ticket; job.priority = true;
     job.bytes.swap(bytes);
+    promise_add(id);
     qcv_.notify_all();
     return ticket;
 }
@@ -602,7 +629,9 @@ ReadTicket DiskKVBridge::try_read_priority(const DiskKVIdentity& id, DiskKVKind 
                                            std::span<std::byte> dst) {
     if (volume_breaker_tripped()) { return {}; }   // volume wedged: reject submission
     std::unique_lock<std::mutex> lock(qmu_, std::try_to_lock);
-    if (!lock || quit_ || queued_jobs() + in_flight_ + in_flight_reads_ >= kQueueCap) { return {}; }
+    // Read admission is judged against the READ budget alone: a write backlog
+    // parked on QLC-stalled workers must never refuse a seed page read.
+    if (!lock || quit_ || read_outstanding() >= kReadBudget) { return {}; }
     auto ticket = std::make_shared<ReadCompletion>();
     if (!enabled_ || kind_index(kind) >= std::size(families_) || !family(kind).store) {
         ticket->result.store(DiskReadResult::Disabled, std::memory_order_release);
@@ -616,6 +645,7 @@ ReadTicket DiskKVBridge::try_read_priority(const DiskKVIdentity& id, DiskKVKind 
     job.id = id; job.kind = kind; job.read = ticket; job.read_dst = dst; job.priority = true;
     // Request-path lane: ahead of maintenance even inside the priority tier.
     seed_queue_.push_back(std::move(job));
+    queued_reads_ += 1;
     lock.unlock();
     qcv_.notify_all();
     return ticket;
@@ -679,10 +709,15 @@ bool DiskKVBridge::bounded_sync_write(const DiskKVIdentity& id, DiskKVKind kind,
     auto attempt    = std::make_shared<Attempt>();
     attempt->bytes.assign(bytes.begin(), bytes.end());
     auto* store     = family(kind).store.get();
+    promise_add(id);
+    async_live_.fetch_add(1, std::memory_order_relaxed);
     std::thread worker([this, attempt, id, store] {
         attempt->ok = store->upsert_page(id, attempt->bytes, &attempt->evicted);
         attempt->done.store(true, std::memory_order_release);
         if (attempt->abandoned.exchange(true)) { abandoned_ios_.fetch_sub(1); }
+        promise_done(id);
+        async_live_.fetch_sub(1, std::memory_order_release);
+        qcv_.notify_all();
     });
     const auto deadline = std::chrono::steady_clock::now() + write_deadline();
     bool finished = attempt->done.load(std::memory_order_acquire);
@@ -692,7 +727,8 @@ bool DiskKVBridge::bounded_sync_write(const DiskKVIdentity& id, DiskKVKind kind,
     }
     if (!finished) {
         // Attempt owns its payload copy; the abandoned thread touches nothing
-        // the caller owns. The anchor degrades silently (best-effort by design).
+        // the caller owns. The state degrades (best-effort by design) and the
+        // next round restores from an older frontier.
         if (!attempt->abandoned.exchange(true)) { abandoned_ios_.fetch_add(1); }
         disk_kv_logf('W', "l3-bridge",
                      "sync write abandoned | kind=%u bytes=%zu id=%llu/%llu outstanding=%u",
@@ -706,7 +742,7 @@ bool DiskKVBridge::bounded_sync_write(const DiskKVIdentity& id, DiskKVKind kind,
     worker.join();
     if (!attempt->ok) { return false; }
     const std::size_t evicted_n = attempt->evicted.size();
-    family(kind).store->flush_index();
+    store->flush_index();
     std::lock_guard<std::mutex> lock(mu_);
     stats_.spills += 1;
     stats_.spill_bytes += bytes.size();
@@ -714,18 +750,10 @@ bool DiskKVBridge::bounded_sync_write(const DiskKVIdentity& id, DiskKVKind kind,
     return true;
 }
 
-bool DiskKVBridge::spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
-                                   std::span<const std::byte> bytes) {
+bool DiskKVBridge::spill_page_async(const DiskKVIdentity& id, DiskKVKind kind,
+                                    std::span<const std::byte> bytes, bool wait_for_slot) {
     if (!enabled_ || kind_index(kind) >= std::size(families_)) { return false; }
-    if (volume_breaker_tripped()) {
-        // Volume wedged: degrade the (best-effort) synchronous write at once instead
-        // of parking the caller for the bounded-write window.
-        disk_kv_logf('W', "l3-bridge",
-                     "sync write rejected | volume breaker tripped | id=%llu/%llu",
-                     static_cast<unsigned long long>(id.lo),
-                     static_cast<unsigned long long>(id.hi));
-        return false;
-    }
+    if (volume_breaker_tripped()) { return false; }
     const Family& f = family(kind);
     if (f.store == nullptr || bytes.size() != f.stride) { return false; }
     {
@@ -735,12 +763,67 @@ bool DiskKVBridge::spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
             return true;  // already restorable (dedupe)
         }
     }
-    // ALL payloads take the bounded path. The old small-payload shortcut called
-    // upsert_page directly on the calling (engine) thread with no deadline, so a wedged
-    // volume would hold the engine forever — and the seam write runs per tool-loop
-    // round, making it a high-frequency exposure. bounded_sync_write handles any size
-    // (transient thread, 30s deadline, payload copy, abandon accounting).
-    return bounded_sync_write(id, kind, bytes);
+    // Claim a ring slot and copy the payload on the CALLING thread: the source
+    // (a D2H scratch or a dying owner's host view) is typically leased and
+    // must be releasable the moment this call returns. The transient writer
+    // touches only ring-owned memory and the store.
+    AsyncWriteSlot* slot = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(async_mu_);
+        for (auto& candidate : async_slots_) {
+            if (!candidate.busy) { slot = &candidate; break; }
+        }
+        if (slot == nullptr) {
+            // Saturated ring. The load-bearing owner-death states must not
+            // silently skip - a missing endpoint state orphans the whole
+            // persisted chain and the next round pays a full recompute.
+            // Degrade to the bounded synchronous write (the pre-async
+            // behavior, bounded by the write deadline) instead.
+            if (wait_for_slot) { return bounded_sync_write(id, kind, bytes); }
+            return false;
+        }
+        slot->busy = true;
+        try {
+            if (slot->capacity != bytes.size()) {
+                slot->bytes = std::make_unique<std::byte[]>(bytes.size());
+                slot->capacity = bytes.size();
+            }
+            std::memcpy(slot->bytes.get(), bytes.data(), bytes.size());
+        } catch (...) {
+            slot->busy = false;
+            throw;
+        }
+    }
+    promise_add(id);
+    auto* store = f.store.get();
+    const auto payload = std::span<const std::byte>(slot->bytes.get(), bytes.size());
+    async_live_.fetch_add(1, std::memory_order_relaxed);
+    std::thread writer([this, slot, id, kind, store, payload] {
+        std::vector<std::uint32_t> evicted;
+        const bool ok = store->upsert_page(id, payload, &evicted);
+        if (!ok) {
+            disk_kv_logf('W', "l3-bridge",
+                         "async write failed | kind=%u id=%llu/%llu | degrade to delta recompute",
+                         static_cast<unsigned>(kind),
+                         static_cast<unsigned long long>(id.lo),
+                         static_cast<unsigned long long>(id.hi));
+        } else {
+            store->flush_index();
+            std::lock_guard<std::mutex> lock(mu_);
+            stats_.spills += 1;
+            stats_.spill_bytes += payload.size();
+            stats_.evicted_slots += evicted.size();
+        }
+        promise_done(id);   // landed or failed: waiters stop waiting either way
+        {
+            std::lock_guard<std::mutex> lock(async_mu_);
+            slot->busy = false;
+        }
+        async_live_.fetch_sub(1, std::memory_order_release);
+        qcv_.notify_all();
+    });
+    writer.detach();
+    return true;
 }
 
 bool DiskKVBridge::drop_page(const DiskKVIdentity& id, DiskKVKind kind) {
@@ -766,11 +849,25 @@ bool DiskKVBridge::restore_page(const DiskKVIdentity& id, DiskKVKind kind,
     return true;
 }
 
+void DiskKVBridge::wait_promise_clear(const DiskKVIdentity& id) const {
+    // A read racing its own chain's checkpoint: the probe selected this page
+    // because the write is PROMISED (submitted, not landed). Wait for the
+    // write to finish instead of failing the whole restore. Bounded by the
+    // write deadline; a wedged volume abandons the write, the promise
+    // clears, and the read honestly misses.
+    const auto deadline = std::chrono::steady_clock::now() + write_deadline();
+    while (promised(id)) {
+        if (std::chrono::steady_clock::now() >= deadline) { return; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
 bool DiskKVBridge::contains(const DiskKVIdentity& id, DiskKVKind kind) const {
     if (!enabled_ || kind_index(kind) >= std::size(families_)) { return false; }
     const Family& f = family(kind);
     if (f.store == nullptr) { return false; }
-    return f.store->contains(id);
+    if (f.store->contains(id)) { return true; }
+    return promised(id);   // submitted write still in flight
 }
 
 std::size_t DiskKVBridge::probe_prefix(const std::vector<DiskKVIdentity>& page_ids,

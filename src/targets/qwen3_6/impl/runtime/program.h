@@ -638,6 +638,10 @@ public:
         } catch (...) { return 0; }
     }
     void proactive_cancel() noexcept;
+    // Drain cancelled proactive works whose accepted write tickets have
+    // settled. Never blocks: an unsettled entry keeps draining in the
+    // background and is retried on the next call.
+    void pump_retired_proactive() noexcept;
     bool proactive_pending() const noexcept { return bool(proactive_); }
     [[nodiscard]] bool has_background_host_kv_work() const noexcept { return host_prewrite.has_work(); }
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
@@ -743,8 +747,22 @@ public:
     // scratch so a proactive owner spill never blocks the prefill seam write.
     std::optional<HostKVAllocation> l3_seam_scratch;
     std::optional<HostKVAllocation> l3_seam_backend_scratch;
+    // Dedicated spill scratch (one owner-spill batch each): the resumable
+    // spill's D2H staging is disjoint from BOTH seed slots. A spill's accepted
+    // write jobs used to hold shared scratch until a write worker dequeued
+    // them - under a QLC GC stall that hold stretched to tens of seconds and
+    // stalled the next seed behind every in-flight checkpoint (observed: a
+    // 79s gap between materialize-begin and the first seed read while four
+    // owner spills drained). The single-user scratch contract is gone.
+    std::optional<HostKVAllocation> l3_spill_scratch;
+    std::optional<HostKVAllocation> l3_spill_backend_scratch;
     std::optional<qwen3_6::HostStateSlotHandle> l3_state_scratch;
     StateScratchLease l3_state_scratch_lease;
+    // State-image scratch for spill/maintenance writers (endpoint/seam/anchor
+    // states), disjoint from both seed slots: a spill's state stage can no
+    // longer starve a seed's restore phase or steal its lease.
+    std::optional<qwen3_6::HostStateSlotHandle> l3_state_spill_scratch;
+    StateScratchLease l3_state_spill_lease;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
     std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
@@ -1027,6 +1045,12 @@ private:
         bool checkpoint_only=false;
     };
     std::unique_ptr<ProactiveWork> proactive_;
+    // Cancelled-but-not-yet-drained proactive works. cleanup_owner_spill waits
+    // for every accepted write ticket to settle, which under a QLC GC stall is
+    // a 15-30s block - unacceptable on the transaction-begin path that used to
+    // call it inline. Cancellation now retires the work: the boundary pump
+    // drains settled entries in the background while the transaction proceeds.
+    std::vector<std::unique_ptr<ProactiveWork>> retired_proactive_;
     bool progress_owner_spill(SequenceState& sequence, OwnerSpillProgress& progress);
     bool owner_spill_pending(const OwnerSpillProgress& progress) const;
     void cleanup_owner_spill(OwnerSpillProgress& progress) noexcept;

@@ -3,6 +3,7 @@
 // 1.18MB CRC+memcpy, which serialized every reader at ~1.2 ms/page; this bench
 // shows what the same volume does now that the payload work moved outside the lock.
 #include "core/disk_kv_bridge.h"
+#include "test_spill_sync.h"
 
 #include <algorithm>
 #include <chrono>
@@ -41,7 +42,7 @@ int main(int argc, char** argv) {
         const DiskKVIdentity id{1, 2, static_cast<std::uint32_t>(i), 64};
         ids.push_back(id);
         src[0] = std::byte{static_cast<unsigned char>(i)};
-        until([&] { return bridge.spill_page_sync(id, DiskKVKind::MainKV, src); }, "spill_page_sync");
+        until([&] { return test_spill_wait(bridge, id, DiskKVKind::MainKV, src, std::chrono::milliseconds(30000)); }, "spill_page_sync");
     }
     bridge.wait_idle();
     const double write_s = std::chrono::duration<double>(Clock::now() - w0).count();

@@ -51,6 +51,10 @@ namespace {
 // family (main + backend reserves), which is ~5% of the 6GiB host arena.
 constexpr std::uint32_t kL3ScratchPages = 128;
 
+// Owner-spill D2H batch bound: the resumable spill probes at most one bridge
+// probe batch at a time, so its dedicated staging scratch never needs more.
+constexpr std::uint32_t kSpillBatchMax = static_cast<std::uint32_t>(kDiskKVProbeBatchMax);
+
 // Bounded in-visit wait for the disk seed, in milliseconds; 0 (the default) means no
 // wait at all. Read once, so a sweep is a container restart and cannot drift mid-run.
 // Rationale: a restore advances one batch per scheduling step, but a batch only needs
@@ -1030,6 +1034,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             // with the shared seed/spill scratch a proactive owner spill may hold mid-batch
             // while the next round's prefill runs.
             l3_seam_scratch = host_kv_arena->allocate(*main_scratch_layout, 2U);
+            // Dedicated one-batch scratch for the resumable owner spill's D2H
+            // staging (kSpillBatchMax pages): disjoint from both seed slots, so
+            // a spill's write jobs parked on QLC-stalled workers can never hold
+            // the buffer the next seed reads through.
+            l3_spill_scratch = host_kv_arena->allocate(*main_scratch_layout, kSpillBatchMax);
         }
         if (backend_host_kv_page_stride != 0 && backend_kv_pages != nullptr) {
             const HostKVPageLayout* backend_scratch_layout =
@@ -1041,14 +1050,18 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                     host_kv_arena->allocate(*backend_scratch_layout, kL3ScratchPages);
                 l3_seam_backend_scratch =
                     host_kv_arena->allocate(*backend_scratch_layout, 2U);
+                l3_spill_backend_scratch =
+                    host_kv_arena->allocate(*backend_scratch_layout, kSpillBatchMax);
             }
         }
         l3_state_scratch = host_state_images->allocate();
         l3_state_scratch_b = host_state_images->allocate();
-        disk_kv_logf('I', "l3-restore", "scratch reserved | kv=%d backend=%d state=%d",
+        l3_state_spill_scratch = host_state_images->allocate();
+        disk_kv_logf('I', "l3-restore", "scratch reserved | kv=%d backend=%d state=%d spill=%d",
                      static_cast<int>(l3_kv_scratch.has_value()),
                      static_cast<int>(l3_backend_scratch.has_value()),
-                     static_cast<int>(l3_state_scratch.has_value()));
+                     static_cast<int>(l3_state_scratch.has_value()),
+                     static_cast<int>(l3_spill_scratch.has_value()));
     }
 
     io = qwen3_6::RoundState(backing, plan.persistent.round);
@@ -1135,6 +1148,16 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
+    // Retired proactive works still borrow host extents/scratch through their
+    // accepted write tickets; dropping them without cleanup would let the
+    // in-flight writes read freed host memory. cleanup_owner_spill drains.
+    for (auto& work : retired_proactive_) {
+        try { cleanup_owner_spill(work->spill); } catch (...) { std::terminate(); }
+    }
+    if (proactive_) {
+        try { cleanup_owner_spill(proactive_->spill); } catch (...) { std::terminate(); }
+        proactive_.reset();
+    }
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
@@ -3077,10 +3100,10 @@ void ProgramImplCore::cleanup_owner_spill(OwnerSpillProgress& p) noexcept {
     try {
         // Only exceptional teardown waits. Normal cancellation polls before cleanup.
         if (p.copy_done) { p.copy_done->synchronize(); }
-        if ((p.ticket && DiskKVBridge::poll(p.ticket) == SpillStatus::Pending) ||
-            p.OwnerSpillBatch::pending()) {
-            disk_kv->wait_idle();
-        }
+        // Drain is bounded by THIS spill's own tickets below. The old global
+        // wait_idle here also waited for unrelated seed reads - exactly the
+        // maintenance-blocks-request-path coupling the dedicated staging
+        // scratch removed.
         if (p.pinned_page) { p.pinned_store->unpin_source(*p.pinned_page); }
         p.pinned_page.reset();
         if (!p.batch_pages.empty()) {
@@ -3101,9 +3124,11 @@ void ProgramImplCore::cleanup_owner_spill(OwnerSpillProgress& p) noexcept {
         // batch borrows its payload bytes for in-flight writes, so dropping
         // early is a use-after-free. Global wait_idle no longer covers
         // writes (read/write worker split - a checkpoint backlog must not
-        // stall this teardown), so poll the spill's own tickets here.
+        // stall this teardown), so poll the spill's own tickets here. The
+        // batch PROBE ticket is borrowed too (its results buffer lives in
+        // the bridge until terminal) and must join the drain.
         for (std::uint32_t wait_ms = 0;;) {
-            bool settled = true;
+            bool settled = !p.probe || DiskKVBridge::poll(p.probe);
             for (const auto& t : p.batch_tickets) {
                 if (t && DiskKVBridge::poll(t) == SpillStatus::Pending) { settled = false; break; }
             }
@@ -3192,8 +3217,13 @@ bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillPr
                         ++devices;
                     }
                 }
+                // Dedicated spill staging: never the seed's scratch. These
+                // payload borrows live until the write jobs are DEQUEUED, and
+                // a QLC-stalled worker can park that for tens of seconds -
+                // sharing the seed's buffer here stalled the next transaction's
+                // restore behind every in-flight checkpoint.
                 auto& scratch = p.batch_kind == DiskKVKind::BackendKV
-                                    ? l3_backend_scratch : l3_kv_scratch;
+                                    ? l3_spill_backend_scratch : l3_spill_scratch;
                 if (devices && !scratch) { p.failed = true; return false; }
                 // Retry-safe prepare. First call: pin sources, snapshot
                 // payloads, enqueue the D2H copy, record its completion event,
@@ -3450,12 +3480,15 @@ bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillPr
                     // returning the claim. The borrow therefore lasts through ack.
                     p.bytes = {view->data, stride}; p.ready = true;
                 } else {
-                    if (!l3_state_scratch) { p.failed = true; return false; }
-                    if (!p.state_scratch_lease) {
-                        p.state_scratch_lease = l3_state_scratch_lease.try_acquire();
-                        if (!p.state_scratch_lease) { return false; }
-                    }
-                    auto scratch_view = host_state_images->writable_view(*l3_state_scratch);
+                if (!l3_state_spill_scratch) { p.failed = true; return false; }
+                if (!p.state_scratch_lease) {
+                    // Dedicated spill-state lease: a paused/resumed spill can
+                    // hold this through its write, so a second spill stage
+                    // waits instead of stealing a seed's restore buffer.
+                    p.state_scratch_lease = l3_state_spill_lease.try_acquire();
+                    if (!p.state_scratch_lease) { return false; }
+                }
+                auto scratch_view = host_state_images->writable_view(*l3_state_spill_scratch);
                     if (!state_images->spill_copy_to_host(state_store->physical_slot(handle),
                             scratch_view, device.transfer_stream)) { p.failed = true; return false; }
                     p.bytes = {scratch_view.data, stride}; ++p.d2h;
@@ -3475,7 +3508,7 @@ bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillPr
                     // Seam tails are single pages: keep the one-shot flow.
                     if (!pages->can_pin_source(logical)) { return false; }
                     pages->pin_source(logical); p.pinned_store = pages; p.pinned_page = logical;
-                    auto& scratch = backend ? l3_backend_scratch : l3_kv_scratch;
+                    auto& scratch = backend ? l3_spill_backend_scratch : l3_spill_scratch;
                     if (!scratch) { p.failed = true; return false; }
                     auto view = host_kv_arena->writable_view(*scratch).subview(0, 1);
                     const auto physical = pages->physical(logical);
@@ -3619,26 +3652,32 @@ void ProgramImplCore::spill_dying_owner_pages(SequenceState& sequence) {
             spill_prefix(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend,
                          backend_pages, backend_host_kv_page_stride, DiskKVKind::BackendKV);
         }
-        // Owner-death release is best effort, unlike resumable pressure eviction.
-        // All accepted copies drain before scratch/owner release; hard GPU errors
-        // exit 70 in SpillCopy (no unwinding), requiring process recovery.
+        // Owner-death release is best effort. The state writes are fire-and-
+        // forget (spill_page_async): the dying lane's release must never sit
+        // in a 15-30s QLC write stall - that block was the terminal-pending
+        // pileup that starved admission. Until an async write lands, probe
+        // misses degrade the next round to an older frontier plus delta.
+        // All accepted copies drain before scratch/owner release; hard GPU
+        // errors exit 70 in SpillCopy (no unwinding), requiring process
+        // recovery.
         StateScratchLease::Lease spill_state_lease;
         auto readable_state = [&](StateImageHandle state)
             -> std::optional<qwen3_6::HostStateImageConstView> {
             if (auto host = state_store->host_view(state)) { return host; }
-            // The synchronous writer consumes the previous view before reentry.
-            // Hold the exclusive lease through both writes and exception unwind.
-            // Busy pressure/seed lease means best-effort skip, never a wait.
+            // The fire-and-forget writer consumes the view before this call
+            // returns (the copy happens inside spill_page_async). Hold the
+            // dedicated spill lease through the D2H only; busy means
+            // best-effort skip, never a wait.
             return runtime_support::spill_state_to_scratch(*state_images,
                 state_store->physical_slot(state), host_state_images.get(),
-                l3_state_scratch, l3_state_scratch_lease, spill_state_lease,
+                l3_state_spill_scratch, l3_state_spill_lease, spill_state_lease,
                 device.transfer_stream);
         };
         // State image (L3): the 48-layer GDN/hidden recurrent state at the endpoint
         // frontier. Not derivable from KV, so it must spill (and later restore)
         // as a pair with the KV pages, or a KV-only restore still forces full
-        // prefill of the linear layers. Synchronous spill (146 MiB) — a single
-        // blob, never goes through the bounded page queue.
+        // prefill of the linear layers. Fire-and-forget spill (146 MiB) - the
+        // dying lane's release must never sit in a QLC write stall.
         if (sequence.endpoint_valid && sequence.execution_frontier != 0 &&
             sequence.execution_frontier < sequence.prefix_digests.size() &&
             disk_kv->slot_count(DiskKVKind::StateImage) != 0) {
@@ -3654,8 +3693,9 @@ void ProgramImplCore::spill_dying_owner_pages(SequenceState& sequence) {
                                               .hi       = sdigest[1],
                                               .tag      = tag,
                                               .frontier = sf};
-                    disk_kv->spill_page_sync(sid, DiskKVKind::StateImage,
-                                             std::span<const std::byte>(view->data, stride));
+                    (void)disk_kv->spill_page_async(sid, DiskKVKind::StateImage,
+                                                    std::span<const std::byte>(view->data, stride),
+                                                    /*wait_for_slot=*/true);
                 }
             }
         }
@@ -3684,8 +3724,9 @@ void ProgramImplCore::spill_dying_owner_pages(SequenceState& sequence) {
                                               .hi       = fdigest[1],
                                               .tag      = tag,
                                               .frontier = F};
-                    disk_kv->spill_page_sync(fid, DiskKVKind::StateImage,
-                                             std::span<const std::byte>(view->data, stride));
+                    (void)disk_kv->spill_page_async(fid, DiskKVKind::StateImage,
+                                                    std::span<const std::byte>(view->data, stride),
+                                                    /*wait_for_slot=*/true);
                     // Seam-tail KV page keyed at digest(F) (F is rarely page-aligned;
                     // the seed reads pages [0, F/64) as full pages plus this partial).
                     const std::uint32_t seam_page  = F / static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -3836,7 +3877,12 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
     // `materialization result is not action aligned` -> engine fail-all. With the
     // store on a VM-internal disk (2.9GB/s cold, 7-8GB/s cached) a 3.4GB chain
     // restores in ~1.2s, so the slow-cold-read case this guarded no longer exists.
-    if (progress.started.time_since_epoch().count() == 0) { progress.started = std::chrono::steady_clock::now(); }
+    if (progress.started.time_since_epoch().count() == 0) {
+        progress.started = std::chrono::steady_clock::now();
+        disk_kv_logf('I', "l3-seed-yield",
+                     "seed begin | lane=%u phase=%u slot=%u", sequence.lane,
+                     progress.phase, transaction.slot);
+    }
     // Slow-restore heartbeat: a healthy restore logs its yield line in well
     // under ten seconds even under load, so anything past a minute is
     // forensics for a wedged store read (the serve-level stall sentinel is
@@ -3951,6 +3997,13 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
     const auto read = [&](const DiskKVIdentity& id, DiskKVKind kind, std::span<std::byte> dst) {
         NINFER_SEED_STAGE("read_submit");
         progress.read = disk_kv->try_read_priority(id, kind, dst);
+        if (!progress.read) {
+            // Forensics: a refused seed read stalls the whole materialization
+            // silently - name the refusal every time it happens.
+            disk_kv_logf('W', "l3-seed-yield",
+                         "read refused | kind=%u frontier=%u | admission budget or shutdown",
+                         static_cast<unsigned>(kind), id.frontier);
+        }
         NINFER_SEED_STAGE("read_accepted");
     };
     // Each invocation submits or polls ONE CPU read. No store locks on the
@@ -3977,6 +4030,9 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
         const bool queue_expired = now - progress.read->submitted_at > l3_queue_deadline();
         progress.read.reset();
         if (result != DiskReadResult::Success) {
+            disk_kv_logf('W', "l3-seed-yield",
+                         "state read not restorable | result=%d frontier=%u queue_expired=%d",
+                         static_cast<int>(result), E, static_cast<int>(queue_expired));
             progress.reason = queue_expired ? "state-read-queue-deadline" : "state-read";
             return fail();
         }
@@ -5856,6 +5912,10 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
                 request_plan.reuse_base <= request_plan.summary.prompt_tokens) {
                 transaction.l3_restore_frontier = request_plan.reuse_base;
             }
+            disk_kv_logf('I', "l3-materialize",
+                         "reserve | reuse=%d reuse_base=%u prompt=%u",
+                         static_cast<int>(request_plan.reuse), request_plan.reuse_base,
+                         request_plan.summary.prompt_tokens);
             std::vector<DiskKVIdentity> probe_ids;
             const std::uint32_t max_pages =
                 std::min<std::uint32_t>(kv_pages_for_frontier(prompt_tokens), 4096);
@@ -5960,13 +6020,13 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
             destination.role = ContinuationSlotRole::ReservedMaterialization;
         }
         advance_resource_revision();
-        // An owner spill started before planning may still hold accepted bridge
-        // jobs borrowing the shared KV scratch (copy D2H in flight or store
-        // writes reading borrowed bytes at dequeue). Its store worker would
-        // otherwise observe the seed's pages and persist them under the spilled
-        // session's identity, and its transfer-stream D2H races the seed's
-        // fills on the same slots. The persisted chain is content-addressed, so
-        // cancelling here only defers the increment to a later re-spill.
+        // An owner spill started before planning still borrows its owner's
+        // pages through the D2H window and would keep writing through the
+        // seed's read-critical path. Cancel it: the persisted chain is
+        // content-addressed, so this only defers the increment to a later
+        // re-spill. Cancellation retires the work - the boundary pump drains
+        // its accepted tickets in the background while the seed proceeds on
+        // its own staging buffers.
         if (proactive_) {
             proactive_cancel();
             disk_kv_logf('I', "l3-materialize",
@@ -8301,6 +8361,13 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
 
     // Root disk initialization is transaction-owned and never activates a lane.
     // Non-root paths retain their existing atomic start path.
+    if (transaction.l3_restore_frontier &&
+        transaction.plan->impl_->reuse != ReusePath::Root) {
+        disk_kv_logf('W', "l3-materialize",
+                     "seed gate skip | frontier=%u reuse=%d",
+                     *transaction.l3_restore_frontier,
+                     static_cast<int>(transaction.plan->impl_->reuse));
+    }
     if (transaction.l3_restore_frontier && transaction.plan->impl_->reuse == ReusePath::Root) {
         auto& sequence = continuation_states[*transaction.root_continuation_index];
         sequence.lane = transaction.destination.value;
@@ -14006,12 +14073,16 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 if ((preopener_seam || probe_seam) &&
                     persist_context &&
                     disk_kv != nullptr &&
-                    l3_state_scratch && host_state_images && text_kv_pages && !staged.vision &&
+                    l3_state_spill_scratch && host_state_images && text_kv_pages && !staged.vision &&
                     !staged.prompt.has_media() && speculative_backend != SpeculativeBackend::DFlash &&
                     disk_kv->slot_count(DiskKVKind::StateImage) != 0 &&
                     staged.cursor < sequence.prefix_digests.size()) {
                   try {
-                    StateScratchLease::Lease seam_lease = l3_state_scratch_lease.try_acquire();
+                    // Dedicated spill-state lease: the anchor write must never
+                    // steal the restore-phase buffer of a concurrent seed, and
+                    // the prefill must never wait behind one (busy = skip, the
+                    // round simply re-anchors on a later turn).
+                    StateScratchLease::Lease seam_lease = l3_state_spill_lease.try_acquire();
                     if (seam_lease) {
                         const auto seam_digest = sequence.prefix_digests.at(staged.cursor);
                         const DiskKVIdentity seam{
@@ -14027,7 +14098,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                             sweep_seam_anchors(*disk_kv, preopener_seam, staged.cursor,
                                                seam_digest, sequence.prefix_digests);
                         } else {
-                            const auto view = host_state_images->writable_view(*l3_state_scratch);
+                            const auto view = host_state_images->writable_view(*l3_state_spill_scratch);
                             const std::size_t stride = state_images->host_layout().image_bytes;
                             if (view.data != nullptr && view.layout != nullptr &&
                                 state_images->spill_copy_to_host(
@@ -14041,11 +14112,15 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                     fflush(stderr);
                                     std::_Exit(70);
                                 }
-                                (void)disk_kv->spill_page_sync(
+                                // Fire-and-forget: the prefill continues while the
+                                // write drains; a follow-up that probes before the
+                                // page lands degrades to the older frontier.
+                                (void)disk_kv->spill_page_async(
                                     seam, DiskKVKind::StateImage,
-                                    std::span<const std::byte>(view.data, stride));
+                                    std::span<const std::byte>(view.data, stride),
+                                    /*wait_for_slot=*/false);
                                 disk_kv_logf('I', "l3-seam",
-                                             "anchor written | kind=%s frontier=%u digest=%016llx%016llx",
+                                             "anchor submitted | kind=%s frontier=%u digest=%016llx%016llx",
                                              probe_seam ? "probe" : "preopener",
                                              staged.cursor,
                                              (unsigned long long)seam_digest[0],
@@ -14068,9 +14143,8 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                         // refills + writeback stalls) measured ~0.3s per page inside
                         // advance_prefill: one 1.3K-token preopener increment = 42 pages
                         // = 11.6s of first-token latency with the GPU idle. The failure
-                        // model is unchanged: the old bounded_sync_write already degraded
-                        // silently on timeout, and a dropped page just stops the next
-                        // probe at that hole (shallower restore or honest recompute).
+                        // model is unchanged: a timed-out or dropped page just stops the
+                        // next probe at that hole (shallower restore or honest recompute).
                         // Owned submission swaps the buffer, so the seam scratch stays
                         // free immediately and no ticket lifetime outlives this block.
                         const auto seam_queue_write =

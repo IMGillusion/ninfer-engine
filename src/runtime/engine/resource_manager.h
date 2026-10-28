@@ -252,6 +252,11 @@ public:
     // Called at the scheduler boundary, outside the context transaction.
     // Catalogued remains available to ordinary admission throughout preparation.
     bool proactive_tick(Program& program, bool admission_waiting) noexcept {
+        // Settle cancelled proactive works first, on every boundary and
+        // regardless of whether a victim is being tracked: their write
+        // tickets drain in the background and must never pile up behind a
+        // maintenance lull.
+        program.pump_retired_proactive();
         // Direct call on purpose: the package Program facade must expose the
         // maintenance hooks. A feature-detection guard here was silently DISCARDING
         // the whole body (the hooks lived on the impl type only), which looked
@@ -266,10 +271,10 @@ public:
                 // Do NOT stop preparing just because queued requests are in the
                 // way: under sustained load the queue is never empty, and skipping
                 // them starved every preparation (0 releases) - exactly the
-                // situation this maintenance path exists to remove. A live context
-                // transaction still blocks (proactive_begin refuses it): the shared
-                // seed/KV scratch has a single user and the transaction may hold
-                // borrowed bytes with tickets in flight.
+                // situation this maintenance path exists to remove. Live context
+                // transactions do NOT block maintenance either: spills stage
+                // through dedicated buffers and the bridge's read isolation
+                // keeps checkpoint writes off the seed's critical path.
                 if (program.has_context_transaction()) { ++proactive_tx_skips_; }
                 const unsigned per_tick = 8;
                 if (proactive_victim_) {

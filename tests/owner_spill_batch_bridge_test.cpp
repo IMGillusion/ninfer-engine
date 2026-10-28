@@ -1,3 +1,4 @@
+#include "test_spill_sync.h"
 #include "core/owner_spill_batch.h"
 #include <cassert>
 #include <filesystem>
@@ -16,12 +17,12 @@ int main() {
         for(auto kind : {DiskKVKind::MainKV,DiskKVKind::BackendKV,DiskKVKind::StateImage}) {
             OwnerSpillBatch b; b.batch_kind=kind;
             for(unsigned i=0;i<32;++i)b.batch_ids.push_back({.lo=i+1,.frontier=(i+1)*256});
-            assert(bridge.spill_page_sync(b.batch_ids[0],kind,bytes[0]));
+            assert(test_spill_wait(bridge, b.batch_ids[0],kind,bytes[0], std::chrono::milliseconds(30000)));
             unsigned saved=0,dups=0,prepared=0;
             auto prepare=[&](const auto& missing,auto& out){
                 ++prepared; assert(missing.size()==31);
                 // Real bridge race: probe Missing -> another writer publishes -> Present ack.
-                assert(bridge.spill_page_sync(b.batch_ids[missing[0]],kind,bytes[missing[0]]));
+                assert(test_spill_wait(bridge, b.batch_ids[missing[0]],kind,bytes[missing[0]], std::chrono::milliseconds(30000)));
                 out.clear(); for(auto i:missing) out.emplace_back(bytes[i]); return true;
             };
             auto ack=[&](SpillStatus s){++saved;if(s==SpillStatus::Present)++dups;};

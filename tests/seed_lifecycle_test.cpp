@@ -1,3 +1,4 @@
+#include "test_spill_sync.h"
 #include "core/seed_lifecycle.h"
 #include <cassert>
 #include <filesystem>
@@ -26,8 +27,15 @@ int main() {
                              .capacity_bytes=1024*1024});
         std::vector<std::byte> bytes(128,std::byte{0x5a}), dst(128);
         const DiskKVIdentity id{.lo=55,.hi=77,.tag=1,.frontier=64};
-        assert(bridge.spill_page_sync(id,DiskKVKind::MainKV,bytes));
-        auto t=bridge.try_read(id,DiskKVKind::MainKV,dst); assert(t);
+        assert(test_spill_wait(bridge, id,DiskKVKind::MainKV,bytes, std::chrono::milliseconds(30000)));
+        // try_read is a single try_lock: the queue worker may briefly hold
+        // qmu_ right after the spill landed (the fixture goes through the
+        // queue now), so retry instead of asserting on one attempt.
+        ReadTicket t; const auto t_end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(!(t=bridge.try_read(id,DiskKVKind::MainKV,dst))){
+            assert(std::chrono::steady_clock::now()<t_end); std::this_thread::yield();
+        }
+        assert(t);
         SeedLifecycle cancelled_actual; cancelled_actual.begin_prepare(); cancelled_actual.prepared();
         cancelled_actual.cancel_and_drained(t);
         bridge.wait_idle();

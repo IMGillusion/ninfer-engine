@@ -1,6 +1,7 @@
 #include <bits/stdc++.h>
 #define private public
 #include "core/disk_kv_bridge.h"
+#include "test_spill_sync.h"
 #undef private
 using namespace ninfer;
 using Clock=std::chrono::steady_clock;
@@ -12,7 +13,7 @@ int main(){
  auto submit=[&](DiskKVIdentity key,DiskKVKind k,std::span<std::byte> out){ ReadTicket t; until([&]{t=b.try_read(key,k,out);return bool(t);});return t;};
  auto finish=[&](ReadTicket t,DiskReadResult expected){until([&]{return b.poll(t)!=DiskReadResult::Pending;});assert(b.poll(t)==expected);};
  for(auto kind:{DiskKVKind::MainKV,DiskKVKind::BackendKV,DiskKVKind::StateImage}){
-  assert(b.spill_page_sync(id,kind,src));finish(submit(id,kind,dst),DiskReadResult::Success);assert(src==dst);
+  assert(test_spill_wait(b, id,kind,src, std::chrono::milliseconds(30000)));finish(submit(id,kind,dst),DiskReadResult::Success);assert(src==dst);
   finish(submit({9,9,3,64},kind,dst),DiskReadResult::Missing);
   finish(submit(id,kind,std::span(dst).first(1)),DiskReadResult::BadSize);
  }
@@ -41,10 +42,12 @@ int main(){
  hdr->lo++;finish(submit(id,DiskKVKind::MainKV,dst),DiskReadResult::BadIdentity);hdr->lo--;
  hdr->crc^=1;finish(submit(id,DiskKVKind::MainKV,dst),DiskReadResult::BadCRC);hdr->crc^=1;
  assert(b.contains(id,DiskKVKind::MainKV));finish(submit(id,DiskKVKind::MainKV,dst),DiskReadResult::Success);
- // Queue saturation accepts exactly the shared bound, never overwrites scratch.
- b.wait_idle();std::vector<ReadTicket> tickets;std::vector<std::vector<std::byte>> buffers(512,std::vector<std::byte>(4096));
+ // Queue saturation accepts exactly the read budget, never overwrites scratch.
+ // Reads have their own admission bound (kReadBudget) that write backlog cannot
+ // eat into; the total queue cap stays separate.
+ b.wait_idle();std::vector<ReadTicket> tickets;std::vector<std::vector<std::byte>> buffers(b.kReadBudget,std::vector<std::byte>(4096));
  {std::lock_guard lock(s.mu_);for(auto& v:buffers)tickets.push_back(submit(id,DiskKVKind::MainKV,v));assert(!b.try_read(id,DiskKVKind::MainKV,dst));assert(b.stats().queue_drops==0);}
  for(auto t:tickets)finish(t,DiskReadResult::Success);
  for(auto& v:buffers)assert(v==src);
- std::cout<<"PASS read classifications, three families, blocked read/decode ticks="<<decode<<", simulated deadline/cancel retention, saturation=512\n";
+ std::cout<<"PASS read classifications, three families, blocked read/decode ticks="<<decode<<", simulated deadline/cancel retention, read-budget saturation="<<b.kReadBudget<<"\n";
 }

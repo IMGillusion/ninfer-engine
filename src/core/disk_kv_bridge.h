@@ -36,10 +36,12 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
+#include <tuple>
 #include <thread>
 #include <vector>
 
@@ -163,13 +165,21 @@ public:
     bool spill_page_wait(const DiskKVIdentity& id, DiskKVKind kind,
                          std::span<const std::byte> bytes, std::chrono::milliseconds timeout);
 
-    /** Synchronous spill: write the bytes to the store on the calling thread
-     *  (no async queue copy). For large blobs (state images ~146 MiB) where
-     *  buffering a copy in the bounded queue would exhaust memory. The caller
-     *  must ensure `bytes` outlives this call (it is read directly). Returns
-     *  true if restorable after the call (fresh write or dedupe hit). */
-    bool spill_page_sync(const DiskKVIdentity& id, DiskKVKind kind,
-                         std::span<const std::byte> bytes);
+    /** Fire-and-forget large spill (state images ~146 MiB): copies `bytes`
+     *  into a ring-owned buffer on the calling thread, then hands the write
+     *  to a transient thread and returns immediately. The persisted page
+     *  becomes restorable atomically when the write lands; until then
+     *  probe/contains simply miss and restores degrade to an older frontier
+     *  plus delta recompute. `wait_for_slot`: the load-bearing owner-death
+     *  states fall back to the bounded synchronous write when every ring
+     *  slot is busy - a silently skipped endpoint state orphans the whole
+     *  persisted chain (observed: agent hit rate 82% -> 51% with a 4-slot
+     *  ring under six concurrent chains). Best-effort anchors pass false.
+     *  False (skip) only when !wait_for_slot, the family is disabled, the
+     *  volume breaker is tripped, or this identity is already restorable.
+     *  `bytes` only needs to live until this call returns. */
+    bool spill_page_async(const DiskKVIdentity& id, DiskKVKind kind,
+                          std::span<const std::byte> bytes, bool wait_for_slot);
 
     // Null ticket = busy; retry without releasing the owner. No store lock.
     // Borrowed bytes MUST remain immutable/alive until poll != Pending,
@@ -250,8 +260,13 @@ public:
      *  more than a single request. */
     bool drop_page(const DiskKVIdentity& id, DiskKVKind kind);
 
-    /** True if this identity's page is restorable on disk right now. Cheap
-     *  (header check). */
+    /** True if this identity's page is restorable on disk right now - or is
+     *  a SUBMITTED write still in flight (promise). The admission probe walks
+     *  chains through this, so a chain whose checkpoint was handed off
+     *  moments ago is selectable; the seed's read of a promised page waits
+     *  for the write to land instead of mis-failing the whole restore
+     *  (observed: back-to-back chain rounds always probed before their own
+     *  checkpoint landed - every round recomputed from zero). */
     [[nodiscard]] bool contains(const DiskKVIdentity& id, DiskKVKind kind) const;
 
     /** Read-only benefit probe: longest contiguous prefix (from page 0) of
@@ -297,11 +312,63 @@ private:
      *  attempt-owned memory on a transient thread; on timeout the attempt is
      *  abandoned (IOFailure) so the caller never blocks on a wedged volume. */
     DiskReadResult bounded_large_read(SpillJob& job);
-    /** Deadline-bounded synchronous write used by engine-thread spill paths
-     *  (seam anchors, owner-spill state): the payload is copied first, so an
-     *  abandoned attempt never touches engine memory. False on timeout. */
+    /** Bounded synchronous write used as spill_page_async's saturation
+     *  fallback: the payload is copied first, so an abandoned attempt never
+     *  touches engine memory. False on timeout. */
     bool bounded_sync_write(const DiskKVIdentity& id, DiskKVKind kind,
                             std::span<const std::byte> bytes);
+    /** Ring slot for spill_page_async: one large payload buffer per in-flight
+     *  fire-and-forget write. Copy happens on the calling thread, so the
+     *  source scratch can be released (or recycled by the next request) the
+     *  moment this call returns. */
+    struct AsyncWriteSlot {
+        std::unique_ptr<std::byte[]> bytes;
+        std::size_t capacity = 0;
+        bool busy = false;
+    };
+    static constexpr std::size_t kAsyncWriteSlots = 12;
+    std::mutex async_mu_;
+    std::array<AsyncWriteSlot, kAsyncWriteSlots> async_slots_{};
+    // Live fire-and-forget writers; the destructor gives them a bounded
+    // window (write deadline) before the stores are torn down.
+    std::atomic<std::size_t> async_live_{0};
+    // Submitted-but-not-landed write identities (the promise set). Counted:
+    // the same identity can be submitted twice (turn-end checkpoint plus a
+    // dying-owner re-spill). contains() reports promised identities as
+    // present so a probe never rejects a chain whose head write is in
+    // flight; the seed's read of a promised page waits for it to land.
+    // Lock ordering: qmu_ -> promised_mu_ (never the reverse).
+    struct IdentityKey {
+        std::uint64_t lo;
+        std::uint64_t hi;
+        std::uint32_t tag;
+        std::uint32_t frontier;
+        bool operator<(const IdentityKey& o) const {
+            return std::tuple(lo, hi, tag, frontier) <
+                   std::tuple(o.lo, o.hi, o.tag, o.frontier);
+        }
+    };
+    static IdentityKey identity_key(const DiskKVIdentity& id) noexcept {
+        return {id.lo, id.hi, id.tag, id.frontier};
+    }
+    mutable std::mutex promised_mu_;
+    std::map<IdentityKey, int> promised_;
+    void promise_add(const DiskKVIdentity& id) {
+        std::lock_guard<std::mutex> lock(promised_mu_);
+        promised_[identity_key(id)] += 1;
+    }
+    void promise_done(const DiskKVIdentity& id) noexcept {
+        std::lock_guard<std::mutex> lock(promised_mu_);
+        const auto it = promised_.find(identity_key(id));
+        if (it != promised_.end() && --(it->second) <= 0) { promised_.erase(it); }
+    }
+    [[nodiscard]] bool promised(const DiskKVIdentity& id) const {
+        std::lock_guard<std::mutex> lock(promised_mu_);
+        return promised_.count(identity_key(id)) != 0;
+    }
+    /** Read-side wait for a promised write to land (bounded by the write
+     *  deadline). Only reads racing their own chain's checkpoint pay it. */
+    void wait_promise_clear(const DiskKVIdentity& id) const;
 
     Family& family(DiskKVKind kind);
     const Family& family(DiskKVKind kind) const;
@@ -337,6 +404,19 @@ private:
     [[nodiscard]] std::size_t queued_jobs() const noexcept {
         return queue_.size() + priority_queue_.size() + seed_queue_.size();
     }
+    // Read-side outstanding (queued + executing read jobs); only meaningful
+    // under qmu_. Read admission is judged against kReadBudget ALONE, never
+    // against the total: a QLC GC stall parking every write worker must not
+    // push the shared total to the cap and refuse the seed's page reads -
+    // that refusal stalls the single materialization transaction, and the
+    // stall gates admission for every queued request.
+    std::size_t queued_reads_ = 0;
+    [[nodiscard]] std::size_t read_outstanding() const noexcept {
+        return queued_reads_ + in_flight_reads_;
+    }
+    // Seed-restore read budget: two 128-page seed chunks plus headroom for
+    // state-image reads and probe read-backs. Writes cannot eat into it.
+    static constexpr std::size_t kReadBudget = 320;
     std::vector<std::thread> workers_;
     bool quit_ = false;
     std::size_t in_flight_ = 0;  // jobs pulled from the queue, not yet applied

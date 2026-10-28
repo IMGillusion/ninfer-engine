@@ -3,6 +3,7 @@
 // Readers hammer existing pages while a writer keeps inserting new ones to force
 // continuous LRU eviction.
 #include "core/disk_kv_bridge.h"
+#include "test_spill_sync.h"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -25,7 +26,7 @@ int main() {
     for (std::uint32_t i = 0; i < 4; ++i) {
         const DiskKVIdentity id{7, 7, i, 64};
         std::fill(payload.begin(), payload.end(), std::byte{static_cast<unsigned char>(i + 1)});
-        if (!bridge.spill_page_sync(id, DiskKVKind::MainKV, payload)) { std::fprintf(stderr, "seed spill failed\n"); return 2; }
+        if (!test_spill_wait(bridge, id, DiskKVKind::MainKV, payload, std::chrono::milliseconds(30000))) { std::fprintf(stderr, "seed spill failed\n"); return 2; }
         stable.push_back(id);
     }
     bridge.wait_idle();
@@ -60,7 +61,7 @@ int main() {
     for (std::uint32_t i = 0; i < 4000 && errors.load() == 0; ++i) {
         const DiskKVIdentity id{9, 9, i, 64};
         payload[0] = std::byte{static_cast<unsigned char>(i)};
-        bridge.spill_page_sync(id, DiskKVKind::MainKV, payload);
+        test_spill_wait(bridge, id, DiskKVKind::MainKV, payload, std::chrono::milliseconds(30000));
     }
     stop = true;
     for (auto& r : readers) { r.join(); }
