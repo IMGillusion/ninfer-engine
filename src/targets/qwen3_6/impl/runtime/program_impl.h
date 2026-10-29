@@ -3491,6 +3491,17 @@ bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillPr
                 auto scratch_view = host_state_images->writable_view(*l3_state_spill_scratch);
                     if (!state_images->spill_copy_to_host(state_store->physical_slot(handle),
                             scratch_view, device.transfer_stream)) { p.failed = true; return false; }
+                    // The submitted write reads the borrowed bytes at dequeue,
+                    // which can outrun this async D2H. Land it first.
+                    {
+                        const auto status = cudaStreamSynchronize(device.transfer_stream);
+                        if (status != cudaSuccess) {
+                            disk_kv_logf('W', "l3-spill-cuda",
+                                         "spill state D2H sync failed: %s", cudaGetErrorString(status));
+                            p.failed = true;
+                            return false;
+                        }
+                    }
                     p.bytes = {scratch_view.data, stride}; ++p.d2h;
                     p.ready = true;
                 }
@@ -3514,6 +3525,17 @@ bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillPr
                     const auto physical = pages->physical(logical);
                     if (!pages->physical_pool().spill_copy_to_host({&physical, 1}, view,
                             device.transfer_stream)) { p.failed = true; return false; }
+                    // Same async-D2H rule: the write borrows these bytes at
+                    // dequeue; land the copy before unpinning the source.
+                    {
+                        const auto status = cudaStreamSynchronize(device.transfer_stream);
+                        if (status != cudaSuccess) {
+                            disk_kv_logf('W', "l3-spill-cuda",
+                                         "seam tail D2H sync failed: %s", cudaGetErrorString(status));
+                            p.failed = true;
+                            return false;
+                        }
+                    }
                     pages->unpin_source(*p.pinned_page);
                     p.pinned_page.reset();
                     p.bytes = {view.data(), stride}; ++p.d2h;
@@ -3600,6 +3622,13 @@ void ProgramImplCore::spill_dying_owner_pages(SequenceState& sequence) {
                                 device.transfer_stream)) {
                                 throw std::runtime_error("best-effort owner spill copy failed");
                             }
+                            // The D2H is async: land it BEFORE reading the
+                            // staging bytes and BEFORE abort() recycles the
+                            // reservation out from under the copy.
+                            const auto status = cudaStreamSynchronize(device.transfer_stream);
+                            if (status != cudaSuccess) {
+                                throw std::runtime_error("owner spill D2H sync failed");
+                            }
                             ++device_copies;
                             std::memcpy(scratch.data(),
                                         host_kv_extents->writable_view(*reservation).data(), stride);
@@ -3664,14 +3693,25 @@ void ProgramImplCore::spill_dying_owner_pages(SequenceState& sequence) {
         auto readable_state = [&](StateImageHandle state)
             -> std::optional<qwen3_6::HostStateImageConstView> {
             if (auto host = state_store->host_view(state)) { return host; }
-            // The fire-and-forget writer consumes the view before this call
-            // returns (the copy happens inside spill_page_async). Hold the
-            // dedicated spill lease through the D2H only; busy means
-            // best-effort skip, never a wait.
-            return runtime_support::spill_state_to_scratch(*state_images,
+            // spill_state_to_scratch only ENQUEUES the D2H on the transfer
+            // stream. Sync before returning: the caller's fire-and-forget
+            // ring memcpy (and the sequence release that recycles this
+            // device slot) must never race a copy still in flight - a torn
+            // state image restores garbage into the GDN kernels.
+            const auto copied = runtime_support::spill_state_to_scratch(*state_images,
                 state_store->physical_slot(state), host_state_images.get(),
                 l3_state_spill_scratch, l3_state_spill_lease, spill_state_lease,
                 device.transfer_stream);
+            if (copied) {
+                const auto status = cudaStreamSynchronize(device.transfer_stream);
+                if (status != cudaSuccess) {
+                    disk_kv_logf('W', "l3-spill-cuda",
+                                 "dying state D2H sync failed: %s | skip this state",
+                                 cudaGetErrorString(status));
+                    return std::nullopt;
+                }
+            }
+            return copied;
         };
         // State image (L3): the 48-layer GDN/hidden recurrent state at the endpoint
         // frontier. Not derivable from KV, so it must spill (and later restore)
@@ -3757,6 +3797,12 @@ void ProgramImplCore::spill_dying_owner_pages(SequenceState& sequence) {
                                     device.transfer_stream)) {
                                     throw std::runtime_error("best-effort owner spill copy failed");
                                 }
+                                // Async D2H: land it before reading the staging
+                                // bytes and before abort() recycles the reservation.
+                                const auto copied = cudaStreamSynchronize(device.transfer_stream);
+                                if (copied != cudaSuccess) {
+                                    throw std::runtime_error("seam tail D2H sync failed");
+                                }
                                 std::vector<std::byte> scratch(text_host_kv_page_stride);
                                 std::memcpy(scratch.data(),
                                             host_kv_extents->writable_view(*reservation).data(),
@@ -3817,6 +3863,12 @@ void ProgramImplCore::spill_dying_owner_pages(SequenceState& sequence) {
                                             host_kv_extents->writable_view(*reservation),
                                             device.transfer_stream)) {
                                             throw std::runtime_error("best-effort owner spill copy failed");
+                                        }
+                                        // Async D2H: land before reading/aborting.
+                                        const auto copied =
+                                            cudaStreamSynchronize(device.transfer_stream);
+                                        if (copied != cudaSuccess) {
+                                            throw std::runtime_error("seam tail D2H sync failed");
                                         }
                                         std::vector<std::byte> scratch(backend_host_kv_page_stride);
                                         std::memcpy(scratch.data(),
@@ -3950,17 +4002,24 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
         return true;
     };
     if (progress.failing) { return fail(); }
-    // Volume circuit breaker + submission-livelock deadline: with nothing in flight
-    // (no state read, no open batch) past the queue deadline — or with the breaker
-    // tripped by an earlier expiry — the volume is wedged and further submission
-    // attempts would just spin. Degrade to an honest full recompute immediately
-    // instead. (observed: phase-0 resubmit livelock for 210s on a wedged volume.)
+    // Volume circuit breaker + submission-livelock deadline: with nothing in
+    // flight (no state read, no open batch) AND no progress for a whole queue
+    // deadline, submissions are livelocked (every worker wedged or the breaker
+    // tripped) - degrade to an honest full recompute instead of spinning.
+    // Stagnation is measured from the last active visit, NOT from seed start:
+    // a restore reading its own chain's in-flight checkpoint advances slowly
+    // (its reads wait for the promised writes) and must not be killed at a
+    // between-batch instant - that misfire tripped the breaker and 503-stormed
+    // every queued request.
     {
         const auto now = std::chrono::steady_clock::now();
         const bool nothing_in_flight = !progress.read && progress.batch.empty() &&
                                        progress.batch_pages == 0;
+        const auto last_active = progress.last_active.time_since_epoch().count() == 0
+                                     ? progress.started
+                                     : progress.last_active;
         if (progress.phase < 3 && nothing_in_flight &&
-            (now - progress.started > l3_queue_deadline() ||
+            (now - last_active > l3_queue_deadline() ||
              (disk_kv != nullptr && disk_kv->volume_breaker_tripped()))) {
             if (disk_kv != nullptr && disk_kv->volume_breaker_tripped()) {
                 progress.reason = "volume-breaker";
@@ -3972,6 +4031,7 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
             }
             return fail();
         }
+        if (!nothing_in_flight) { progress.last_active = now; }
     }
     try {
     NINFER_SEED_STAGE("progress");

@@ -1192,6 +1192,14 @@ private:
             // hit actually beat recomputing the same prompt.
             std::chrono::steady_clock::time_point started{};
             std::chrono::steady_clock::time_point last_beat{};
+            // Last visit with a read/batch in flight, a submission, or page
+            // progress. The submission-livelock guard measures STAGNATION from
+            // this, not total elapsed: a restore reading its own chain's
+            // in-flight checkpoint legitimately stretches past the queue
+            // deadline while advancing (killing a healthy seed at a
+            // between-batch instant tripped the volume breaker and 503-stormed
+            // every queued request).
+            std::chrono::steady_clock::time_point last_active{};
             std::uint64_t batches = 0;
             std::uint32_t max_batch = 0;
             std::uint32_t pages_read = 0;

@@ -852,10 +852,13 @@ bool DiskKVBridge::restore_page(const DiskKVIdentity& id, DiskKVKind kind,
 void DiskKVBridge::wait_promise_clear(const DiskKVIdentity& id) const {
     // A read racing its own chain's checkpoint: the probe selected this page
     // because the write is PROMISED (submitted, not landed). Wait for the
-    // write to finish instead of failing the whole restore. Bounded by the
-    // write deadline; a wedged volume abandons the write, the promise
-    // clears, and the read honestly misses.
-    const auto deadline = std::chrono::steady_clock::now() + write_deadline();
+    // write to finish instead of failing the whole restore. Bounded WELL
+    // below the read ticket's queue deadline (30s): a promise wait that
+    // outlives the ticket gets the read declared dead mid-wait. A write that
+    // has not landed within 10s is in a QLC GC stall anyway - the read then
+    // honestly misses and that round degrades to a delta recompute.
+    const auto wait = std::min(write_deadline(), std::chrono::milliseconds(10000));
+    const auto deadline = std::chrono::steady_clock::now() + wait;
     while (promised(id)) {
         if (std::chrono::steady_clock::now() >= deadline) { return; }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));

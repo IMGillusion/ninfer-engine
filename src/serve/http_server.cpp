@@ -329,7 +329,12 @@ void HttpServer::run_stats_reporter() {
     const std::uint64_t materializing_stall_ms =
         env_ms("NINFER_L3_STALL_EXIT_MS", 300000);
     const std::uint64_t running_stall_ms =
-        env_ms("NINFER_RUN_STALL_EXIT_MS", 900000);
+        env_ms("NINFER_RUN_STALL_EXIT_MS", 180000);
+        // 180s: a boundary wedge used to sit 15 minutes before the sentinel
+        // fired. Every healthy phase (decode rounds, prefill chunks, seed
+        // batches) shows token progress well inside a minute, so three
+        // minutes of zero progress means the boundary is blocked - recover
+        // fast and let the L3 tier re-warm instead of hanging the fleet.
     Clock::time_point materializing_since{};
     Clock::time_point running_idle_since{};
     std::uint64_t previous_progress_tokens =
