@@ -4232,18 +4232,17 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
         // Budget-limited self-drain. A batch's store reads take ~66ms plus ~21ms
         // of H2D while a loaded scheduling step is ~170ms, so one-batch-per-visit
         // left the disk idle for most of every step and stretched a 27-batch
-        // restore to ~4.6s regardless of I/O speed. When no decode lane is
-        // runnable (the adaptive gate: decode_ready == 0, passed down from the
-        // engine boundary), this visit keeps submitting and draining batches
-        // until the NINFER_SEED_SPIN_MS budget is spent, so the wall time lands
-        // on the I/O floor and the admission gate reopens sooner. With decode
-        // runnable the budget is zero and the pacing is exactly the historical
-        // one-batch-per-visit. Batches still respect the queue-full break and
-        // the short-batch top-up bound; the queue deadline is enforced inside
-        // every poll_seed_batch, so a wedged volume cannot outlive it.
-        const auto spin_budget = decode_ready == 0
-                                     ? std::chrono::milliseconds(l3_seed_spin_ms())
-                                     : std::chrono::milliseconds{0};
+        // restore to ~4.6s regardless of I/O speed. The visit keeps submitting
+        // and draining batches until the NINFER_SEED_SPIN_MS budget is spent,
+        // ALWAYS - the old decode_ready==0 adaptive gate stretched restores
+        // back to 8-30s under load (one batch per loaded step), and a restore
+        // is exactly when the disk tier must run at full bandwidth: the
+        // boundary costs at most one spin budget of decode-round delay per
+        // visit, while every queued request's admission waits on this restore.
+        // Batches still respect the queue-full break and the short-batch
+        // top-up bound; the queue deadline is enforced inside every
+        // poll_seed_batch, so a wedged volume cannot outlive it.
+        const auto spin_budget = std::chrono::milliseconds(l3_seed_spin_ms());
         const auto visit_started = std::chrono::steady_clock::now();
         const auto budget_left = [&]() {
             // spin_budget == 0 (decode runnable) = the historical one-batch-per-visit

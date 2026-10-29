@@ -425,10 +425,10 @@ private:
     // pages concurrently; the SSD needs several in-flight streams to reach its
     // bandwidth (single-writer was ~180 MB/s of a ~2 GB/s device through the
     // bind-mount layer). Bookkeeping stays serialized by the store lock.
-    // Three workers could not keep the NVMe busy even when every reader held the
-    // store lock only briefly: four concurrent streams already reach ~880MB/s on
-    // this volume against 421MB/s single-stream. Reads and writes share these.
-    static constexpr std::size_t kWorkerCount = 8;
+    // Twelve workers: 8 read (the Ti600's measured read optimum is QD8 -
+    // 2156 MB/s; QD5 read workers left a third of the bandwidth on the
+    // table) + 4 write for the phase-gated checkpoint stream.
+    static constexpr std::size_t kWorkerCount = 12;
     // Read/write phase gate: while seed reads occupy the device, write
     // workers (and the direct writers) hold so the QLC device runs reads
     // and writes in phases. Measured on the Ti600: pure reads 2156 MB/s;
@@ -447,7 +447,7 @@ private:
     static std::size_t read_worker_count() noexcept {
         static const std::size_t value = [] {
             const char* s = std::getenv("NINFER_L3_READ_WORKERS");
-            std::size_t v = s != nullptr ? std::strtoul(s, nullptr, 10) : 5;
+            std::size_t v = s != nullptr ? std::strtoul(s, nullptr, 10) : 8;
             return v < kWorkerCount ? v : kWorkerCount - 1;
         }();
         return value;
