@@ -368,7 +368,7 @@ private:
     }
     /** Read-side wait for a promised write to land (bounded by the write
      *  deadline). Only reads racing their own chain's checkpoint pay it. */
-    void wait_promise_clear(const DiskKVIdentity& id) const;
+    void wait_promise_clear(const DiskKVIdentity& id);
 
     Family& family(DiskKVKind kind);
     const Family& family(DiskKVKind kind) const;
@@ -429,6 +429,15 @@ private:
     // store lock only briefly: four concurrent streams already reach ~880MB/s on
     // this volume against 421MB/s single-stream. Reads and writes share these.
     static constexpr std::size_t kWorkerCount = 8;
+    // Read/write phase gate: while seed reads occupy the device, write
+    // workers (and the direct writers) hold so the QLC device runs reads
+    // and writes in phases. Measured on the Ti600: pure reads 2156 MB/s;
+    // with a state-image write in flight the same reads collapse to
+    // 75-150 MB/s and the write itself to ~3 MB/s. Promise-waiting reads
+    // are excluded from the occupancy, so the write that clears their
+    // promise is never gated behind them (no deadlock, no timeout needed).
+    /** Hold the caller while non-promise seed reads are in flight. */
+    void wait_read_phase_clear();
     // Read/write worker partition: request-path reads (seed page + state
     // reads) execute on dedicated read workers and can never be stuck
     // behind an in-flight checkpoint/spill write that a QLC GC stall is
@@ -444,6 +453,12 @@ private:
         return value;
     }
     std::size_t in_flight_reads_ = 0;  // read jobs popped, not yet applied
+    // Reads currently inside wait_promise_clear: they hold a worker but are
+    // WAITING for a write, so they do not occupy the device. The write-side
+    // phase gate subtracts them from in_flight_reads_, which both removes
+    // the gate's timeout (true read/write phasing) and breaks the
+    // promise/gate deadlock without the 8s escape hatch.
+    std::size_t promise_wait_reads_ = 0;
     // Bounded large IO. The mounted volume has wedged single large preads and
     // pwrites indefinitely (twice in production, freezing the engine's single
     // context transaction past recovery). Large reads (state images) run on a

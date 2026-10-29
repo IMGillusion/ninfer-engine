@@ -186,10 +186,22 @@ void DiskKVBridge::wait_idle() {
         // them let a checkpoint backlog stall the failure/teardown path
         // behind minutes of background writes (the isolation this pool
         // split exists for).
-        qcv_.wait(lock, [this] {
+        auto wait_started = std::chrono::steady_clock::now();
+        auto last_warn = wait_started;
+        qcv_.wait(lock, [&] {
             // queued_reads_ covers every queued read job (any lane), so no
             // scan of the write lanes is needed.
-            return queued_reads_ == 0 && in_flight_reads_ == 0;
+            const bool settled = queued_reads_ == 0 && in_flight_reads_ == 0;
+            if (!settled && std::chrono::steady_clock::now() - last_warn >
+                                std::chrono::seconds(5)) {
+                last_warn = std::chrono::steady_clock::now();
+                disk_kv_logf('W', "l3-bridge",
+                             "wait_idle stuck | queued_reads=%zu in_flight_reads=%zu "
+                             "in_flight=%zu promise_wait=%zu queued=%zu/%zu seed_q=%zu",
+                             queued_reads_, in_flight_reads_, in_flight_, promise_wait_reads_,
+                             queue_.size(), priority_queue_.size(), seed_queue_.size());
+            }
+            return settled;
         });
     }
     // Worker keeps in_flight nonzero through its idle flush.
@@ -225,9 +237,23 @@ void DiskKVBridge::worker_loop(bool read_worker) {
             } else {
                 // Write workers drain maintenance/checkpoint writes. They stop
                 // consuming once quit_ is set; seed reads belong to the read
-                // pool even during shutdown.
+                // pool even during shutdown. While seed reads occupy the
+                // device the write dequeue HOLDS (no timeout) - the DRAM-less
+                // QLC interleaves reads and writes on the same dies:
+                // measured pure reads 2156 MB/s vs 75-150 MB/s with
+                // checkpoint writes in flight (a 146 MiB state image
+                // stretched to 49s). Phasing restores the device's read
+                // bandwidth. Promise-waiting reads are EXCLUDED from the
+                // occupancy count: they wait for a write, so gating on them
+                // would deadlock - with them excluded, the write that clears
+                // their promise is never gated behind them.
                 qcv_.wait(lock, [this] {
-                    return quit_ || !queue_.empty() || !priority_queue_.empty();
+                    if (quit_) { return true; }
+                    if (!seed_queue_.empty()) { return true; }
+                    if (!queue_.empty() || !priority_queue_.empty()) {
+                        return in_flight_reads_ <= promise_wait_reads_;
+                    }
+                    return false;
                 });
                 if (quit_ && queue_.empty() && priority_queue_.empty()) { return; }
                 if (queue_.empty() && priority_queue_.empty()) { continue; }
@@ -469,6 +495,10 @@ void DiskKVBridge::spill_queued(SpillJob& job) {
         return;
     }
     const auto bytes = job.borrowed.empty() ? std::span<const std::byte>(job.bytes) : job.borrowed;
+    // Phase gate: a page write landing mid-restore collapses the seed's read
+    // bandwidth ~15x on this DRAM-less QLC (pure reads 2156 MB/s vs 75-150
+    // MB/s interleaved). Hold briefly while reads are in flight.
+    wait_read_phase_clear();
     if (f.store == nullptr || bytes.size() != f.stride) {
         if (f.store != nullptr) {
             disk_kv_logf('E', "l3-bridge",
@@ -712,6 +742,7 @@ bool DiskKVBridge::bounded_sync_write(const DiskKVIdentity& id, DiskKVKind kind,
     promise_add(id);
     async_live_.fetch_add(1, std::memory_order_relaxed);
     std::thread worker([this, attempt, id, store] {
+        wait_read_phase_clear();   // phase the 146 MiB write off the seed's reads
         attempt->ok = store->upsert_page(id, attempt->bytes, &attempt->evicted);
         attempt->done.store(true, std::memory_order_release);
         if (attempt->abandoned.exchange(true)) { abandoned_ios_.fetch_sub(1); }
@@ -799,6 +830,7 @@ bool DiskKVBridge::spill_page_async(const DiskKVIdentity& id, DiskKVKind kind,
     const auto payload = std::span<const std::byte>(slot->bytes.get(), bytes.size());
     async_live_.fetch_add(1, std::memory_order_relaxed);
     std::thread writer([this, slot, id, kind, store, payload] {
+        wait_read_phase_clear();   // phase the 146 MiB write off the seed's reads
         std::vector<std::uint32_t> evicted;
         const bool ok = store->upsert_page(id, payload, &evicted);
         if (!ok) {
@@ -849,20 +881,46 @@ bool DiskKVBridge::restore_page(const DiskKVIdentity& id, DiskKVKind kind,
     return true;
 }
 
-void DiskKVBridge::wait_promise_clear(const DiskKVIdentity& id) const {
+void DiskKVBridge::wait_read_phase_clear() {
+    // Phase gate for direct writers (ring/async state images): while seed
+    // reads occupy the device, hold the write so the drive phases reads and
+    // writes instead of interleaving them. Promise-waiting reads are
+    // excluded (they wait for a write); the write-side worker gate runs
+    // ahead of them, so this loop cannot starve.
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(qmu_);
+            if (in_flight_reads_ <= promise_wait_reads_) { return; }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+    }
+}
+
+void DiskKVBridge::wait_promise_clear(const DiskKVIdentity& id) {
     // A read racing its own chain's checkpoint: the probe selected this page
     // because the write is PROMISED (submitted, not landed). Wait for the
     // write to finish instead of failing the whole restore. Bounded WELL
     // below the read ticket's queue deadline (30s): a promise wait that
     // outlives the ticket gets the read declared dead mid-wait. A write that
     // has not landed within 10s is in a QLC GC stall anyway - the read then
-    // honestly misses and that round degrades to a delta recompute.
+    // honestly misses and that round degrades to a delta recompute. While
+    // waiting, the read is excluded from the write-side phase gate's
+    // occupancy (it waits FOR a write; gating on it would deadlock).
     const auto wait = std::min(write_deadline(), std::chrono::milliseconds(10000));
     const auto deadline = std::chrono::steady_clock::now() + wait;
+    {
+        std::lock_guard<std::mutex> lock(qmu_);
+        promise_wait_reads_ += 1;
+    }
     while (promised(id)) {
-        if (std::chrono::steady_clock::now() >= deadline) { return; }
+        if (std::chrono::steady_clock::now() >= deadline) { break; }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
+    {
+        std::lock_guard<std::mutex> lock(qmu_);
+        promise_wait_reads_ -= (promise_wait_reads_ > 0 ? 1U : 0U);
+    }
+    qcv_.notify_all();
 }
 
 bool DiskKVBridge::contains(const DiskKVIdentity& id, DiskKVKind kind) const {
