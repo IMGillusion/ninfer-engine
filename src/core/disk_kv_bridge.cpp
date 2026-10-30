@@ -881,6 +881,13 @@ bool DiskKVBridge::restore_page(const DiskKVIdentity& id, DiskKVKind kind,
     return true;
 }
 
+DiskKVBridge::LiveState DiskKVBridge::live_state() {
+    std::lock_guard<std::mutex> lock(qmu_);
+    return {seed_queue_.size(), priority_queue_.size(), queue_.size(),
+            in_flight_, in_flight_reads_, promise_wait_reads_,
+            volume_breaker_tripped()};
+}
+
 void DiskKVBridge::wait_read_phase_clear() {
     // Phase gate for direct writers (ring/async state images): while seed
     // reads occupy the device, hold the write so the drive phases reads and

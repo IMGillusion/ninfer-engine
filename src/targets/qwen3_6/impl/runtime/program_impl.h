@@ -3946,12 +3946,21 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
             (progress.last_beat.time_since_epoch().count() == 0 ||
              now - progress.last_beat > std::chrono::seconds(30))) {
             progress.last_beat = now;
+            const auto live = disk_kv ? disk_kv->live_state() : DiskKVBridge::LiveState{};
             disk_kv_logf('W', "l3-seed-yield",
-                         "slow | lane=%u phase=%u page=%u elapsed_ms=%lld batch=%zu",
+                         "slow | lane=%u phase=%u page=%u elapsed_ms=%lld batch=%zu "
+                         "batch_open=%d read=%d topup=%u | bridge seed_q=%zu prio=%zu q=%zu "
+                         "ifl=%zu ifr=%zu pw=%zu breaker=%d",
                          sequence.lane, progress.phase, progress.page,
                          static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
                              elapsed).count()),
-                         progress.batch.size());
+                         progress.batch.size(),
+                         static_cast<int>(progress.batch_open),
+                         static_cast<int>(progress.read != nullptr),
+                         progress.topup_visits,
+                         live.seed_q, live.prio_q, live.q,
+                         live.in_flight, live.in_flight_reads, live.promise_wait_reads,
+                         static_cast<int>(live.breaker_tripped));
         }
     }
     poll_seed_batch(progress, std::chrono::steady_clock::now());
@@ -4262,6 +4271,7 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
                 fill_batch();
                 if (!close_batch()) {
                     ++progress.topup_visits;
+                    if (progress.batch_pages == 0) { return false; }   // submissions refused: yield the visit, do NOT burn the budget spin-waiting (observed: a 156s single-core spin when the bridge refused every read)
                     if (!budget_left()) { return false; }
                     continue;   // queue headroom returned mid-visit: top up in place
                 }
@@ -4271,6 +4281,7 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
             auto result = progress.read ? progress.read->result.load(std::memory_order_acquire)
                                         : DiskReadResult::Success;
             if (result == DiskReadResult::Pending) {
+                if (progress.batch.empty() && !progress.read) { return false; }   // zombie: nothing anywhere
                 if (!budget_left()) { return false; }   // batch stays open; state recoverable
                 std::this_thread::yield();
                 continue;

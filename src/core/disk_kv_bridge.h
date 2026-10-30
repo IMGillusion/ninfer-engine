@@ -293,6 +293,18 @@ public:
      *  is disabled. */
     [[nodiscard]] std::vector<std::uint32_t> live_state_frontiers() const;
 
+    /** Live queue/worker depths for stall forensics (qmu_-consistent). */
+    struct LiveState {
+        std::size_t seed_q;
+        std::size_t prio_q;
+        std::size_t q;
+        std::size_t in_flight;
+        std::size_t in_flight_reads;
+        std::size_t promise_wait_reads;
+        bool breaker_tripped;
+    };
+    [[nodiscard]] LiveState live_state();
+
     [[nodiscard]] DiskKVBridgeStats stats() const;
     [[nodiscard]] std::size_t used_bytes(DiskKVKind kind) const;
     [[nodiscard]] std::uint32_t slot_count(DiskKVKind kind) const;
