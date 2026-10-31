@@ -906,14 +906,14 @@ void DiskKVBridge::wait_read_phase_clear() {
 void DiskKVBridge::wait_promise_clear(const DiskKVIdentity& id) {
     // A read racing its own chain's checkpoint: the probe selected this page
     // because the write is PROMISED (submitted, not landed). Wait for the
-    // write to finish instead of failing the whole restore. Bounded WELL
-    // below the read ticket's queue deadline (30s): a promise wait that
-    // outlives the ticket gets the read declared dead mid-wait. A write that
-    // has not landed within 10s is in a QLC GC stall anyway - the read then
-    // honestly misses and that round degrades to a delta recompute. While
-    // waiting, the read is excluded from the write-side phase gate's
+    // write to finish instead of failing the whole restore. 35s = the write
+    // deadline (30s) plus margin: a 146 MiB state image legitimately takes
+    // that long on this QLC volume, and a promise wait that gives up early
+    // turns a 1-3s restore into a 40-50s full GPU recompute. The read has
+    // already been dequeued here, so the queue deadline no longer applies.
+    // While waiting, the read is excluded from the write-side phase gate's
     // occupancy (it waits FOR a write; gating on it would deadlock).
-    const auto wait = std::min(write_deadline(), std::chrono::milliseconds(10000));
+    const auto wait = write_deadline() + std::chrono::milliseconds(5000);
     const auto deadline = std::chrono::steady_clock::now() + wait;
     {
         std::lock_guard<std::mutex> lock(qmu_);

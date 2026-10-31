@@ -4077,44 +4077,19 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
     };
     // Each invocation submits or polls ONE CPU read. No store locks on the
     // scheduler. Scratch ownership is the single context transaction's lifetime.
-    if (progress.phase == 0) {
-        if (!progress.state_scratch_lease) {
-            auto& state_lease = transaction.slot != 0 ? l3_state_scratch_lease_b
-                                              : l3_state_scratch_lease;
-            progress.state_scratch_lease = state_lease.try_acquire();
-            if (!progress.state_scratch_lease) { return false; }
-        }
-        if (!progress.read) {
-            read(identity(E), DiskKVKind::StateImage,
-                {host_state_images->writable_view(transaction.slot != 0
-                                                     ? *l3_state_scratch_b
-                                                     : *l3_state_scratch).data,
-                 state_images->host_layout().image_bytes});
-            return false;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        const auto result =
-            DiskKVBridge::poll(progress.read, now, l3_queue_deadline());
-        if (result == DiskReadResult::Pending) { return false; }
-        const bool queue_expired = now - progress.read->submitted_at > l3_queue_deadline();
-        progress.read.reset();
-        if (result != DiskReadResult::Success) {
-            disk_kv_logf('W', "l3-seed-yield",
-                         "state read not restorable | result=%d frontier=%u queue_expired=%d",
-                         static_cast<int>(result), E, static_cast<int>(queue_expired));
-            progress.reason = queue_expired ? "state-read-queue-deadline" : "state-read";
-            return fail();
-        }
-        const auto sid = identity(E);
-        NINFER_SEED_SNAPSHOT(sid.lo, sid.hi, sid.tag, sid.frontier,
-            host_state_images->view(transaction.slot != 0 ? *l3_state_scratch_b
-                                   : *l3_state_scratch).data,
-            state_images->host_layout().image_bytes);
-        progress.phase = 1;
-        return false;
-    }
-    if (progress.phase == 1 || progress.phase == 2) {
-        const bool backend = progress.phase == 2;
+    //
+    // Phase order is deliberate: KV pages FIRST (0,1), the state image LAST
+    // (2). The probe may select a frontier whose state image is a SUBMITTED
+    // write still in flight (the promise set makes contains() optimistic);
+    // a 146 MiB state write takes up to ~30s on this QLC volume while a KV
+    // restore takes 1-3s, so restoring KV first lets the state write land
+    // during the KV phase - the state read then finds it on disk (or waits
+    // out the remaining promise window) instead of failing the whole
+    // restore into a 40-50s full recompute (observed: mixed-load windows
+    // where every round recomputed 100K+ tokens because the state read
+    // raced its own checkpoint).
+    if (progress.phase == 0 || progress.phase == 1) {
+        const bool backend = progress.phase == 1;
         const auto frontier = backend ? backend_frontier_at(speculative_backend, E) : E;
         if ((backend && speculative_backend != SpeculativeBackend::Mtp) ||
             progress.page == kv_pages_for_frontier(frontier)) {
@@ -4322,6 +4297,49 @@ bool ProgramImplCore::progress_disk_seed(SequenceState& sequence,
             }
             // Budget remains: loop and keep draining within this visit.
         }
+    }
+    if (progress.phase == 2) {
+        // State image LAST: the KV restore above bought the checkpoint's
+        // async state write its landing window (see the phase-order note).
+        if (!progress.state_scratch_lease) {
+            auto& state_lease = transaction.slot != 0 ? l3_state_scratch_lease_b
+                                              : l3_state_scratch_lease;
+            progress.state_scratch_lease = state_lease.try_acquire();
+            if (!progress.state_scratch_lease) { return false; }
+        }
+        if (!progress.read) {
+            read(identity(E), DiskKVKind::StateImage,
+                {host_state_images->writable_view(transaction.slot != 0
+                                                     ? *l3_state_scratch_b
+                                                     : *l3_state_scratch).data,
+                 state_images->host_layout().image_bytes});
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        // 60s queue deadline: the state read may legitimately spend 35s
+        // inside the drain thread waiting out its own checkpoint's in-flight
+        // write (wait_promise_clear) - the 30s submission deadline would
+        // fold the ticket mid-wait and fail the whole restore.
+        const auto state_deadline = std::chrono::milliseconds(60000);
+        const auto result =
+            DiskKVBridge::poll(progress.read, now, state_deadline);
+        if (result == DiskReadResult::Pending) { return false; }
+        const bool queue_expired = now - progress.read->submitted_at > state_deadline;
+        progress.read.reset();
+        if (result != DiskReadResult::Success) {
+            disk_kv_logf('W', "l3-seed-yield",
+                         "state read not restorable | result=%d frontier=%u queue_expired=%d",
+                         static_cast<int>(result), E, static_cast<int>(queue_expired));
+            progress.reason = queue_expired ? "state-read-queue-deadline" : "state-read";
+            return fail();
+        }
+        const auto sid = identity(E);
+        NINFER_SEED_SNAPSHOT(sid.lo, sid.hi, sid.tag, sid.frontier,
+            host_state_images->view(transaction.slot != 0 ? *l3_state_scratch_b
+                                   : *l3_state_scratch).data,
+            state_images->host_layout().image_bytes);
+        progress.phase = 3;
+        return false;
     }
     if (progress.phase == 3) {
         const bool complete = state_images->copy_from_host_chunk(
