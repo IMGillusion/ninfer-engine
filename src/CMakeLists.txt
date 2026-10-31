@@ -311,6 +311,7 @@ endif()
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
   add_library(ninfer_product_logging STATIC
     product/logging/logging.cpp
+    product/logging/nonblocking_stderr.cpp
     product/logging/pretty_format.cpp
     product/logging/startup_log.cpp)
   ninfer_internal_includes(ninfer_product_logging)

@@ -1,4 +1,5 @@
 #include "product/logging/logging.h"
+#include "product/logging/nonblocking_stderr.h"
 #include "product/logging/startup_log.h"
 #include "serve/fatal_signal.h"
 #include "serve/generation_service.h"
@@ -29,6 +30,14 @@ void handle_signal(int) {
 } // namespace
 
 int main(int argc, char** argv) {
+    // FIRST: business threads must never be able to block on a stderr write.
+    // Inside a container stderr is a pipe owned by the log driver; when the
+    // consumer dies the pipe fills and every logging thread wedges holding
+    // whatever lock it holds (observed: a 5-hour total deadlock, the stall
+    // sentinel included - it died inside its own forensic log call). After
+    // this call a full pipe merely drops the log line.
+    (void)ninfer::product::install_nonblocking_stderr();
+
     ninfer::serve::ServeOptions options;
     try {
         options = ninfer::serve::parse_serve_options(argc, argv);
