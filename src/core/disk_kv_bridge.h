@@ -471,6 +471,11 @@ private:
     // the gate's timeout (true read/write phasing) and breaks the
     // promise/gate deadlock without the 8s escape hatch.
     std::size_t promise_wait_reads_ = 0;
+    // Volume-health watch (see spill_queued): consecutive reads slower than
+    // kSlowReadMs trip the breaker and fail the restore into a recompute,
+    // instead of holding a lane for minutes until the process sentinel.
+    static constexpr std::int64_t kSlowReadMs = 20000;   // healthy is 1-10ms
+    std::atomic<int> slow_read_streak_{0};
     // Bounded large IO. The mounted volume has wedged single large preads and
     // pwrites indefinitely (twice in production, freezing the engine's single
     // context transaction past recovery). Large reads (state images) run on a

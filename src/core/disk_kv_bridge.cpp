@@ -436,10 +436,32 @@ void DiskKVBridge::spill_queued(SpillJob& job) {
             // promised (a chain racing its own checkpoint). Wait for the write
             // to land; a bounded wait, paid only by reads of promised pages.
             wait_promise_clear(job.id);
+            const auto page_started = std::chrono::steady_clock::now();
             if (job.read_dst.size() >= kLargeIOBytes) {
                 result = bounded_large_read(job);
             } else {
                 result = family(job.kind).store->read_page_result(job.id, job.read_dst);
+            }
+            const auto page_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - page_started).count();
+            // Volume-health watch: a healthy page read is 1-10ms (2.1 GB/s at
+            // QD8); a QLC GC mega-stall parks reads for minutes. Two slow
+            // pages in a row trip the breaker - the seed's next submissions
+            // are refused, the restore fails, and the request degrades to a
+            // GPU recompute instead of holding a lane for 5 minutes until
+            // the process-level sentinel kills everything (observed: 88s per
+            // 1.5 MiB page, 5 minutes of queued reads crawling).
+            if (result == DiskReadResult::Success && page_ms > kSlowReadMs) {
+                const int slow = slow_read_streak_.fetch_add(1) + 1;
+                if (slow >= 2) {
+                    slow_read_streak_.store(0);
+                    disk_kv_logf('W', "l3-bridge",
+                                 "slow read x%d | last=%lldms | trip breaker",
+                                 slow, static_cast<long long>(page_ms));
+                    trip_volume_breaker(std::chrono::seconds(60));
+                }
+            } else if (page_ms <= kSlowReadMs) {
+                slow_read_streak_.store(0);
             }
             std::lock_guard<std::mutex> lock(mu_);
             if (result == DiskReadResult::Success) {
