@@ -1971,7 +1971,17 @@ private:
                                   .prefix_reuse_path    = summary.prefix_reuse_path});
 
         publish_runtime_stats();
-        return progress_context_transaction(false);
+        // Do NOT advance the transaction here. This call used to end with
+        // progress_context_transaction(false), which ran the restore's first
+        // visit INLINE - including the idle spin budget (4s) and
+        // prepare_sequence - so one admission blocked 4-15s (measured
+        // [admit] SLOW total=15.4s with every accounted callee at 0.23s)
+        // while the pending queue serialised behind it and heads expired
+        // into 503s against an IDLE engine (observed: running 0, request
+        // queued 30s, host 831%). The worker boundary's own loop advances
+        // every open transaction each round; admission just registers and
+        // returns.
+        return AdmissionProgress::ControlProgress;
     }
 
     // Rescues the FIFO head out of the pending queue while a materialization
