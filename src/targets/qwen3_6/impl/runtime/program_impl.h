@@ -3339,6 +3339,17 @@ bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillPr
             (backend && (!sequence.kv->backend || !backend_kv_pages))) {
             next_stage(); continue;
         }
+        if (p.stage >= 6 && state) {
+            // Long-anchor states: skip the 146 MiB write entirely. Each
+            // chain carries up to 8 anchors - 1.17 GiB of SLC churn per
+            // round that folded the QLC cache and stalled ALL volume IO.
+            // The anchors' KV tails remain useful (page-chain walks), but
+            // a probe can never select an anchor frontier without a state
+            // gate hit, so the state writes bought nothing the per-round
+            // SEAM state (stage 5, the deepest pre-opener boundary) does
+            // not already provide.
+            next_stage(); continue;
+        }
         if (anchor_stage && p.page >= anchor_list.size()) { next_stage(); continue; }
         std::uint32_t frontier =
             anchor_stage ? sequence.long_anchors[anchor_list[p.page]].frontier
@@ -3353,6 +3364,16 @@ bool ProgramImplCore::progress_owner_spill(SequenceState& sequence, OwnerSpillPr
         if (frontier == 0 || (state && p.stage == 2 && !sequence.endpoint_valid) ||
             (tail && frontier % kPagedKVPageSize == 0)) {
             if (anchor_stage) { ++p.page; continue; }
+            next_stage(); continue;
+        }
+        if (p.stage == 2) {
+            // Endpoint state: skip entirely. Its key digest(execution_frontier)
+            // sits AFTER the generated response, and the next round's prompt
+            // renders history without the thinking span - the digest chain
+            // forks before the state could ever match (zero hits measured).
+            // The 146 MiB write was pure SLC churn: sustained rounds of it
+            // folded the QLC cache and stalled ALL volume IO for minutes.
+            // Seam/anchor states below are the matchable boundaries.
             next_stage(); continue;
         }
         auto* addresses = backend ? backend_kv_addresses.get() : text_kv_addresses.get();
@@ -3713,32 +3734,19 @@ void ProgramImplCore::spill_dying_owner_pages(SequenceState& sequence) {
             }
             return copied;
         };
-        // State image (L3): the 48-layer GDN/hidden recurrent state at the endpoint
-        // frontier. Not derivable from KV, so it must spill (and later restore)
-        // as a pair with the KV pages, or a KV-only restore still forces full
-        // prefill of the linear layers. Fire-and-forget spill (146 MiB) - the
-        // dying lane's release must never sit in a QLC write stall.
-        if (sequence.endpoint_valid && sequence.execution_frontier != 0 &&
-            sequence.execution_frontier < sequence.prefix_digests.size() &&
-            disk_kv->slot_count(DiskKVKind::StateImage) != 0) {
-            const StateImageHandle state = sequence.state.read;
-            if (state_store->valid(state)) {
-                const std::size_t stride =
-                    static_cast<std::size_t>(state_images->host_layout().image_bytes);
-                const auto view = readable_state(state);
-                if (view) {
-                    const std::uint32_t sf = sequence.execution_frontier;
-                    const auto sdigest = sequence.prefix_digests.at(sf);
-                    const DiskKVIdentity sid{.lo       = sdigest[0],
-                                              .hi       = sdigest[1],
-                                              .tag      = tag,
-                                              .frontier = sf};
-                    (void)disk_kv->spill_page_async(sid, DiskKVKind::StateImage,
-                                                    std::span<const std::byte>(view->data, stride),
-                                                    /*wait_for_slot=*/true);
-                }
-            }
-        }
+        // State image (L3) at the ENDPOINT frontier: deliberately NOT spilt.
+        // The endpoint state keys digest(execution_frontier) - the frontier
+        // AFTER the generated response - and the next round's prompt renders
+        // the history WITHOUT the thinking span, so its digest chain forks
+        // from the endpoint's before the state could ever match (measured
+        // across every observed session: zero endpoint-state hits). The
+        // 146 MiB write was pure volume churn: five rounds of it filled the
+        // QLC SLC cache and folded it into the TLC/QLC array, stalling ALL
+        // volume IO - including our own restores - for minutes. The SEAM
+        // state below (the pre-opener boundary the next prompt provably
+        // shares) is the one worth persisting; the endpoint state rides on
+        // the resident device copy until eviction, and eviction costs one
+        // seam-keyed delta recompute instead.
         // Restore seam (L3 read side complement): the multi-turn seam BEFORE the
         // generated response is the deepest boundary a client-authored follow-up
         // turn provably shares with this sequence (tokenizer round-trip drift makes
