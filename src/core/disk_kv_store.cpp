@@ -1,3 +1,4 @@
+#include <vector>
 #include "core/disk_kv_store.h"
 
 #include "core/disk_kv_log.h"
@@ -723,6 +724,7 @@ DiskReadResult DiskKVStore::read_page_result(const DiskKVIdentity& id, std::span
     // pread, not the mmap: the store file is far larger than the VM's memory
     // and mmap reads fault-storm the same way writes do (see upsert_page).
     bool io_ok = true;
+    const auto io_t0 = std::chrono::steady_clock::now();
     {
         std::size_t got = 0;
         while (got < opts_.slot_size) {
@@ -737,10 +739,41 @@ DiskReadResult DiskKVStore::read_page_result(const DiskKVIdentity& id, std::span
             got += static_cast<std::size_t>(n);
         }
     }
+    const auto io_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - io_t0).count();
     {
         std::lock_guard<std::mutex> lock(mu_);
         auto& pinned = readers_[slot];
         if (pinned) { --pinned; }
+    }
+    // Volume-health forensics: when a page read crawls (healthy: 1-10ms for
+    // 1.5 MiB at QD8), re-read the SAME bytes from the SAME offset with a
+    // fresh fd, bypassing the caller's concurrency. Normal raw latency with
+    // the engine path stalled names our own lock/queue as the culprit;
+    // equally slow raw names the volume stack. Logged at most once per slow
+    // event, after the read - never blocks the path itself.
+    if (io_ok && io_ms > 20000) {
+        const int raw_fd = ::open(opts_.path.c_str(), O_RDONLY);
+        if (raw_fd >= 0) {
+            std::vector<std::byte> probe(dst.size());
+            const auto raw_t0 = std::chrono::steady_clock::now();
+            ssize_t rn = 0;
+            while (rn >= 0 && rn < static_cast<ssize_t>(probe.size())) {
+                const ssize_t n2 = ::pread(raw_fd, probe.data() + rn,
+                                           probe.size() - static_cast<std::size_t>(rn),
+                                           static_cast<off_t>(off + rn));
+                if (n2 <= 0) { if (n2 < 0 && errno == EINTR) { continue; } break; }
+                rn += n2;
+            }
+            const auto raw_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - raw_t0).count();
+            ::close(raw_fd);
+            disk_kv_logf('W', "l3-store",
+                         "slow page read | io=%lldms raw_same_offset=%lldms(%zd) | "
+                         "raw_ok=engine-internal raw_slow=volume",
+                         static_cast<long long>(io_ms),
+                         static_cast<long long>(raw_ms), rn);
+        }
     }
     // A pread failure is an I/O problem (disk, mount, short file), not data
     // corruption: report it as its own class so triage does not chase CRC ghosts.
