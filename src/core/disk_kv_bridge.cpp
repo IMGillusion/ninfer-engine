@@ -459,27 +459,6 @@ void DiskKVBridge::spill_queued(SpillJob& job) {
                 const int slow = slow_read_streak_.fetch_add(1) + 1;
                 if (slow >= 2) {
                     slow_read_streak_.store(0);
-                    // Decisive evidence, once per breaker trip: a RAW pread of
-                    // the same size straight from the store file, bypassing
-                    // the store's index/lock path. Normal raw latency with
-                    // the engine path stalled = the contention is OUR lock
-                    // (software); equally slow raw = the volume itself.
-                    {
-                        const int raw_fd = ::open(family(job.kind).path.c_str(), O_RDONLY);
-                        if (raw_fd >= 0) {
-                            std::array<std::byte, 4096> probe_buf{};
-                            const auto raw_t0 = std::chrono::steady_clock::now();
-                            (void)::pread(raw_fd, probe_buf.data(), probe_buf.size(), 0);
-                            const auto raw_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::steady_clock::now() - raw_t0).count();
-                            ::close(raw_fd);
-                            disk_kv_logf('W', "l3-bridge",
-                                         "slow read x%d | last=%lldms raw_probe=%lldms | "
-                                         "raw_ok=engine-internal raw_slow=volume",
-                                         slow, static_cast<long long>(page_ms),
-                                         static_cast<long long>(raw_ms));
-                        }
-                    }
                     disk_kv_logf('W', "l3-bridge",
                                  "slow read x%d | last=%lldms | trip breaker",
                                  slow, static_cast<long long>(page_ms));

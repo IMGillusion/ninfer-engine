@@ -459,7 +459,7 @@ void ProgramImplCore::prime_disk_probe(
     detail::RequestBasePlanImpl<NINFER_QWEN36_VARIANT>& base) {
     if (base.disk_probe_primed) { return; }
     base.disk_probe_primed = true;
-    static const bool l3_trace = std::getenv("NINFER_L3_TRACE") != nullptr;
+    static const bool l3_trace = []{ const char* s = std::getenv("NINFER_L3_TRACE"); return s != nullptr && s[0] != ' '; }();
     base.disk_probe_frontier =
         l3_disk_restore_frontier(base.prefix_digests, base.summary.prompt_tokens, l3_trace);
 }
@@ -715,7 +715,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
          speculative_backend == SpeculativeBackend::Mtp) &&
         plan->summary.prompt_tokens != 0 &&
         base.prefix_digests.size() >= plan->summary.prompt_tokens) {
-        static const bool l3_trace_shallow = std::getenv("NINFER_L3_TRACE") != nullptr;
+        static const bool l3_trace_shallow = []{ const char* s = std::getenv("NINFER_L3_TRACE"); return s != nullptr && s[0] != ' '; }();
         const std::optional<std::uint32_t> disk_best =
             base.disk_probe_primed
                 ? base.disk_probe_frontier
@@ -930,7 +930,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     // Failure to seed later keeps the accounting (the prefill then recomputes the
     // [0,E) segment as an unreported replay; the engine-visible contract holds).
     if (plan->reuse == ReusePath::Root && disk_kv != nullptr && disk_kv_restore) {
-        static const bool l3_trace_enter = std::getenv("NINFER_L3_TRACE") != nullptr;
+        static const bool l3_trace_enter = []{ const char* s = std::getenv("NINFER_L3_TRACE"); return s != nullptr && s[0] != ' '; }();
         if (l3_trace_enter) {
             disk_kv_logf('D', "l3-probe", "enter | src=%d/%d spec=%d pub=%d slots=%u dig=%zu/%u",
                     static_cast<int>(source != nullptr), static_cast<int>(shared_source != nullptr),
@@ -960,7 +960,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         } else {
         // Candidate-level detail is debug-only (NINFER_L3_TRACE=1): the
         // per-candidate lines flood the log at one entry per frontier.
-        static const bool l3_trace = std::getenv("NINFER_L3_TRACE") != nullptr;
+        static const bool l3_trace = []{ const char* s = std::getenv("NINFER_L3_TRACE"); return s != nullptr && s[0] != ' '; }();
         const std::optional<std::uint32_t> best_E =
             base.disk_probe_primed
                 ? base.disk_probe_frontier
