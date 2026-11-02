@@ -352,6 +352,25 @@ void HttpServer::run_stats_reporter() {
         const Clock::time_point now        = Clock::now();
         const std::uint64_t progress_tokens =
             current.computed_prefill_tokens + current.committed_decode_tokens;
+        // Boundary-stage forensics: a stage that outlives a healthy bound
+        // names itself here (observed: boundary hangs with decode_ready=1 and
+        // zero progress had no forensics at all). Observation only - the
+        // exit decision stays with the sentinels below.
+        {
+            static Clock::time_point last_stage_warn{};
+            const char* stage = service_->boundary_stage();
+            const auto age_s = service_->boundary_stage_age_seconds();
+            if (age_s >= 15 && stage != nullptr) {
+                if (now - last_stage_warn >= std::chrono::seconds(15)) {
+                    last_stage_warn = now;
+                    disk_kv_logf('W', "l3-stall",
+                                 "boundary in stage '%s' for %llds (observing)",
+                                 stage, static_cast<long long>(age_s));
+                }
+            } else {
+                last_stage_warn = {};
+            }
+        }
         if (materializing_stall_ms != 0) {
             if (current.materializing_requests != 0) {
                 if (materializing_since.time_since_epoch().count() == 0) {

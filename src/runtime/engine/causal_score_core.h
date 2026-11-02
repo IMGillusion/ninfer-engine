@@ -97,6 +97,12 @@ public:
 
     [[nodiscard]] RuntimeStats runtime_stats() const noexcept { return {}; }
 
+    // Causal scoring has no worker boundary; the Engine facade's forensics
+    // visitor never selects this core for serving. Stubs keep the visitor
+    // uniform.
+    [[nodiscard]] const char* boundary_stage() const noexcept { return "unavailable"; }
+    [[nodiscard]] std::int64_t boundary_stage_age_ns() const noexcept { return 0; }
+
     [[nodiscard]] bool is_available() const {
         std::lock_guard lock(queue_mutex_);
         return !stopping_;

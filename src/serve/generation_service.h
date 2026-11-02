@@ -110,6 +110,14 @@ public:
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
+    // Boundary-stage forensics: the stage name the worker boundary last
+    // entered and how long ago. Pure atomics - safe to read from the stats
+    // reporter even when a wedged boundary holds every engine mutex.
+    [[nodiscard]] const char* boundary_stage() const { return engine_->boundary_stage(); }
+    [[nodiscard]] std::int64_t boundary_stage_age_seconds() const {
+        return engine_->boundary_stage_age_seconds();
+    }
+
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
 
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {

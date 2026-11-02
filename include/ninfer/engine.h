@@ -110,6 +110,11 @@ public:
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
+    // Boundary-stage forensics: the worker boundary's current stage name and
+    // how long it has been there. Lock-free reads - valid even when a wedged
+    // boundary holds every engine mutex. Diagnostic only.
+    [[nodiscard]] const char* boundary_stage() const;
+    [[nodiscard]] std::int64_t boundary_stage_age_seconds() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] bool is_available() const;
 

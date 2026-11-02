@@ -552,6 +552,34 @@ bool Engine::is_available() const {
         impl_->core);
 }
 
+const char* Engine::boundary_stage() const {
+    if (impl_ == nullptr) { return "unavailable"; }
+    return std::visit(
+        [](const auto& core) -> const char* {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                return "unavailable";
+            } else {
+                return core != nullptr ? core->boundary_stage() : "unavailable";
+            }
+        },
+        impl_->core);
+}
+
+std::int64_t Engine::boundary_stage_age_seconds() const {
+    if (impl_ == nullptr) { return 0; }
+    return std::visit(
+        [](const auto& core) -> std::int64_t {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                return 0;
+            } else {
+                return core->boundary_stage_age_ns() / 1'000'000'000LL;
+            }
+        },
+        impl_->core);
+}
+
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
     std::visit(

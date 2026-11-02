@@ -283,6 +283,25 @@ public:
         return published_stats_;
     }
 
+    // Boundary-stage forensics. The worker boundary records the stage it is
+    // about to enter (plain atomics - readable even when every engine mutex
+    // is held by a wedged path). The stall reporter logs it when the stage
+    // outlives a healthy bound, so a boundary wedge names itself instead of
+    // showing an anonymous zero-progress window.
+    [[nodiscard]] const char* boundary_stage() const noexcept {
+        return boundary_stage_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] std::int64_t boundary_stage_age_ns() const noexcept {
+        const std::int64_t now = Clock::now().time_since_epoch().count();
+        const std::int64_t tick = boundary_stage_tick_ns_.load(std::memory_order_acquire);
+        return tick == 0 ? 0 : now - tick;
+    }
+    void boundary_mark(const char* stage) noexcept {
+        boundary_stage_.store(stage, std::memory_order_release);
+        boundary_stage_tick_ns_.store(Clock::now().time_since_epoch().count(),
+                                      std::memory_order_release);
+    }
+
     [[nodiscard]] bool is_available() const {
         std::lock_guard lock(queue_mutex_);
         return !stopping_ && !failed_;
@@ -2513,17 +2532,27 @@ private:
                 set_host_work_class(HostWorkClass::Control);
                 HostPhaseMeasurement boundary = begin_host_phase();
                 const bool have_pending       = expire_pending_requests();
+                boundary_mark("expire_pending");
                 (void)progress_context_transaction(have_pending, decode_ready_count());
+                boundary_mark("promote_waiters");
                 promote_materialization_waiters();
+                boundary_mark("prime_admission");
                 prime_admission_preparation();
+                boundary_mark("settle_terminal");
                 (void)settle_terminal_requests(boundary);
+                boundary_mark("cancel_active");
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
+                boundary_mark("resume_prefill");
                 resume_paused_prefill();
+                boundary_mark("pause_prefill_check");
                 maybe_pause_prefill_for_admission();
+                boundary_mark("background_host_tick");
                 instance_.program->background_host_kv_tick();
                 background_pending = instance_.program->has_background_host_kv_work();
+                boundary_mark("proactive_tick");
                 background_pending = resources_.proactive_tick(*instance_.program, have_pending) || background_pending;
+                boundary_mark("build_round");
                 RoundMembership membership =
                     scheduler_.build_round_membership(slots_, max_concurrency_);
                 const bool admission_check_pending =
@@ -2545,9 +2574,11 @@ private:
                 // timeouts, zero rescues). Rescuing is idempotent, resource-
                 // free, and capped, so the per-boundary evaluation is cheap.
                 if (gate_open && consume_admission_check()) {
+                    boundary_mark("admission");
                     (void)try_admit_one();
                     membership = scheduler_.build_round_membership(slots_, max_concurrency_);
                 } else if (!gate_open && materialization_waiters_.size() < kMaterializationWaiters) {
+                    boundary_mark("waiter_create");
                     try_create_materialization_waiter();
                 }
 
@@ -2579,6 +2610,7 @@ private:
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                    boundary_mark("prefill_step");
                     run_prefill_step(cancelled_at_unit_start);
                     previous_unit_was_decode = false;
                     continue;
@@ -2586,6 +2618,7 @@ private:
                 if (action == ExecutionAction::Decode) {
                     set_host_work_class(HostWorkClass::Decode, membership.lane_span());
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                    boundary_mark("decode_round");
                     run_decode_round(membership, cancelled_at_unit_start);
                     previous_unit_was_decode = true;
                     continue;
@@ -2678,6 +2711,11 @@ private:
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;
+    // Boundary-stage forensics (see boundary_mark / boundary_stage): plain
+    // atomics, lock-free by design so a wedged boundary path that holds
+    // every engine mutex still leaves its stage name readable.
+    std::atomic<const char*> boundary_stage_{"pre-boot"};
+    std::atomic<std::int64_t> boundary_stage_tick_ns_{0};
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
