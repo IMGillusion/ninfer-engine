@@ -2492,6 +2492,11 @@ private:
                         active = active || slots_[lane] != nullptr;
                     }
                     if (!active) {
+                        // Healthy idle: clear the stage so the forensics
+                        // reporter does not misread a stale label as a wedge
+                        // (observed: 'waiter_create' reported for minutes of
+                        // perfectly healthy idle-cv waiting).
+                        boundary_mark("idle_wait");
                         if (background_pending) {
                             queue_cv_.wait_for(lock, std::chrono::milliseconds(1),
                                                [&] { return stopping_ || !pending_.empty(); });

@@ -360,7 +360,10 @@ void HttpServer::run_stats_reporter() {
             static Clock::time_point last_stage_warn{};
             const char* stage = service_->boundary_stage();
             const auto age_s = service_->boundary_stage_age_seconds();
-            if (age_s >= 15 && stage != nullptr) {
+            // idle_wait is the healthy no-work state - only a REAL stage
+            // outliving its bound is worth a warning line.
+            if (age_s >= 15 && stage != nullptr &&
+                std::strcmp(stage, "idle_wait") != 0) {
                 if (now - last_stage_warn >= std::chrono::seconds(15)) {
                     last_stage_warn = now;
                     disk_kv_logf('W', "l3-stall",
